@@ -20,7 +20,7 @@ struct BatchMemcpy {
         tvm::ffi::TensorView sizes,
         int64_t stream_handle
     ) {
-#if CUDART_VERSION >= 13000
+#if defined(__HIP_PLATFORM_AMD__) || CUDART_VERSION >= 13000
         using namespace host;
         auto N = SymbolicSize{"batch length"};
         auto ptr_dtype = SymbolicDType{};
@@ -34,11 +34,32 @@ struct BatchMemcpy {
         if (n == 0) {
             return;
         }
-        RuntimeCheck(stream_handle != 0, "hipMemcpyBatchAsync rejects the legacy NULL stream");
+        RuntimeCheck(stream_handle != 0, "MemcpyBatchAsync rejects the legacy NULL stream");
+#if defined(__HIP_PLATFORM_AMD__)
         auto attr = ::hipMemcpyAttributes{};
         attr.srcAccessOrder = ::hipMemcpySrcAccessOrderStream;
+#else
+        auto attr = ::cudaMemcpyAttributes{};
+        attr.srcAccessOrder = ::cudaMemcpySrcAccessOrderStream;
+#endif
         std::size_t attr_idx = 0;
+#if defined(__HIP_PLATFORM_AMD__)
+        // ROCm kept the failIdx out-parameter that CUDA 13 dropped, and takes
+        // the pointer arrays non-const, so the HIP call is 9 arguments.
+        std::size_t fail_idx = 0;
         CUDA_CHECK(::hipMemcpyBatchAsync(
+            reinterpret_cast<void**>(dst_ptrs.data_ptr()),
+            reinterpret_cast<void**>(src_ptrs.data_ptr()),
+            reinterpret_cast<std::size_t*>(sizes.data_ptr()),
+            n,
+            &attr,
+            &attr_idx,
+            1,
+            &fail_idx,
+            reinterpret_cast<::hipStream_t>(stream_handle)
+        ));
+#else
+        CUDA_CHECK(::cudaMemcpyBatchAsync(
             reinterpret_cast<void* const*>(dst_ptrs.data_ptr()),
             reinterpret_cast<const void* const*>(src_ptrs.data_ptr()),
             reinterpret_cast<const std::size_t*>(sizes.data_ptr()),
@@ -46,12 +67,13 @@ struct BatchMemcpy {
             &attr,
             &attr_idx,
             1,
-            reinterpret_cast<::hipStream_t>(stream_handle)
+            reinterpret_cast<::cudaStream_t>(stream_handle)
         ));
+#endif
 #else
         ::host::panic(
             std::source_location::current(),
-            "this hipMemcpyBatchAsync binding requires CUDA >= 13.0 at build time"
+            "this MemcpyBatchAsync binding requires CUDA >= 13.0 or ROCm/HIP at build time"
         );
 #endif
     }
