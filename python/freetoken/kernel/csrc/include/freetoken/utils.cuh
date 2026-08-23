@@ -111,10 +111,18 @@ public:
   template <typename T, typename... Args>
   auto operator()(T &&kernel, Args &&...args) const -> void {
     CUDA_CHECK(
-        ::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...));
+        ::hipLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...));
   }
 
-  auto with_attr(bool use_pdl) -> LaunchKernel & {
+  auto with_attr([[maybe_unused]] bool use_pdl) -> LaunchKernel & {
+#if defined(__HIP_PLATFORM_AMD__)
+    // Programmatic Dependent Launch has no HIP counterpart: hipLaunchAttributeID
+    // stops at MemSyncDomain and AMD hardware has no equivalent of the Hopper
+    // programmatic-stream-serialization path. PDL only lets a dependent kernel
+    // start its prologue early, so dropping it costs launch latency, never
+    // correctness -- the stream ordering that guarantees the result is unchanged.
+    m_config.numAttrs = 0;
+#else
     if (use_pdl) {
       m_attr_cache.id = ::cudaLaunchAttributeProgrammaticStreamSerialization;
       m_attr_cache.val.programmaticStreamSerializationAllowed = 1;
@@ -123,13 +131,14 @@ public:
     } else {
       m_config.numAttrs = 0;
     }
+#endif
     return *this;
   }
 
 private:
   static auto s_make_config(dim3 grid_dim, dim3 block_dim, hipStream_t stream,
-                            std::size_t smem) -> cudaLaunchConfig_t {
-    auto config = ::cudaLaunchConfig_t{};
+                            std::size_t smem) -> hipLaunchConfig_t {
+    auto config = ::hipLaunchConfig_t{};
     config.gridDim = grid_dim;
     config.blockDim = block_dim;
     config.dynamicSmemBytes = smem;
@@ -137,8 +146,10 @@ private:
     config.numAttrs = 0;
     return config;
   }
-  cudaLaunchConfig_t m_config;
+  hipLaunchConfig_t m_config;
+#if !defined(__HIP_PLATFORM_AMD__)
   cudaLaunchAttribute m_attr_cache;
+#endif
 };
 
 } // namespace host
