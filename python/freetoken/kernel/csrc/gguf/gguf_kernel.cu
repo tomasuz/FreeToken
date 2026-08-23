@@ -10,6 +10,15 @@
 // clang-format off
 #include "dispatch.h"
 
+// torch's headers pull in libstdc++ <math.h>, whose host-only fabsf/fmaxf/roundf
+// win the lookup over HIP's device versions. The clang builtins are always
+// available in device code and lower to the same instructions.
+#if defined(__HIP_PLATFORM_AMD__)
+#define fabsf(x) __builtin_fabsf(x)
+#define fmaxf(a, b) __builtin_fmaxf((a), (b))
+#define roundf(x) __builtin_roundf(x)
+#endif
+
 #include "ggml-common.h"
 #include "vecdotq.cuh"
 #include "dequantize.cuh"
@@ -41,8 +50,8 @@ quantize_q8_1(const scalar_t* __restrict__ x, void* __restrict__ vy, const int k
 
 #pragma unroll
   for (int mask = 16; mask > 0; mask >>= 1) {
-    amax = fmaxf(amax, SGLANG_SHFL_XOR_SYNC_WIDTH(uint32_t(-1), amax, mask, 32));
-    sum += SGLANG_SHFL_XOR_SYNC_WIDTH(uint32_t(-1), sum, mask, 32);
+    amax = fmaxf(amax, SGLANG_SHFL_XOR_SYNC_WIDTH(SGLANG_FULL_MASK, amax, mask, 32));
+    sum += SGLANG_SHFL_XOR_SYNC_WIDTH(SGLANG_FULL_MASK, sum, mask, 32);
   }
 
   const float d = amax / 127;
