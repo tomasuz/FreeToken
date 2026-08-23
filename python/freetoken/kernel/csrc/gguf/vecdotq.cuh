@@ -1,4 +1,17 @@
 #include "hip/hip_runtime.h"
+
+// CUDA declares integer min()/max() for device code implicitly; under HIP the
+// libstdc++ <math.h> that torch's headers drag in wins the lookup and only
+// offers floating-point fmin/fmax. Guarded because torch's JIT hipify emits a
+// second copy of this header (*_hip.cuh) that can end up in the same TU.
+// Deliberately not <algorithm>: it pulls host <cmath> declarations that then
+// shadow HIP's device fabsf/fmaxf/roundf.
+#if defined(__HIP_PLATFORM_AMD__) && !defined(FREETOKEN_HIP_INT_MINMAX)
+#define FREETOKEN_HIP_INT_MINMAX
+__host__ __device__ __forceinline__ int min(int a, int b) { return a < b ? a : b; }
+__host__ __device__ __forceinline__ int max(int a, int b) { return a > b ? a : b; }
+#endif
+
 // copied from
 // https://github.com/vllm-project/vllm/blob/4492e3a55428e161ca8db381edc28263e5da4c8d/csrc/quantization/gguf/vecdotq.cuh
 // copied and adapted from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/vecdotq.cuh

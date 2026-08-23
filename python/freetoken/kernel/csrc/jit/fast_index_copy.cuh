@@ -1,4 +1,11 @@
 #include "hip/hip_runtime.h"
+
+// __grid_constant__ is an nvcc attribute (CUDA 11.7+) that promises a kernel
+// parameter lives in constant memory. HIP has no equivalent and passes kernel
+// parameters the same way regardless, so define it away.
+#if defined(__HIP_PLATFORM_AMD__) && !defined(__grid_constant__)
+#define __grid_constant__
+#endif
 #include <freetoken/tensor.h>
 #include <freetoken/utils.cuh>
 #include <freetoken/utils.h>
@@ -33,6 +40,42 @@ inline constexpr auto get_mem_package() {
     static_assert(kUnit == 16 || kUnit == 8 || kUnit == 4, "Unsupported memory package size");
     }
 }
+
+// The PTX below is NVIDIA-only: "L1::no_allocate" loads and "wt" (write-through)
+// stores are cache hints, not semantics. clang's __builtin_nontemporal_* are the
+// AMDGPU equivalent and lower to the corresponding sc0/sc1/nt instructions.
+#if defined(__HIP_PLATFORM_AMD__)
+
+__always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
+    return uint1{__builtin_nontemporal_load(&src->x)};
+}
+
+__always_inline __device__ auto load_nc(const uint2* __restrict__ src) -> uint2 {
+    return uint2{__builtin_nontemporal_load(&src->x), __builtin_nontemporal_load(&src->y)};
+}
+
+__always_inline __device__ auto load_nc(const uint4* __restrict__ src) -> uint4 {
+    return uint4{__builtin_nontemporal_load(&src->x), __builtin_nontemporal_load(&src->y),
+                 __builtin_nontemporal_load(&src->z), __builtin_nontemporal_load(&src->w)};
+}
+
+__always_inline __device__ void store_nc(uint1* __restrict__ dst, const uint1& value) {
+    __builtin_nontemporal_store(value.x, &dst->x);
+}
+
+__always_inline __device__ void store_nc(uint2* __restrict__ dst, const uint2& value) {
+    __builtin_nontemporal_store(value.x, &dst->x);
+    __builtin_nontemporal_store(value.y, &dst->y);
+}
+
+__always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& value) {
+    __builtin_nontemporal_store(value.x, &dst->x);
+    __builtin_nontemporal_store(value.y, &dst->y);
+    __builtin_nontemporal_store(value.z, &dst->z);
+    __builtin_nontemporal_store(value.w, &dst->w);
+}
+
+#else
 
 __always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
     uint32_t tmp;
@@ -70,6 +113,8 @@ __always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& v
     uint32_t tmp3 = value.w;
     asm volatile("st.global.wt.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(dst), "r"(tmp0), "r"(tmp1), "r"(tmp2), "r"(tmp3));
 }
+
+#endif
 
 __always_inline __device__ void wait_flag_clear(const int32_t* __restrict__ flag_ptr) {
     // Exponential backoff to avoid hammering a global atomic in a tight loop.
