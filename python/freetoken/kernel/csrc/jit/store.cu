@@ -1,4 +1,11 @@
 #include "hip/hip_runtime.h"
+
+// __grid_constant__ is an nvcc attribute (CUDA 11.7+) that promises a kernel
+// parameter lives in constant memory. HIP has no equivalent and passes kernel
+// parameters the same way regardless, so define it away.
+#if defined(__HIP_PLATFORM_AMD__) && !defined(__grid_constant__)
+#define __grid_constant__
+#endif
 #include <freetoken/tensor.h>
 #include <freetoken/utils.cuh>
 #include <freetoken/utils.h>
