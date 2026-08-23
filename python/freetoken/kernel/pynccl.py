@@ -27,7 +27,12 @@ else:
 
 @functools.cache
 def _load_nccl_module() -> Module:
-    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=["-lnccl"])
+    # RCCL is AMD's NCCL: it keeps the ncclXxx symbol names, so only the library
+    # we link against changes.
+    import torch
+
+    lib = "-lrccl" if torch.version.hip else "-lnccl"
+    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=[lib])
 
 
 @functools.cache
