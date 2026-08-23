@@ -39,7 +39,15 @@ def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
         lib64 = rocm_home / "lib64"
         if lib64.exists():
             library_dirs.append(str(lib64))
-        return [str(rocm_home / "include")], library_dirs
+        # On Debian ROCM_HOME is /usr, and handing clang an explicit
+        # "-isystem /usr/include" pulls that directory out of its default
+        # ordering, after which libstdc++'s <cmath> can no longer resolve its
+        # #include_next <math.h>. The HIP headers live on the default path
+        # there anyway, so contribute no include dir at all in that case.
+        include_dirs = []
+        if rocm_home != Path("/usr"):
+            include_dirs.append(str(rocm_home / "include"))
+        return include_dirs, library_dirs
     if CUDA_HOME is None:
         raise RuntimeError(
             "CUDA_HOME is required to build freetoken.kernel._pinned_tensor "

@@ -11,12 +11,33 @@
 #endif
 
 // Warp-shuffle wrappers the donor pulls from sgl-kernel's utils.h (CUDA variants).
+
+// "All lanes" differs by wavefront width: 32 bits on RDNA, 64 on GCN/CDNA.
+#if defined(__HIP_PLATFORM_AMD__)
+#define SGLANG_FULL_MASK (~0ull)
+#else
+#define SGLANG_FULL_MASK (uint32_t(-1))
+#endif
+
+// HIP's __shfl_xor_sync static_asserts on a 64-bit mask (wave64 has 64 lanes),
+// so widen whatever the CUDA-shaped call sites pass.
+#if defined(__HIP_PLATFORM_AMD__)
+#ifndef SGLANG_SHFL_XOR_SYNC
+#define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) \
+  __shfl_xor_sync(static_cast<unsigned long long>(mask), (var), (lane_mask))
+#endif
+#ifndef SGLANG_SHFL_XOR_SYNC_WIDTH
+#define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) \
+  __shfl_xor_sync(static_cast<unsigned long long>(mask), (var), (lane_mask), (width))
+#endif
+#else
 #ifndef SGLANG_SHFL_XOR_SYNC
 #define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor_sync((mask), (var), (lane_mask))
 #endif
 #ifndef SGLANG_SHFL_XOR_SYNC_WIDTH
 #define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) \
   __shfl_xor_sync((mask), (var), (lane_mask), (width))
+#endif
 #endif
 
 #define DISPATCH_CASE_FLOAT_TYPES(...)                 \

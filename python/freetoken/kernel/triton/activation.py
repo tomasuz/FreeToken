@@ -16,6 +16,7 @@ from __future__ import annotations
 import functools
 
 import torch
+import torch as _torch
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
@@ -46,22 +47,41 @@ def _pdl_supported() -> bool:
     return is_sm90_supported()
 
 
-@triton.jit
-def _fast_tanh(x):
-    # PTX tanh.approx.f32 — single HW op, matches flashinfer math::tanh.
-    return tl.inline_asm_elementwise(
-        "tanh.approx.f32 $0, $1;", "=f,f", [x],
-        dtype=tl.float32, is_pure=True, pack=1,
-    )
+# The PTX approximations below are NVIDIA-only: their "=f,f" register
+# constraints cannot be satisfied on AMDGPU ("couldn't allocate output register
+# for constraint 'f'"). Under ROCm, express the same functions with plain Triton
+# ops and let the backend pick the hardware instruction.
+_USE_PTX_MATH = not bool(getattr(_torch.version, "hip", None))
 
+if _USE_PTX_MATH:
 
-@triton.jit
-def _fast_ex2(x):
-    # PTX ex2.approx.f32 — matches __expf fast path used by flashinfer silu.
-    return tl.inline_asm_elementwise(
-        "ex2.approx.f32 $0, $1;", "=f,f", [x],
-        dtype=tl.float32, is_pure=True, pack=1,
-    )
+    @triton.jit
+    def _fast_tanh(x):
+        # PTX tanh.approx.f32 — single HW op, matches flashinfer math::tanh.
+        return tl.inline_asm_elementwise(
+            "tanh.approx.f32 $0, $1;", "=f,f", [x],
+            dtype=tl.float32, is_pure=True, pack=1,
+        )
+
+    @triton.jit
+    def _fast_ex2(x):
+        # PTX ex2.approx.f32 — matches __expf fast path used by flashinfer silu.
+        return tl.inline_asm_elementwise(
+            "ex2.approx.f32 $0, $1;", "=f,f", [x],
+            dtype=tl.float32, is_pure=True, pack=1,
+        )
+
+else:
+
+    @triton.jit
+    def _fast_tanh(x):
+        # tanh(x) = 1 - 2/(exp(2x) + 1); saturates to +/-1 the same way the PTX
+        # approximation does once exp overflows.
+        return 1.0 - 2.0 / (tl.exp(2.0 * x) + 1.0)
+
+    @triton.jit
+    def _fast_ex2(x):
+        return tl.exp2(x)
 
 
 @triton.jit
@@ -134,7 +154,7 @@ def _act_and_mul(
     block_d = min(triton.next_power_of_2(d), 1024 if M >= 4096 else 512)
     num_stages = 2 if block_d == 1024 else 3
     _act_and_mul_kernel[grid](
-        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, launch_pdl=pdl,
+        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, **({"launch_pdl": True} if pdl else {}),
         BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
     )
     return out
