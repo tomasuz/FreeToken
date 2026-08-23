@@ -18,7 +18,9 @@ DISABLE_JIT_ENV = "FREETOKEN_DISABLE_JIT"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
-DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
+# --expt-relaxed-constexpr is an nvcc flag; hipcc/clang rejects it outright.
+_IS_HIP = bool(getattr(__import__("torch").version, "hip", None))
+DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3"] + ([] if _IS_HIP else ["--expt-relaxed-constexpr"])
 DEFAULT_LDFLAGS = []
 
 
@@ -31,7 +33,7 @@ def _cuda_cflags(extra: List[str]) -> List[str]:
     JIT-forwards from the highest compatible PTX. When the env is unset (runtime JIT), this is a
     no-op and tvm-ffi targets only the local GPU."""
     flags = DEFAULT_CUDA_CFLAGS + extra
-    arch_list = os.getenv("TVM_FFI_CUDA_ARCH_LIST", "").split()
+    arch_list = [] if _IS_HIP else os.getenv("TVM_FFI_CUDA_ARCH_LIST", "").split()
     if arch_list:
         def _rank(a: str) -> int:
             major, minor = a.rstrip("a").split(".")
