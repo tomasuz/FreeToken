@@ -575,6 +575,12 @@ static void* cumemop_dlsym(void* h, const char* n) {
 }
 #else
 #include <dlfcn.h>
+
+// CUDART_CB is CUDA's host-callback calling convention macro; it expands to
+// nothing on Linux. HIP has no such macro, so define it away when absent.
+#ifndef CUDART_CB
+#define CUDART_CB
+#endif
 static void* cumemop_dlopen() {
   void* h = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
   if (h == nullptr) h = dlopen("libcuda.so", RTLD_LAZY | RTLD_LOCAL);
