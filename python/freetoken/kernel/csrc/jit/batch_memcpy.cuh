@@ -46,7 +46,7 @@ struct BatchMemcpy {
             &attr,
             &attr_idx,
             1,
-            reinterpret_cast<::cudaStream_t>(stream_handle)
+            reinterpret_cast<::hipStream_t>(stream_handle)
         ));
 #else
         ::host::panic(

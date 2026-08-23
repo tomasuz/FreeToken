@@ -61,25 +61,25 @@ template <bool kUsePDL> __always_inline __device__ void launch() {
 namespace host {
 
 inline auto
-CUDA_CHECK(::cudaError_t error,
+CUDA_CHECK(::hipError_t error,
            std::source_location location = std::source_location::current())
     -> void {
-  if (error != ::cudaSuccess) {
+  if (error != ::hipSuccess) {
     [[unlikely]];
-    ::host::panic(location, "CUDA error: ", ::cudaGetErrorString(error));
+    ::host::panic(location, "CUDA error: ", ::hipGetErrorString(error));
   }
 }
 
 inline auto
 CUDA_CHECK(std::source_location location = std::source_location::current())
     -> void {
-  return CUDA_CHECK(::cudaGetLastError(), location);
+  return CUDA_CHECK(::hipGetLastError(), location);
 }
 
 template <auto F> inline void set_smem_once(std::size_t smem_size) {
   static const auto last_smem_size = [&] {
-    CUDA_CHECK(::cudaFuncSetAttribute(
-        F, ::cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    CUDA_CHECK(::hipFuncSetAttribute(
+        F, ::hipFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     return smem_size;
   }();
   RuntimeCheck(
@@ -95,13 +95,13 @@ public:
       : m_config(s_make_config(grid_dim, block_dim, resolve_device(device),
                                dynamic_shared_mem_bytes)) {}
 
-  explicit LaunchKernel(dim3 grid_dim, dim3 block_dim, cudaStream_t stream,
+  explicit LaunchKernel(dim3 grid_dim, dim3 block_dim, hipStream_t stream,
                         std::size_t dynamic_shared_mem_bytes = 0) noexcept
       : m_config(s_make_config(grid_dim, block_dim, stream,
                                dynamic_shared_mem_bytes)) {}
 
-  static auto resolve_device(DLDevice device) -> cudaStream_t {
-    return static_cast<cudaStream_t>(
+  static auto resolve_device(DLDevice device) -> hipStream_t {
+    return static_cast<hipStream_t>(
         ::TVMFFIEnvGetStream(device.device_type, device.device_id));
   }
 
@@ -127,7 +127,7 @@ public:
   }
 
 private:
-  static auto s_make_config(dim3 grid_dim, dim3 block_dim, cudaStream_t stream,
+  static auto s_make_config(dim3 grid_dim, dim3 block_dim, hipStream_t stream,
                             std::size_t smem) -> cudaLaunchConfig_t {
     auto config = ::cudaLaunchConfig_t{};
     config.gridDim = grid_dim;
