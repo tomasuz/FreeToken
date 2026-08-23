@@ -78,8 +78,8 @@ CUDA_CHECK(std::source_location location = std::source_location::current())
 
 template <auto F> inline void set_smem_once(std::size_t smem_size) {
   static const auto last_smem_size = [&] {
-    CUDA_CHECK(::hipFuncSetAttribute(reinterpret_cast<const void*>(
-        F), ::hipFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    CUDA_CHECK(::hipFuncSetAttribute(
+        F, ::hipFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     return smem_size;
   }();
   RuntimeCheck(
@@ -111,10 +111,18 @@ public:
   template <typename T, typename... Args>
   auto operator()(T &&kernel, Args &&...args) const -> void {
     CUDA_CHECK(
-        ::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...));
+        ::hipLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...));
   }
 
-  auto with_attr(bool use_pdl) -> LaunchKernel & {
+  auto with_attr([[maybe_unused]] bool use_pdl) -> LaunchKernel & {
+#if defined(__HIP_PLATFORM_AMD__)
+    // Programmatic Dependent Launch has no HIP counterpart: hipLaunchAttributeID
+    // stops at MemSyncDomain and AMD hardware has no equivalent of the Hopper
+    // programmatic-stream-serialization path. PDL only lets a dependent kernel
+    // start its prologue early, so dropping it costs launch latency, never
+    // correctness -- the stream ordering that guarantees the result is unchanged.
+    m_config.numAttrs = 0;
+#else
     if (use_pdl) {
       m_attr_cache.id = ::cudaLaunchAttributeProgrammaticStreamSerialization;
       m_attr_cache.val.programmaticStreamSerializationAllowed = 1;
@@ -123,6 +131,7 @@ public:
     } else {
       m_config.numAttrs = 0;
     }
+#endif
     return *this;
   }
 
@@ -138,7 +147,9 @@ private:
     return config;
   }
   hipLaunchConfig_t m_config;
-  hipLaunchAttribute m_attr_cache;
+#if !defined(__HIP_PLATFORM_AMD__)
+  cudaLaunchAttribute m_attr_cache;
+#endif
 };
 
 } // namespace host

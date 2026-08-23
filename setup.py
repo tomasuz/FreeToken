@@ -8,11 +8,25 @@ import sys
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CppExtension
 
+try:
+    from torch.utils.cpp_extension import ROCM_HOME
+except ImportError:  # older torch
+    ROCM_HOME = None
+
+# torch's ROCm builds report HIP through torch.version.hip; CUDA_HOME is unset there.
+import torch
+
+IS_ROCM = bool(getattr(torch.version, "hip", None)) and ROCM_HOME is not None
+
 
 ROOT = Path(__file__).parent
 
 
 def _check_toolchain() -> None:
+    if IS_ROCM:
+        # hipcc ships with the ROCm that torch was built against; there is no
+        # nvcc/torch version pairing to verify.
+        return
     path = ROOT / "python" / "freetoken" / "kernel" / "_toolchain.py"
     spec = importlib.util.spec_from_file_location("_freetoken_toolchain", path)
     module = importlib.util.module_from_spec(spec)
@@ -21,6 +35,13 @@ def _check_toolchain() -> None:
 
 
 def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
+    if IS_ROCM:
+        rocm_home = Path(ROCM_HOME)
+        library_dirs = [str(rocm_home / "lib")]
+        lib64 = rocm_home / "lib64"
+        if lib64.exists():
+            library_dirs.append(str(lib64))
+        return [str(rocm_home / "include")], library_dirs
     if CUDA_HOME is None:
         raise RuntimeError(
             "CUDA_HOME is required to build freetoken.kernel._pinned_tensor "
@@ -33,6 +54,7 @@ def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
     return [str(cuda_home / "include")], library_dirs
 
 
+_RUNTIME_LIBS = ["amdhip64"] if IS_ROCM else ["cudart"]
 cuda_include_dirs, cuda_library_dirs = _cuda_runtime_paths()
 _check_toolchain()
 
@@ -46,7 +68,7 @@ setup(
             ],
             include_dirs=cuda_include_dirs,
             library_dirs=cuda_library_dirs,
-            libraries=["cudart"],
+            libraries=_RUNTIME_LIBS,
             extra_compile_args=["-O3", "-std=c++17"],
         ),
         # CPU-compute MoE executor for --moe-backend cpu. Links cudart for the
@@ -61,7 +83,7 @@ setup(
             ],
             include_dirs=cuda_include_dirs,
             library_dirs=cuda_library_dirs,
-            libraries=["cudart"],
+            libraries=_RUNTIME_LIBS,
             extra_compile_args=["-O3", "-std=c++17", "-pthread"],
         ),
         # --ple-backend disk row store; Linux-only until the TableFile/BatchReader seams grow Windows bodies
