@@ -51,8 +51,12 @@ def _c_compiler_for(cxx: str) -> str:
 def _module():
     from torch.utils.cpp_extension import load
 
-    extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
-    host_cxx = _host_compiler()
+    import torch as _t
+
+    _is_hip = bool(getattr(_t.version, "hip", None))
+    # --expt-relaxed-constexpr and -ccbin are nvcc-only; hipcc/clang rejects both.
+    extra_cuda_cflags = ["-O3"] if _is_hip else ["-O3", "--expt-relaxed-constexpr"]
+    host_cxx = None if _is_hip else _host_compiler()
     if host_cxx is not None:
         # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
         # libtorch/nvcc-compatible compiler. Force (not setdefault): the system
