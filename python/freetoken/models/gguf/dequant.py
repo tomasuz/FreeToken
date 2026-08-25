@@ -67,6 +67,26 @@ GGML_NAME = {
 }
 
 
+# Native GGUF routed-expert / weight formats: the ggml quants every entry point in
+# csrc/gguf dispatches. Format tag <-> ggml type, lowercased so the pre-existing
+# "q4_0" tag keeps its exact spelling.
+GGUF_EXPERT_FORMATS: dict[str, int] = {
+    GGML_NAME[t].lower(): t
+    for t in (
+        GGML_Q4_0,
+        GGML_Q4_1,
+        GGML_Q5_0,
+        GGML_Q5_1,
+        GGML_Q8_0,
+        GGML_Q2_K,
+        GGML_Q3_K,
+        GGML_Q4_K,
+        GGML_Q5_K,
+        GGML_Q6_K,
+    )
+}
+
+
 def row_bytes(numel: int, ggml_type: int) -> int:
     """Packed byte length of one row of ``numel`` elements in ``ggml_type`` blocks.
 
@@ -174,6 +194,7 @@ __all__ = [
     "GGML_Q6_K",
     "GGML_NAME",
     "BLOCK_SHAPE",
+    "GGUF_EXPERT_FORMATS",
     "row_bytes",
     "dequant_q4_0",
     "dequant_q6_k",

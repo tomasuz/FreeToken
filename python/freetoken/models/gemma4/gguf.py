@@ -24,11 +24,11 @@ from freetoken.models.config import (
 )
 from freetoken.models.gguf.dequant import (
     GGML_NAME,
+    GGUF_EXPERT_FORMATS,
     GGML_Q4_0,
     dequantize,
     row_bytes,
 )
-from freetoken.moe.offload_cache import GGUF_EXPERT_FORMATS
 
 if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
