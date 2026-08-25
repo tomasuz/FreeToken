@@ -358,9 +358,21 @@ def test_resident_layer_matches_offload_path_bitwise():
     E, H, I, tokens, top_k = 4, 64, 64, 3, 2
     gu_row, dn_row = row_bytes(H, GGML_Q4_0), row_bytes(I, GGML_Q4_0)
 
+    def q4_0_bank(*shape: int, blocks: int) -> torch.Tensor:
+        """Random but VALID Q4_0 bytes: each 18-byte block is ``half d`` + 16 nibble bytes.
+
+        Randomising all 18 bytes would put random bit patterns in the fp16 scale, and a
+        good share of those decode to NaN/Inf -- the comparison would then be NaN vs NaN
+        and prove nothing. So the payload is random and the scale is a fixed small value.
+        """
+        buf = torch.randint(0, 256, (*shape, blocks, 18), dtype=torch.uint8)
+        scale = torch.tensor([0.05], dtype=torch.float16).view(torch.uint8)  # 2 bytes
+        buf[..., :2] = scale
+        return buf.reshape(*shape, blocks * 18)
+
     # identical packed bytes for both layers
-    gate_up = torch.randint(0, 256, (E, 2 * I, gu_row), dtype=torch.uint8)
-    down = torch.randint(0, 256, (E, H, dn_row), dtype=torch.uint8)
+    gate_up = q4_0_bank(E, 2 * I, blocks=H // 32)
+    down = q4_0_bank(E, H, blocks=I // 32)
 
     banks = {"gate_up": [HB((E, 2 * I, gu_row), torch.uint8) for _ in range(2)],
              "down": [HB((E, H, dn_row), torch.uint8) for _ in range(2)]}
