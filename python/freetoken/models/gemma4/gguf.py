@@ -25,7 +25,6 @@ from freetoken.models.config import (
 from freetoken.models.gguf.dequant import (
     GGML_NAME,
     GGML_Q4_0,
-    GGML_Q6_K,
     dequantize,
     row_bytes,
 )
@@ -101,6 +100,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     )
 
     _expert_tag = GGML_NAME[_expert_ggml_type(shim.model_path)].lower()
+    _embed_qt = _tensor_ggml_type(shim.model_path, "token_embd.weight")
     return ModelConfig(
         num_layers=num_layers,
         num_qo_heads=num_qo_heads,
@@ -122,6 +122,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         moe_enabled=True,
         expert_quant=_expert_tag,
         moe_weight_format=_expert_tag,
+        gguf_embed_quant=_embed_qt,
         use_qk_norm=True,
         attn_sm_scale=1.0,
         final_logit_softcapping=float(g("final_logit_softcapping")),
@@ -189,6 +190,19 @@ def _expert_ggml_type(model_path: str) -> int:
     raise ValueError(f"{model_path}: no routed-expert tensors ({', '.join(_EXPERT_SUFFIXES)})")
 
 
+
+def _tensor_ggml_type(model_path: str, name: str) -> int:
+    """ggml type of one named tensor. Like the expert quant, the embedding table's
+    type is a per-tensor property: Google's own Gemma-4 GGUF stores token_embd as
+    Q6_K while other repacks of the same model use Q4_0."""
+    from freetoken.models.gguf.reader import _reader
+
+    for t in _reader(model_path).tensors:
+        if t.name == name:
+            return int(t.ggml_type)
+    raise ValueError(f"{model_path}: no tensor named {name!r}")
+
+
 def _to_bf16(t) -> torch.Tensor:
     """Dequantize a GgufTensor (F32/F16/Q*) to a dense bf16 tensor of its torch shape."""
     flat = dequantize(t.packed().reshape(-1), t.ggml_type, torch.bfloat16)
@@ -254,7 +268,7 @@ def iter_gguf_weights(
     for t in iter_gguf_tensors(model_path):
         name = t.name
         if name == "token_embd.weight":
-            yield "model.embed_tokens.qweight", t.packed()  # Q6_K packed table
+            yield "model.embed_tokens.qweight", t.packed()  # packed table, quant per checkpoint
             continue
         if name == "output_norm.weight":
             yield "model.norm.weight", _to_bf16(t)
@@ -381,10 +395,12 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
         )
 
     inner = model.model
+    embed_qt = config.gguf_embed_quant
+    assert embed_qt is not None, "gguf_embed_quant not set; parse_gguf_config must run first"
     embed = GGUFEmbedding(
         num_embeddings=config.vocab_size,
         embedding_dim=config.hidden_size,
-        quant_type=GGML_Q6_K,
+        quant_type=embed_qt,
         embed_scale=config.embedding_scale,
     )
     inner.embed_tokens = embed
@@ -396,7 +412,7 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
         swap_linear(layer.feed_forward.shared_mlp, "down_proj")
 
     if config.tie_word_embeddings:
-        model.lm_head = GGUFTiedLMHead(embed, GGML_Q6_K)
+        model.lm_head = GGUFTiedLMHead(embed, embed_qt)
 
 
 # --------------------------------------------------------------------------------------
