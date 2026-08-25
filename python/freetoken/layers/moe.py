@@ -6,7 +6,7 @@ from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_backend
 from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl, fused_topk
-from freetoken.models.gguf.dequant import GGUF_EXPERT_FORMATS
+from freetoken.gguf_quant import GGUF_EXPERT_FORMATS
 from freetoken.moe.offload_cache import OffloadMoeCache
 from freetoken.utils import div_even
 
