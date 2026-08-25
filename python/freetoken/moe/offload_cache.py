@@ -578,7 +578,11 @@ class OffloadMoeCache:
             assert not missing, f"resident bank {name!r} missing layers {missing}"
             for layer_id in layers:
                 t = per_layer[layer_id]
-                assert t.device == self.device, (name, layer_id, t.device)
+                # A tensor's device always carries an index; self.device may be the bare
+                # "cuda" the caller constructed the cache with, so compare index-tolerantly.
+                assert t.device.type == self.device.type and (
+                    self.device.index is None or t.device.index == self.device.index
+                ), (name, layer_id, t.device, self.device)
                 assert t.size(0) == self.num_experts, (name, layer_id, t.shape)
         overlap = layers & self.cpu_layer_ids
         assert not overlap, (
