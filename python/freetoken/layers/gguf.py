@@ -21,7 +21,14 @@ from freetoken.models.gguf.dequant import (
     GGML_F16,
     GGML_F32,
     GGML_NAME,
+    GGML_Q2_K,
+    GGML_Q3_K,
     GGML_Q4_0,
+    GGML_Q4_1,
+    GGML_Q4_K,
+    GGML_Q5_0,
+    GGML_Q5_1,
+    GGML_Q5_K,
     GGML_Q6_K,
     GGML_Q8_0,
     row_bytes,
@@ -32,9 +39,26 @@ from .base import BaseOP
 # ggml type groups for kernel dispatch (subset we build kernels for).
 _UNQUANTIZED = {GGML_F32, GGML_F16, GGML_BF16}
 # standard + k-quants: both an MMVQ (small-batch GEMV) and MMQ (large-batch) kernel exist.
-_MMVQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_DEQUANT = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
+# These are exactly the ggml types dispatched by all three entry points in
+# csrc/gguf/gguf_kernel.cu -- ggml_dequantize, ggml_mul_mat_vec_a8 (MMVQ) and
+# ggml_mul_mat_a8 (MMQ). The i-quants (16..23, 29) are deliberately left out:
+# MMVQ and dequantize handle them, but MMQ does not, so a large-batch matmul
+# would have no kernel to fall back to.
+_QUANTS = {
+    GGML_Q4_0,
+    GGML_Q4_1,
+    GGML_Q5_0,
+    GGML_Q5_1,
+    GGML_Q8_0,
+    GGML_Q2_K,
+    GGML_Q3_K,
+    GGML_Q4_K,
+    GGML_Q5_K,
+    GGML_Q6_K,
+}
+_MMVQ = set(_QUANTS)
+_MMQ = set(_QUANTS)
+_DEQUANT = set(_QUANTS)
 
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
 _MMVQ_SAFE = 6
