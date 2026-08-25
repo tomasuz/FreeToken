@@ -228,3 +228,95 @@ def test_copy_plan_nulls_resident_sources():
     if cache._copy_fused_ok:
         assert cache._copy_src_ptrs_host[2] == [0, 0]
         assert all(p != 0 for p in cache._copy_src_ptrs_host[1])
+
+
+# ---------------------------------------------------------------------------
+# flag resolution
+# ---------------------------------------------------------------------------
+
+
+class _Cfg:
+    moe_backend = "offload"
+
+    def __init__(self, spec):
+        self.moe_resident_layers = spec
+
+
+def test_resolve_resident_layers_spec_forms():
+    from freetoken.engine.engine import _RESIDENT_AUTO, _resolve_resident_layers
+
+    assert _resolve_resident_layers(_Cfg(None), 30) == frozenset()
+    assert _resolve_resident_layers(_Cfg(""), 30) == frozenset()
+    assert _resolve_resident_layers(_Cfg("auto"), 30) == _RESIDENT_AUTO
+    assert _resolve_resident_layers(_Cfg("3,7,11"), 30) == frozenset({3, 7, 11})
+    # a count is placed from the ends, where decode miss rates are highest
+    assert sorted(_resolve_resident_layers(_Cfg("4"), 30)) == [0, 1, 28, 29]
+    assert len(_resolve_resident_layers(_Cfg("0.5"), 30)) == 15
+    assert _resolve_resident_layers(_Cfg("30"), 30) == frozenset(range(30))
+
+
+def test_resolve_resident_layers_is_offload_only():
+    cfg = _Cfg("8")
+    cfg.moe_backend = "fused"
+    from freetoken.engine.engine import _resolve_resident_layers
+
+    assert _resolve_resident_layers(cfg, 30) == frozenset()
+
+
+def test_resolve_resident_layers_rejects_out_of_range():
+    from freetoken.engine.engine import _resolve_resident_layers
+
+    with pytest.raises(ValueError, match="out of range"):
+        _resolve_resident_layers(_Cfg("0,99"), 30)
+    with pytest.raises(ValueError, match="must be in"):
+        _resolve_resident_layers(_Cfg("31"), 30)
+
+
+def test_auto_cache_size_excludes_resident_layers():
+    """A resident layer must not be sized for a slot, and its VRAM is charged as weights."""
+    from freetoken.engine.engine import Engine
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    class StubModelConfig:
+        num_experts = 4
+        num_moe_layers = 4
+        num_layers = 4
+        head_dim = 8
+        num_key_value_heads = 1
+        dtype = torch.float16
+
+        def kv_cache_group_specs(self):
+            return []
+
+    class StubConfig:
+        moe_prefill_overlap = False
+        memory_ratio = 0.9
+        kv_reserve_tokens = 0
+        page_size = 1
+        model_config = StubModelConfig()
+
+        class tp_info:
+            size = 1
+
+    class Banks:
+        quant_format = "bf16"
+        sources = {
+            "gate_up": [torch.zeros(4, 32, 8, dtype=torch.float16)] * 4,
+            "down": [torch.zeros(4, 8, 16, dtype=torch.float16)] * 4,
+        }
+
+        def __init__(self, resident, resident_bytes=0):
+            self.resident_layers = frozenset(resident)
+            self.resident_bytes = resident_bytes
+
+    engine = Engine.__new__(Engine)  # bypass __init__/GPU
+    engine._baseline_free = 10_000_000
+    engine._weights_bytes = 1_000_000
+    engine._pool_cls = MHAKVCache
+
+    all_offload, _, _ = engine._resolve_auto_moe_cache_size(StubConfig(), Banks(()))
+    half_resident, _, _ = engine._resolve_auto_moe_cache_size(StubConfig(), Banks({0, 3}))
+    # half the layers gone from the offload population -> the cache is sized for half the
+    # experts (capped by the same budget, so this is an upper bound that must shrink)
+    assert half_resident < all_offload
+    assert half_resident >= StubModelConfig.num_experts  # never below the slot floor
