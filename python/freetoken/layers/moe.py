@@ -304,6 +304,9 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
+        if cache.is_resident_layer(self.layer_id):
+            return self._resident_expert_gemm(cache, hidden_states, topk_weights, topk_ids,
+                                              is_prefill=False)
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
@@ -384,6 +387,13 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if cache.is_resident_layer(self.layer_id):
+            if self.layer_id == 0:
+                # begin_prefill normally rides on _wait_prefill_overlap's layer-0 call; a
+                # resident layer 0 never gets there, so open the prefill here instead.
+                cache.begin_prefill()
+            return self._resident_expert_gemm(cache, hidden_states, topk_weights, topk_ids,
+                                              is_prefill=True)
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -409,6 +419,33 @@ class OffloadMoELayer(MoELayer):
             n=self.num_experts,
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
+        )
+
+    def _resident_expert_gemm(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        *,
+        is_prefill: bool,
+    ) -> torch.Tensor:
+        """Expert compute for a VRAM-resident layer: no movement at all.
+
+        The layer's banks are already ``[num_experts, ...]`` on the device, so this is the
+        materialized-prefill shape in both directions -- position == expert id, hence raw
+        ``topk_ids`` (no slot rewrite) and ``alphas_for_layer``. Skipping
+        ``ensure_experts``/``copy_missing`` is the whole point: nothing crosses PCIe and no
+        slot is spent, which is why a resident layer needs no host bank to exist."""
+        return self._expert_gemm(
+            cache,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            views=cache.resident_views(self.layer_id),
+            n=self.num_experts,
+            alphas=cache.alphas_for_layer(self.layer_id),
+            is_prefill=is_prefill,
         )
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
