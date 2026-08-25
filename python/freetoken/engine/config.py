@@ -48,6 +48,20 @@ class EngineConfig:
     # fraction ("0.5"). None/"" = all layers on GPU (plain offload). --moe-backend cpu
     # already means all layers on CPU and ignores this.
     moe_cpu_layers: str | None = None
+    # Resident MoE tier (--moe-backend offload/hybrid): which MoE layers keep their experts
+    # in VRAM ONLY -- uploaded during the bank load, host banks released immediately, never
+    # given a slot in the offload cache. This is what stops a layer's weights from existing
+    # in RAM and VRAM at once: host RAM only has to hold the layers that stay offloaded.
+    # Same spec syntax as moe_cpu_layers, but a count/fraction is placed from both ends
+    # (highest-miss layers first); "auto" fills VRAM after weights, KV and the slot-cache
+    # floor. None/"" = no resident tier. Must not overlap moe_cpu_layers.
+    moe_resident_layers: str | None = None
+    # Directory for file-backed (spillable) expert banks; exported as
+    # FREETOKEN_BANK_SPILL_DIR. Host banks then cost reclaimable page cache instead of
+    # anonymous RAM, so the offloaded tier degrades to paging speed instead of OOM when it
+    # does not fit. Must be real storage -- a tmpfs (/dev/shm) spill file is unevictable and
+    # buys nothing. None = anonymous mmap (the default).
+    moe_bank_spill_dir: str | None = None
     # Hybrid MoE backend (--moe-backend hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
     # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's

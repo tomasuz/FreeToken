@@ -51,9 +51,65 @@ class ExpertBanks:
     # streamed straight to its sink instead of staying materialized here) -- set by
     # convert.py's per-format streaming gate; ``sources`` may hold released tensors.
     streamed: bool = False
+    # GPU-RESIDENT layers: {bank name: {layer_id: [num_experts, ...] device tensor}}. These
+    # layers' experts live in VRAM only -- their host banks were uploaded and released at
+    # load time, so ``sources`` still holds correctly shaped tensors whose PAGES ARE GONE.
+    # Nothing may read them; the cache excludes these layers from every copy path.
+    resident: dict[str, dict[int, torch.Tensor]] = field(default_factory=dict)
+    resident_layers: frozenset = field(default_factory=frozenset)
+    # VRAM the resident tier took. The auto cache sizer must charge it against the same
+    # budget as the weights (it was allocated after the engine's free-memory baseline).
+    resident_bytes: int = 0
 
 
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
+
+
+class ResidentUploader:
+    """Moves a claimed layer's expert banks into VRAM as they finish loading.
+
+    The point of the resident tier is that a layer's experts exist in exactly ONE place. So
+    the copy has to happen *during* the load, at layer-completion time, and be followed by
+    ``HostBank.release()`` -- allocating every host bank first and freeing afterwards would
+    still take the full host-RAM peak this exists to avoid. The banks are lazy mmaps, so
+    only the layers in flight are ever resident on the host.
+
+    The copy source is unregistered host memory, so ``Tensor.to`` is a synchronous
+    (staging-buffer) H2D: it has fully landed before ``upload`` returns, which is what makes
+    the caller's immediate ``release()`` safe. Runs on the ``PinPipeline`` worker, hence the
+    explicit ``set_device`` -- CUDA's current device is thread-local.
+    """
+
+    def __init__(self, layers: frozenset, device: torch.device) -> None:
+        self.layers = layers
+        self._device = device
+        self._lock = threading.Lock()
+        self.banks: dict[str, dict[int, torch.Tensor]] = {}
+        self.bytes_uploaded = 0
+
+    def claims(self, layer_id: int) -> bool:
+        return layer_id in self.layers
+
+    def upload(self, layer_id: int, banks) -> None:
+        if self._device.type == "cuda":
+            torch.cuda.set_device(self._device)
+        staged = {
+            name: bank.tensor.to(self._device, non_blocking=False)
+            for name, bank in banks.items()
+        }
+        if self._device.type == "cuda":
+            torch.cuda.synchronize(self._device)  # belt and braces before the release()
+        nbytes = sum(t.numel() * t.element_size() for t in staged.values())
+        with self._lock:
+            for name, tensor in staged.items():
+                self.banks.setdefault(name, {})[layer_id] = tensor
+            self.bytes_uploaded += nbytes
+
+    def missing(self) -> list[int]:
+        """Claimed layers that never completed (a loader that bypassed the sink)."""
+        done = set.intersection(*(set(m) for m in self.banks.values())) if self.banks else set()
+        return sorted(self.layers - done)
+
 
 
 def _v4_unsupported(quant):
@@ -430,6 +486,7 @@ def load_expert_banks(
     decode_target: str = "gpu",
     layer_sink=None,
     layer_residency: list[str] | None = None,
+    resident_layers: frozenset | None = None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -450,6 +507,10 @@ def load_expert_banks(
 
     ``layer_residency``: per-layer ``HostResidency`` labels applied at settle time -- explicitly on the FTW fast path, ambiently (``requested_residency``) in the slow-path providers.
     Applied labels are echoed on ``ExpertBanks.layer_residency``; a loader that settles some other way leaves it ``None`` (CPU-layer decode still works on pinned banks, it just saves no pin quota).
+
+    ``resident_layers``: layers whose experts should live in VRAM ONLY. Each is uploaded at
+    layer-completion time and its host banks released (see :class:`ResidentUploader`), so the
+    host never holds more than the layers in flight. Reported on ``ExpertBanks.resident``.
     """
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
 
@@ -459,6 +520,12 @@ def load_expert_banks(
             layer_residency=layer_residency,
         )
         if banks is not None:
+            if resident_layers:
+                raise NotImplementedError(
+                    "--moe-resident-layers is not supported for FTW checkpoints yet: "
+                    "load_ftw_banks settles its own banks and never drives the layer sink "
+                    "the resident uploader hooks. Serve the original checkpoint instead."
+                )
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
             return banks
 
@@ -490,9 +557,12 @@ def load_expert_banks(
     # OSError on those (which would leak the banks it pre-allocated, since host banks live for
     # the process). Only NotImplementedError (quant has no parallel reader; raised before any
     # allocation) falls back to serial.
-    from freetoken.moe.host_banks import requested_residency
+    from freetoken.moe.host_banks import requested_residency, resident_upload
 
-    with requested_residency(layer_residency) as residency_plan:
+    uploader = (
+        ResidentUploader(resident_layers, device) if resident_layers else None
+    )
+    with requested_residency(layer_residency) as residency_plan, resident_upload(uploader):
         try:
             banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk,
                                         decode_target, layer_sink)
@@ -502,7 +572,34 @@ def load_expert_banks(
             logger.warning_rank0(f"parallel reader unavailable ({exc}); falling back to serial build")
             banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, False, workers, chunk,
                                         decode_target, layer_sink)
-    return _echo_residency(banks, layer_residency, residency_plan)
+    return _echo_resident(_echo_residency(banks, layer_residency, residency_plan), uploader)
+
+
+def _echo_resident(banks: ExpertBanks, uploader: "ResidentUploader | None") -> ExpertBanks:
+    """Stamp the uploaded VRAM banks onto the ExpertBanks, or fail loudly if the loader
+    never fired the layer sink (which would silently leave those layers unbacked)."""
+    if uploader is None:
+        return banks
+    import dataclasses
+
+    missing = uploader.missing()
+    if missing:
+        raise RuntimeError(
+            f"--moe-resident-layers: this checkpoint's bank loader did not report layer "
+            f"completion for layers {missing}, so their experts were never uploaded. "
+            f"Resident experts need a loader that drives a layer sink (LayerCompletionTracker "
+            f"/ pin_banks); drop --moe-resident-layers for this checkpoint."
+        )
+    logger.info_rank0(
+        f"resident experts: {len(uploader.layers)} layers in VRAM "
+        f"({uploader.bytes_uploaded / 2**30:.2f} GiB), host banks released"
+    )
+    return dataclasses.replace(
+        banks,
+        resident=uploader.banks,
+        resident_layers=uploader.layers,
+        resident_bytes=uploader.bytes_uploaded,
+    )
 
 
 def _echo_residency(banks: ExpertBanks, requested, plan) -> ExpertBanks:
