@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // adapted from
 // https://github.com/vllm-project/vllm/blob/4492e3a55428e161ca8db381edc28263e5da4c8d/csrc/quantization/gguf/ggml-common.h
 // copied from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-common.h
@@ -931,7 +932,7 @@ typedef half dfloat;  // dequantize float
 typedef half2 dfloat2;
 typedef void (*dequantize_kernel_t)(const void* vx, const int ib, const int iqs, dfloat2& v);
 template <typename dst_t>
-using to_cuda_ggml_t = void (*)(const void* __restrict__ x, dst_t* __restrict__ y, int k, cudaStream_t stream);
+using to_cuda_ggml_t = void (*)(const void* __restrict__ x, dst_t* __restrict__ y, int k, hipStream_t stream);
 typedef float (*vec_dot_q_cuda_t)(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs);
 typedef void (*allocate_tiles_cuda_t)(int** x_ql, half2** x_dm, int** x_qh, int** x_sc);
 typedef void (*load_tiles_cuda_t)(

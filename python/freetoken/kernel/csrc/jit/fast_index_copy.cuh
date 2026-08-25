@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 #include <freetoken/tensor.h>
 #include <freetoken/utils.cuh>
 #include <freetoken/utils.h>
@@ -128,19 +129,19 @@ __always_inline __device__ void store_vec(void* __restrict__ dst, const Tp& vec)
 
 
 // Pinned host memory is GPU-dereferenceable at its host VA only where UVA identity
-// holds (Linux). On Windows/WDDM, cudaHostRegister'd memory maps to a different device
+// holds (Linux). On Windows/WDDM, hipHostRegister'd memory maps to a different device
 // address, so host-resident tensors are translated here -- the one point their pointer
 // enters kernel params. Cached once per process: FreeToken pins one CUDA device per
 // process (set at engine launch).
 inline bool host_ptr_identity() {
     static const bool identity = [] {
         int device = 0;
-        if (cudaGetDevice(&device) != cudaSuccess) {
+        if (hipGetDevice(&device) != hipSuccess) {
             return false;  // fail closed: translate (and surface errors), don't assume identity
         }
         int uva = 0, reg = 0;
-        cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device);
-        cudaDeviceGetAttribute(&reg, cudaDevAttrCanUseHostPointerForRegisteredMem, device);
+        hipDeviceGetAttribute(&uva, hipDeviceAttributeUnifiedAddressing, device);
+        hipDeviceGetAttribute(&reg, hipDeviceAttributeCanUseHostPointerForRegisteredMem, device);
         return uva == 1 && reg == 1;
     }();
     return identity;
@@ -151,10 +152,10 @@ inline void* device_alias(void* ptr, DLDevice dev) {
         return ptr;
     }
     void* mapped = nullptr;
-    const auto err = cudaHostGetDevicePointer(&mapped, ptr, 0);
-    host::RuntimeCheck(err == cudaSuccess,
-        "fast_index_copy: host tensor must be pinned+mapped (cudaHostGetDevicePointer: ",
-        cudaGetErrorString(err), ")");
+    const auto err = hipHostGetDevicePointer(&mapped, ptr, 0);
+    host::RuntimeCheck(err == hipSuccess,
+        "fast_index_copy: host tensor must be pinned+mapped (hipHostGetDevicePointer: ",
+        hipGetErrorString(err), ")");
     return mapped;
 }
 

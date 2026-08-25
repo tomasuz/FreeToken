@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 #include <freetoken/nccl227.h>
 #include <freetoken/tensor.h>
 #include <freetoken/utils.cuh>
@@ -106,8 +107,8 @@ public:
       const auto buf_ptr = m_sym_mem.get();
       const auto need_memcpy = (buf_ptr != data_ptr);
       if (need_memcpy) {
-        CUDA_CHECK(::cudaMemcpyAsync(buf_ptr, data_ptr, size_bytes,
-                                     ::cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(::hipMemcpyAsync(buf_ptr, data_ptr, size_bytes,
+                                     ::hipMemcpyDeviceToDevice, stream));
       }
       NCCL_CHECK(::ncclAllReduce(
           /*sendbuff=*/buf_ptr,
@@ -118,8 +119,8 @@ public:
           /*comm=*/m_comm.get(),
           /*stream=*/stream));
       if (need_memcpy) {
-        CUDA_CHECK(::cudaMemcpyAsync(data_ptr, buf_ptr, size_bytes,
-                                     ::cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(::hipMemcpyAsync(data_ptr, buf_ptr, size_bytes,
+                                     ::hipMemcpyDeviceToDevice, stream));
       }
     } else {
       NCCL_CHECK(::ncclAllReduce(

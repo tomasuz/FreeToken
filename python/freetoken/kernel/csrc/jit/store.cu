@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 #include <freetoken/tensor.h>
 #include <freetoken/utils.cuh>
 #include <freetoken/utils.h>
