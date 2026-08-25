@@ -345,11 +345,14 @@ def test_resident_layer_matches_offload_path_bitwise():
     over ``alphas_for_layer``. Layer 0 is served resident, layer 1 through the ordinary
     host-bank -> materialize -> slot-cache path, from byte-identical banks.
     """
+    from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.layers.moe import OffloadMoELayer
     from freetoken.moe.host_banks import HostBank as HB
     from freetoken.moe.offload_cache import OffloadMoeCache
     from freetoken.models.gguf.dequant import GGML_Q4_0, row_bytes
 
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
     device = torch.device("cuda")
     torch.manual_seed(0)
     E, H, I, tokens, top_k = 4, 64, 64, 3, 2
