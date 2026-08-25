@@ -276,23 +276,32 @@ def test_auto_cache_size_excludes_resident_layers():
     """A resident layer must not be sized for a slot, and its VRAM is charged as weights."""
     from freetoken.engine.engine import Engine
     from freetoken.kvcache.mha_pool import MHAKVCache
+    from freetoken.models.config import KVCacheGroupSpec
 
     class StubModelConfig:
+        has_swa_attention = False
         num_experts = 4
-        num_moe_layers = 4
-        num_layers = 4
-        head_dim = 8
-        num_key_value_heads = 1
-        dtype = torch.float16
+        num_moe_layers = 4  # total_experts = 16 with no resident tier
 
         def kv_cache_group_specs(self):
-            return []
+            return [KVCacheGroupSpec(
+                name="full", layer_ids=(0, 1, 2, 3), num_kv_heads=8, head_dim=64,
+                sliding_window=None,
+            )]
+
+        def linear_attention_group(self):
+            return None
 
     class StubConfig:
-        moe_prefill_overlap = False
+        dtype = torch.float16
+        page_size = 16
+        max_running_req = 4
+        hybrid_swa_cache_mode = "auto"
         memory_ratio = 0.9
+        moe_prefill_overlap = False
         kv_reserve_tokens = 0
-        page_size = 1
+        swa_full_tokens_ratio = 0.2
+        swa_num_pages_override = None
         model_config = StubModelConfig()
 
         class tp_info:
