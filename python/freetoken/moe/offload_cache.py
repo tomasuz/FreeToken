@@ -8,20 +8,7 @@ from typing import Iterator
 import torch
 from flashlib.kernels.slot_cache import N_STATS, Stat
 
-from freetoken.models.gguf.dequant import (
-    GGML_NAME,
-    GGML_Q2_K,
-    GGML_Q3_K,
-    GGML_Q4_0,
-    GGML_Q4_1,
-    GGML_Q4_K,
-    GGML_Q5_0,
-    GGML_Q5_1,
-    GGML_Q5_K,
-    GGML_Q6_K,
-    GGML_Q8_0,
-    row_bytes,
-)
+from freetoken.models.gguf.dequant import GGUF_EXPERT_FORMATS, row_bytes
 
 # Fuse the per-bank expert copies into a single multi-bank launch (one per copy_missing
 # instead of one per bank). Set FREETOKEN_FUSED_COPY=0 to force the legacy per-bank path
@@ -108,22 +95,6 @@ _BANK_BYTES_PER_EXPERT = {
 # in how many bytes a row of packed blocks takes, so register the whole family from
 # one description instead of hand-writing a table row per quant. "q4_0" keeps its
 # existing spelling and behaviour; the others are new.
-_GGUF_EXPERT_QUANTS = (
-    GGML_Q4_0,
-    GGML_Q4_1,
-    GGML_Q5_0,
-    GGML_Q5_1,
-    GGML_Q8_0,
-    GGML_Q2_K,
-    GGML_Q3_K,
-    GGML_Q4_K,
-    GGML_Q5_K,
-    GGML_Q6_K,
-)
-
-# format tag <-> ggml type, e.g. "q5_k" <-> GGML_Q5_K. Lowercased so the pre-existing
-# "q4_0" tag is unchanged.
-GGUF_EXPERT_FORMATS = {GGML_NAME[t].lower(): t for t in _GGUF_EXPERT_QUANTS}
 
 
 def _gguf_bank_bytes(ggml_type: int):
