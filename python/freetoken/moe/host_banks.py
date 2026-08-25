@@ -71,24 +71,97 @@ def born_pinned_default() -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# File-backed (spillable) banks
+# ---------------------------------------------------------------------------
+
+# Linux fallocate(2) flags for returning a punched range to the filesystem.
+_FALLOC_FL_KEEP_SIZE = 0x01
+_FALLOC_FL_PUNCH_HOLE = 0x02
+
+
+def bank_spill_dir() -> str | None:
+    """Directory for file-backed expert banks, or ``None`` to keep them anonymous.
+
+    Set ``FREETOKEN_BANK_SPILL_DIR`` (or pass ``--moe-bank-spill-dir``, which exports it)
+    to a path on a fast local filesystem. Point it at real storage, not ``/dev/shm`` or
+    another tmpfs: tmpfs pages are unevictable, so a tmpfs spill file is just an anonymous
+    mmap with extra steps.
+    """
+    d = os.environ.get("FREETOKEN_BANK_SPILL_DIR", "").strip()
+    return d or None
+
+
+def bank_backing_default() -> str:
+    """Pick the default :class:`HostBank` backing from the environment + ambient plan.
+
+    ``cuda`` (born pinned) only when explicitly asked for AND no residency plan wants
+    unpinned layers -- cudaHostAlloc spends the very pin quota such a plan exists to save.
+    ``file`` when a spill dir is configured. Otherwise the anonymous lazy mmap.
+    """
+    plan = _requested_residency
+    born = _env_born_pinned() and (plan is None or not plan.has_unpinned)
+    if born:
+        return "cuda"
+    return "file" if bank_spill_dir() is not None else "mmap"
+
+
+def _open_spill_file(size: int):
+    """A sparse, already-unlinked scratch file of ``size`` bytes in :func:`bank_spill_dir`."""
+    import tempfile
+
+    d = bank_spill_dir()
+    f = tempfile.TemporaryFile(dir=d)  # unlinked (or O_TMPFILE) -> cannot leak on crash
+    try:
+        os.ftruncate(f.fileno(), size)  # sparse: no blocks allocated until written
+    except OSError:
+        f.close()
+        raise
+    return f
+
+
+def _punch_hole(fd: int, size: int) -> None:
+    """Best-effort ``fallocate(FALLOC_FL_PUNCH_HOLE)`` over the whole spill file.
+
+    Returns the blocks to the filesystem after the bank's pages have been dropped. Silently
+    does nothing where the filesystem does not support hole punching -- the mapping stays
+    correct either way (a hole reads as zero, and a released bank's contents are undefined).
+    """
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.fallocate(
+            ctypes.c_int(fd),
+            ctypes.c_int(_FALLOC_FL_KEEP_SIZE | _FALLOC_FL_PUNCH_HOLE),
+            ctypes.c_longlong(0),
+            ctypes.c_longlong(size),
+        )
+    except (OSError, AttributeError, ValueError):
+        pass
+
+
 class HostBank:
     """A page-aligned host buffer + its torch view, page-locked on demand: allocate -> fill -> ``pin()``/``lock()``.
 
     * ``"mmap"`` (default) -- lazy anonymous mmap; pages materialize on fill, then ``pin()`` registers or ``lock()`` OS-locks it.
     * ``"cuda"`` -- cudaHostAlloc, born pinned+mapped; ``pin()``/``lock()``/``release()`` are no-ops and it never takes LOCKED. See :func:`born_pinned_default`.
+    * ``"file"`` -- mmap of a sparse scratch file under :func:`bank_spill_dir`. Identical to
+      ``"mmap"`` for every consumer, but the pages are **file-backed**: the kernel can
+      reclaim them under memory pressure and re-read from the spill file instead of
+      pushing anonymous pages to swap (or OOM-killing). An unpinned file bank therefore
+      costs page cache, not committed RAM -- the difference between a hard "banks must fit
+      in RAM" wall and a soft, paging-speed one. ``pin()`` still works (registering
+      file-backed pages is legal) but makes them unreclaimable again, so a spilled bank is
+      normally left PAGEABLE/LOCKED. See :func:`bank_backing_default`.
 
-    The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
+    The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC`` / ``FREETOKEN_BANK_SPILL_DIR``."""
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked")
+    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_spill")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
                  *, backing: str | None = None):
         if backing is None:
-            plan = _requested_residency
-            # a plan with non-pinned labels vetoes born-pinned: cudaHostAlloc spends the pin quota the plan exists to save
-            born = _env_born_pinned() and (plan is None or not plan.has_unpinned)
-            backing = "cuda" if born else "mmap"
-        assert backing in ("mmap", "cuda"), backing
+            backing = bank_backing_default()
+        assert backing in ("mmap", "cuda", "file"), backing
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
         asize = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
@@ -104,11 +177,23 @@ class HostBank:
             self.addr = raw.data_ptr() + off
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
+            self._spill = None
+        elif backing == "file":
+            # Sparse spill file, unlinked immediately: the mapping keeps it alive, so it
+            # never outlives the process and no cleanup path can leak it. Pages are still
+            # lazy (a hole reads as zero, same guarantee as the anonymous map) but they are
+            # now RECLAIMABLE -- eviction writes them to the spill file instead of swap.
+            self._spill = _open_spill_file(asize)
+            self._buf = mmap.mmap(self._spill.fileno(), asize)
+            _LIVE_BUFFERS.append(self._buf)
+            self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
+            self._pinned = False
         else:
             self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False
+            self._spill = None
         self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
         self._locked = False
 
@@ -144,10 +229,16 @@ class HostBank:
     def release(self) -> None:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
 
-        For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped."""
+        For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped.
+
+        A file-backed bank additionally punches a hole in its spill file, so the bytes are
+        returned to the filesystem too -- ``MADV_DONTNEED`` alone would only drop the RAM
+        copy and leave the (now useless) file blocks allocated."""
         if self._pinned:
             return
         self._buf.madvise(mmap.MADV_DONTNEED)
+        if self._spill is not None:
+            _punch_hole(self._spill.fileno(), len(self._buf))
 
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.
