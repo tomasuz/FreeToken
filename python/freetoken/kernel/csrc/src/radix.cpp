@@ -1,4 +1,3 @@
-#include "hip/hip_runtime.h"
 #include <freetoken/utils.h>
 
 #include <dlpack/dlpack.h>
