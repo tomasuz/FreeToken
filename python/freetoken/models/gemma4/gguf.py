@@ -186,7 +186,7 @@ def _expert_ggml_type(model_path: str) -> int:
 
     for t in _reader(model_path).tensors:
         if any(t.name.endswith(sfx) for sfx in _EXPERT_SUFFIXES):
-            return int(t.ggml_type)
+            return int(t.tensor_type)
     raise ValueError(f"{model_path}: no routed-expert tensors ({', '.join(_EXPERT_SUFFIXES)})")
 
 
@@ -199,7 +199,7 @@ def _tensor_ggml_type(model_path: str, name: str) -> int:
 
     for t in _reader(model_path).tensors:
         if t.name == name:
-            return int(t.ggml_type)
+            return int(t.tensor_type)
     raise ValueError(f"{model_path}: no tensor named {name!r}")
 
 
