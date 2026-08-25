@@ -68,7 +68,7 @@ _ACT_IDS = {
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
-from .offload_cache import GGUF_EXPERT_FORMATS  # noqa: E402
+from freetoken.models.gguf.dequant import GGUF_EXPERT_FORMATS
 
 _WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
 

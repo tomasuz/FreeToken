@@ -24,7 +24,9 @@ import torch
 
 from freetoken.utils import init_logger
 
-from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS, GGUF_EXPERT_FORMATS
+from freetoken.models.gguf.dequant import GGUF_EXPERT_FORMATS
+
+from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS
 
 logger = init_logger(__name__)
 
