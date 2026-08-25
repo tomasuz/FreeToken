@@ -324,14 +324,16 @@ def load_nvfp4_moe_expert_sources(
     return loader(model_path, model_config, layer_sink=layer_sink)
 
 
-def load_q4_0_moe_expert_sources(
+def load_gguf_moe_expert_sources(
     model_path: str,
     model_config,
     *,
     dummy: bool = False,
     layer_sink=None,
 ) -> dict:
-    """Load (or fabricate, with ``dummy=True``) packed GGUF Q4_0 expert source banks.
+    """Load (or fabricate, with ``dummy=True``) packed GGUF expert source banks.
+    The ggml quant is whatever the checkpoint stores; the model override reads it off
+    the config rather than assuming Q4_0.
     ``layer_sink`` (converter) streams each completed layer's banks; ignored for dummy."""
     _config, spec = _spec_for_model_path(model_path)
     if dummy:
