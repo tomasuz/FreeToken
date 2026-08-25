@@ -298,14 +298,58 @@ def alloc_banks(specs: dict[str, tuple[tuple[int, ...], torch.dtype]]) -> dict[s
     return {name: HostBank(shape, dtype) for name, (shape, dtype) in specs.items()}
 
 
+def _layer_backing(layer_id: int) -> str | None:
+    """Backing for one per-layer bank, or ``None`` to take the ambient default.
+
+    Spilling a bank to disk only pays off when its pages can actually be reclaimed, and
+    two common cases guarantee they cannot:
+
+    * **Resident layers** -- the bank is a transient staging buffer, filled once, uploaded
+      to VRAM and released within the same layer's lifetime. It is never read again, so a
+      spill file would buy nothing and cost a full write of the layer plus the writeback
+      pressure that comes with it.
+    * **PINNED / LOCKED layers** -- ``cudaHostRegister`` and ``mlock`` both make the pages
+      unevictable, so a file-backed bank is exactly as resident as an anonymous one, only
+      with writeback on top.
+
+    That leaves PAGEABLE layers, which are the ones the spill dir exists for.
+    """
+    uploader = _resident_uploader
+    if uploader is not None and uploader.claims(layer_id):
+        return "mmap"
+    plan = _requested_residency
+    if plan is None:
+        return "mmap"  # no plan means every layer pins (see pin_banks) -> unevictable
+    # read the label directly: residency_for() flips the plan's `applied` flag, and
+    # choosing a backing is not the settle point that flag tracks
+    if plan.labels[layer_id] != HostResidency.PAGEABLE.value:
+        return "mmap"
+    return None  # PAGEABLE: take the ambient default, i.e. spill when a dir is configured
+
+
 def alloc_layer_banks(
     specs: dict[str, tuple[tuple[int, ...], torch.dtype]], num_layers: int
 ) -> dict[str, list[HostBank]]:
     """Allocate per-layer host banks: ``{name: ([num_experts, ...] row shape, dtype)}``
     -> one independently allocated (page-aligned, independently pin/lock-able)
-    ``HostBank`` per layer per name."""
+    ``HostBank`` per layer per name.
+
+    Backing is decided per layer (see :func:`_layer_backing`), so a spill dir only reaches
+    the layers that can actually benefit from it."""
+    if bank_spill_dir() is not None:
+        spilled = [l for l in range(num_layers) if _layer_backing(l) is None]
+        if not spilled:
+            logger.info_rank0(
+                "--moe-bank-spill-dir: no layer is pageable (resident, pinned and locked "
+                "banks are all unevictable), so every bank stays anonymous"
+            )
+        else:
+            logger.info_rank0(f"--moe-bank-spill-dir: spilling {len(spilled)} pageable layers")
     return {
-        name: [HostBank(shape, dtype) for _ in range(num_layers)]
+        name: [
+            HostBank(shape, dtype, backing=_layer_backing(layer_id))
+            for layer_id in range(num_layers)
+        ]
         for name, (shape, dtype) in specs.items()
     }
 
