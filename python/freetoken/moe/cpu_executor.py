@@ -68,6 +68,8 @@ _ACT_IDS = {
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
+from .offload_cache import GGUF_EXPERT_FORMATS  # noqa: E402
+
 _WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
 
 
@@ -366,6 +368,15 @@ class CpuMoeExecutor:
 
         if fmt == "q4_0":
             return self._resolve_q4_0_banks(banks)
+
+        if fmt in GGUF_EXPERT_FORMATS:
+            # The compiled CPU path has hand-written AVX2/VNNI dot kernels for Q4_0
+            # only (q4_0_dot_i8_* in csrc/cpu_moe). Other ggml quants work on the GPU
+            # offload path but have no CPU counterpart yet.
+            raise NotImplementedError(
+                f"--moe-backend cpu supports GGUF q4_0 experts only; this checkpoint is "
+                f"{fmt}. Use --moe-backend offload (or fused) instead."
+            )
 
         if fmt == "mxfp4_triton":
             return self._resolve_mxfp4_banks(banks)

@@ -22,7 +22,14 @@ from freetoken.models.config import (
     RotaryConfig,
     SWAAttentionGroupConfig,
 )
-from freetoken.models.gguf.dequant import GGML_Q4_0, GGML_Q6_K, dequantize, row_bytes
+from freetoken.models.gguf.dequant import (
+    GGML_NAME,
+    GGML_Q4_0,
+    GGML_Q6_K,
+    dequantize,
+    row_bytes,
+)
+from freetoken.moe.offload_cache import GGUF_EXPERT_FORMATS
 
 if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
@@ -93,6 +100,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         scaling=None,
     )
 
+    _expert_tag = GGML_NAME[_expert_ggml_type(shim.model_path)].lower()
     return ModelConfig(
         num_layers=num_layers,
         num_qo_heads=num_qo_heads,
@@ -112,8 +120,8 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         model_type="gemma4",
         architectures=list(shim.architectures),
         moe_enabled=True,
-        expert_quant="q4_0",
-        moe_weight_format="q4_0",
+        expert_quant=_expert_tag,
+        moe_weight_format=_expert_tag,
         use_qk_norm=True,
         attn_sm_scale=1.0,
         final_logit_softcapping=float(g("final_logit_softcapping")),
@@ -163,6 +171,22 @@ _LAYER_SCALAR_MAP = {
 }
 # Expert weight tensors (handled by the offload bank loader, not iter_gguf_weights).
 _EXPERT_SUFFIXES = ("ffn_gate_up_exps.weight", "ffn_down_exps.weight")
+
+
+
+def _expert_ggml_type(model_path: str) -> int:
+    """ggml type of the routed-expert tensors in this checkpoint.
+
+    The quant is per tensor, not metadata, so read it off the first expert tensor
+    rather than assuming Q4_0. Every routed expert in a given file uses the same
+    type -- llama.cpp quantizes a tensor class uniformly.
+    """
+    from freetoken.models.gguf.reader import _reader
+
+    for t in _reader(model_path).tensors:
+        if any(t.name.endswith(sfx) for sfx in _EXPERT_SUFFIXES):
+            return int(t.ggml_type)
+    raise ValueError(f"{model_path}: no routed-expert tensors ({', '.join(_EXPERT_SUFFIXES)})")
 
 
 def _to_bf16(t) -> torch.Tensor:
@@ -382,9 +406,10 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
 def _q4_0_expert_specs(config: ModelConfig) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     E = config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
+    t = GGUF_EXPERT_FORMATS[str(config.expert_quant)]
     return {
-        "gate_up": ((E, 2 * I, row_bytes(H, GGML_Q4_0)), torch.uint8),
-        "down": ((E, H, row_bytes(I, GGML_Q4_0)), torch.uint8),
+        "gate_up": ((E, 2 * I, row_bytes(H, t)), torch.uint8),
+        "down": ((E, H, row_bytes(I, t)), torch.uint8),
     }
 
 
