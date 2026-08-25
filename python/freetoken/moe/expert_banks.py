@@ -24,7 +24,7 @@ import torch
 
 from freetoken.utils import init_logger
 
-from freetoken.models.gguf.dequant import GGUF_EXPERT_FORMATS
+from freetoken.gguf_quant import GGUF_EXPERT_FORMATS
 
 from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS
 

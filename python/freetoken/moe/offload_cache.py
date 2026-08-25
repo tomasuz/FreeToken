@@ -8,7 +8,7 @@ from typing import Iterator
 import torch
 from flashlib.kernels.slot_cache import N_STATS, Stat
 
-from freetoken.models.gguf.dequant import GGUF_EXPERT_FORMATS, row_bytes
+from freetoken.gguf_quant import GGUF_EXPERT_FORMATS, row_bytes
 
 # Fuse the per-bank expert copies into a single multi-bank launch (one per copy_missing
 # instead of one per bank). Set FREETOKEN_FUSED_COPY=0 to force the legacy per-bank path
