@@ -1,9 +1,10 @@
+#include "hip/hip_runtime.h"
 // CPU-compute MoE executor for the "cpu" offload backend.
 //
 // Decode ships activations to the CPU, computes the routed experts here (reading
 // the pinned host expert banks at full RAM bandwidth), and ships the results
 // back. To keep the whole decode path inside a single CUDA graph we expose
-// submit/sync as host nodes via cudaLaunchHostFunc -- the callbacks only touch a
+// submit/sync as host nodes via hipLaunchHostFunc -- the callbacks only touch a
 // CPU worker pool + pinned host buffers and never call any CUDA API.
 //
 // One task is in flight at a time (per MoE layer): submit() wakes the pool,
@@ -29,7 +30,7 @@
 #include <thread>
 #include <vector>
 
-#include <cuda_runtime_api.h>
+#include <hip/hip_runtime_api.h>
 #include <torch/extension.h>
 
 #if defined(__linux__)
@@ -574,7 +575,7 @@ float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float
 // which laptop CPU/GPU dynamic power schedulers answered by clamping the CPU's max
 // frequency (GEMV workers -1.5x: the reported edge regression). Availability is
 // probed functionally at startup (memops_probe); anything unsupported (Windows WDDM,
-// vGPU, old drivers) falls back to the cudaLaunchHostFunc path.
+// vGPU, old drivers) falls back to the hipLaunchHostFunc path.
 #if defined(_WIN32)
 #include <windows.h>
 static void* cumemop_dlopen() { return (void*)::LoadLibraryA("nvcuda.dll"); }
@@ -595,7 +596,7 @@ using cuMemOp64_fn = int (*)(void* stream, unsigned long long addr, unsigned lon
                              unsigned int flags);
 static cuMemOp64_fn g_cu_write64 = nullptr;
 static cuMemOp64_fn g_cu_wait64 = nullptr;
-static constexpr unsigned int kCuWaitValueGeq = 0x0;   // CU_STREAM_WAIT_VALUE_GEQ
+static constexpr unsigned int kCuWaitValueGeq = 0x0;   // hipStreamWaitValueGte
 static constexpr unsigned int kCuWriteDefault = 0x0;   // CU_STREAM_WRITE_VALUE_DEFAULT
 
 static bool cumemop_resolve() {
@@ -604,12 +605,12 @@ static bool cumemop_resolve() {
     if (h == nullptr) return false;
     // 11.7+ made the v2 entry points the default; older drivers export only the v1
     // names with the same signature.
-    g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWriteValue64_v2"));
+    g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "hipStreamWriteValue64"));
     if (g_cu_write64 == nullptr)
-      g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWriteValue64"));
-    g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWaitValue64_v2"));
+      g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "hipStreamWriteValue64"));
+    g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "hipStreamWaitValue64"));
     if (g_cu_wait64 == nullptr)
-      g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWaitValue64"));
+      g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "hipStreamWaitValue64"));
     return g_cu_write64 != nullptr && g_cu_wait64 != nullptr;
   }();
   return resolved;
@@ -622,7 +623,7 @@ static bool cumemops_probe(uintptr_t stream, uintptr_t scratch_addr) {
   auto* s = reinterpret_cast<void*>(stream);
   if (g_cu_write64(s, (unsigned long long)scratch_addr, 7ULL, kCuWriteDefault) != 0) return false;
   if (g_cu_wait64(s, (unsigned long long)scratch_addr, 7ULL, kCuWaitValueGeq) != 0) return false;
-  return cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess;
+  return hipStreamSynchronize(reinterpret_cast<hipStream_t>(stream)) == hipSuccess;
 }
 
 // GPU side of the flag handshake (see the block comment above): enqueued on the
@@ -630,12 +631,12 @@ static bool cumemops_probe(uintptr_t stream, uintptr_t scratch_addr) {
 // replay-safe under CUDA graphs.
 // The startup probe validates EAGER memops; a driver could still reject them at graph
 // capture time. Those enqueue errors would otherwise be swallowed here and surface only
-// as a later EndCapture failure -- log the first CUresult so triage is one step.
+// as a later EndCapture failure -- log the first hipError_t so triage is one step.
 static void cumemop_check(int rc, const char* what) {
   static std::atomic<bool> warned{false};
   if (rc != 0 && !warned.exchange(true)) {
     std::fprintf(stderr,
-                 "[freetoken/cpu_moe] %s failed with CUresult=%d (first occurrence; "
+                 "[freetoken/cpu_moe] %s failed with hipError_t=%d (first occurrence; "
                  "subsequent errors are not repeated). If this happened during CUDA "
                  "graph capture, the driver lacks capture support for stream memops -- "
                  "set FREETOKEN_CPU_MOE_FLAG_SYNC=0.\n",
@@ -650,17 +651,17 @@ static void cumemop_submit(uintptr_t stream, uintptr_t done_addr, uintptr_t read
   // so the coordinator's completion write for THIS step can never be wiped.
   cumemop_check(g_cu_write64(s, (unsigned long long)(done_addr + (size_t)slot * 8), 0ULL,
                              kCuWriteDefault),
-                "cuStreamWriteValue64(done)");
+                "hipStreamWriteValue64(done)");
   cumemop_check(g_cu_write64(s, (unsigned long long)(ready_addr + (size_t)slot * 8), 1ULL,
                              kCuWriteDefault),
-                "cuStreamWriteValue64(ready)");
+                "hipStreamWriteValue64(ready)");
 }
 
 static void cumemop_sync(uintptr_t stream, uintptr_t done_addr, int64_t slot) {
   cumemop_check(g_cu_wait64(reinterpret_cast<void*>(stream),
                             (unsigned long long)(done_addr + (size_t)slot * 8), 1ULL,
                             kCuWaitValueGeq),
-                "cuStreamWaitValue64(done)");
+                "hipStreamWaitValue64(done)");
 }
 
 struct DotChoice {
@@ -1308,7 +1309,7 @@ struct CpuMoeExecutor {
   std::vector<MoeTask*> owned_tasks;  // persistent task descriptors (graph-stable)
   std::vector<int> core_ids;          // worker tid -> logical CPU to pin to (may be empty)
 
-  // ---- Flag-based GPU<->CPU handshake (replaces the per-layer cudaLaunchHostFunc pair) ----
+  // ---- Flag-based GPU<->CPU handshake (replaces the per-layer hipLaunchHostFunc pair) ----
   // A tiny GPU kernel bumps ready_flags[slot] at submit; this coordinator thread busy-polls
   // it, runs the slot's task on the worker pool, and sets done_flags[slot], which a GPU
   // spin-wait kernel polls at sync. This removes the ~2x30-50us host-func dispatch round
@@ -1968,12 +1969,12 @@ struct CpuMoeExecutor {
   }
 
   void submit_with_cuda_stream(uintptr_t stream, uintptr_t task) {
-    cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream), &CpuMoeExecutor::submit_cb,
+    hipLaunchHostFunc(reinterpret_cast<hipStream_t>(stream), &CpuMoeExecutor::submit_cb,
                        reinterpret_cast<void*>(task));
   }
 
   void sync_with_cuda_stream(uintptr_t stream, uintptr_t task) {
-    cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream), &CpuMoeExecutor::sync_cb,
+    hipLaunchHostFunc(reinterpret_cast<hipStream_t>(stream), &CpuMoeExecutor::sync_cb,
                        reinterpret_cast<void*>(task));
   }
 

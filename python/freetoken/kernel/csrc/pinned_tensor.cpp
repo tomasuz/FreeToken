@@ -1,12 +1,12 @@
 #include <cstdint>
-#include <cuda_runtime_api.h>
+#include <hip/hip_runtime_api.h>
 #include <torch/extension.h>
 
 namespace {
 
 void free_pinned(void *ptr) {
   if (ptr != nullptr) {
-    cudaFreeHost(ptr);
+    hipHostFree(ptr);
   }
 }
 
@@ -34,9 +34,9 @@ torch::Tensor create_pinned_tensor_like(torch::Tensor input) {
   const size_t alloc_nbytes = static_cast<size_t>(nbytes == 0 ? 1 : nbytes);
 
   void *data_ptr = nullptr;
-  const cudaError_t alloc_err = cudaMallocHost(&data_ptr, alloc_nbytes);
-  TORCH_CHECK(alloc_err == cudaSuccess,
-              "cudaMallocHost failed: ", cudaGetErrorString(alloc_err));
+  const hipError_t alloc_err = hipHostMalloc(&data_ptr, alloc_nbytes);
+  TORCH_CHECK(alloc_err == hipSuccess,
+              "hipHostMalloc failed: ", hipGetErrorString(alloc_err));
 
   auto options = input.options().device(torch::kCPU).pinned_memory(true);
 
@@ -58,10 +58,10 @@ torch::Tensor alloc_pinned_tensor(std::vector<int64_t> sizes,
   // Portable + mapped: the offload gather kernel reads these banks straight
   // from host memory (zero-copy), which requires device-mapped pinned pages.
   void *data_ptr = nullptr;
-  const cudaError_t alloc_err = cudaHostAlloc(
-      &data_ptr, alloc_nbytes, cudaHostAllocPortable | cudaHostAllocMapped);
-  TORCH_CHECK(alloc_err == cudaSuccess,
-              "cudaHostAlloc failed: ", cudaGetErrorString(alloc_err));
+  const hipError_t alloc_err = hipHostAlloc(
+      &data_ptr, alloc_nbytes, hipHostMallocPortable | hipHostMallocMapped);
+  TORCH_CHECK(alloc_err == hipSuccess,
+              "hipHostAlloc failed: ", hipGetErrorString(alloc_err));
 
   auto options = torch::TensorOptions()
                      .dtype(dtype)
@@ -72,41 +72,41 @@ torch::Tensor alloc_pinned_tensor(std::vector<int64_t> sizes,
 }
 
 // Pinned host memory is GPU-dereferenceable at its host VA only where UVA identity
-// holds (Linux; not Windows/WDDM, where cudaHostRegister'd memory maps to a different
+// holds (Linux; not Windows/WDDM, where hipHostRegister'd memory maps to a different
 // device address). Zero-copy consumers resolve bank base addresses through these.
 bool host_ptr_identity() {
   int device = 0;
-  const cudaError_t err = cudaGetDevice(&device);
-  TORCH_CHECK(err == cudaSuccess, "cudaGetDevice failed: ", cudaGetErrorString(err));
+  const hipError_t err = hipGetDevice(&device);
+  TORCH_CHECK(err == hipSuccess, "hipGetDevice failed: ", hipGetErrorString(err));
   int uva = 0, reg = 0;
-  cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device);
-  cudaDeviceGetAttribute(&reg, cudaDevAttrCanUseHostPointerForRegisteredMem, device);
+  hipDeviceGetAttribute(&uva, hipDeviceAttributeUnifiedAddressing, device);
+  hipDeviceGetAttribute(&reg, hipDeviceAttributeCanUseHostPointerForRegisteredMem, device);
   return uva == 1 && reg == 1;
 }
 
 int64_t host_device_ptr(int64_t host_ptr) {
   void *dev_ptr = nullptr;
-  const cudaError_t err =
-      cudaHostGetDevicePointer(&dev_ptr, reinterpret_cast<void *>(host_ptr), 0);
-  TORCH_CHECK(err == cudaSuccess,
-              "cudaHostGetDevicePointer failed (host memory must be pinned+mapped): ",
-              cudaGetErrorString(err));
+  const hipError_t err =
+      hipHostGetDevicePointer(&dev_ptr, reinterpret_cast<void *>(host_ptr), 0);
+  TORCH_CHECK(err == hipSuccess,
+              "hipHostGetDevicePointer failed (host memory must be pinned+mapped): ",
+              hipGetErrorString(err));
   return reinterpret_cast<int64_t>(dev_ptr);
 }
 
 void host_register(int64_t addr, int64_t nbytes) {
-  const cudaError_t err =
-      cudaHostRegister(reinterpret_cast<void *>(addr), static_cast<size_t>(nbytes),
-                       cudaHostRegisterPortable | cudaHostRegisterMapped);
-  TORCH_CHECK(err == cudaSuccess,
-              "cudaHostRegister failed: ", cudaGetErrorString(err));
+  const hipError_t err =
+      hipHostRegister(reinterpret_cast<void *>(addr), static_cast<size_t>(nbytes),
+                       hipHostRegisterPortable | hipHostRegisterMapped);
+  TORCH_CHECK(err == hipSuccess,
+              "hipHostRegister failed: ", hipGetErrorString(err));
 }
 
 int64_t driver_cuda_version() {
   int version = 0;  // stays 0 when no driver is installed
-  const cudaError_t err = cudaDriverGetVersion(&version);
-  TORCH_CHECK(err == cudaSuccess,
-              "cudaDriverGetVersion failed: ", cudaGetErrorString(err));
+  const hipError_t err = hipDriverGetVersion(&version);
+  TORCH_CHECK(err == hipSuccess,
+              "hipDriverGetVersion failed: ", hipGetErrorString(err));
   return version;
 }
 
@@ -122,7 +122,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("host_device_ptr", &host_device_ptr,
         "Device-visible alias of a pinned+mapped host address");
   m.def("host_register", &host_register,
-        "cudaHostRegister an existing host range as portable+mapped");
+        "hipHostRegister an existing host range as portable+mapped");
   m.def("driver_cuda_version", &driver_cuda_version,
         "Max CUDA version the installed NVIDIA driver supports (0 if none)");
 }

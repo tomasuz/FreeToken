@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // Minimal AT_DISPATCH helper for the vendored GGUF kernels (borrowed from
 // sgl-kernel csrc/quantization/gguf, which are ports of llama.cpp). The donor
 // pulls these macros from its large include/utils.h; we only need the float
