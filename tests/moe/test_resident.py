@@ -329,3 +329,72 @@ def test_auto_cache_size_excludes_resident_layers():
     # experts (capped by the same budget, so this is an upper bound that must shrink)
     assert half_resident < all_offload
     assert half_resident >= StubModelConfig.num_experts  # never below the slot floor
+
+
+# ---------------------------------------------------------------------------
+# numerical equivalence: resident tier vs the offload path it replaces
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_resident_layer_matches_offload_path_bitwise():
+    """The same experts must produce the same logits whichever tier serves them.
+
+    This is the test that would catch the two ways the resident branch can be subtly wrong:
+    passing slot-remapped ids where raw expert ids are wanted, or picking ``alphas_for_slots``
+    over ``alphas_for_layer``. Layer 0 is served resident, layer 1 through the ordinary
+    host-bank -> materialize -> slot-cache path, from byte-identical banks.
+    """
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.moe.host_banks import HostBank as HB
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.models.gguf.dequant import GGML_Q4_0, row_bytes
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    E, H, I, tokens, top_k = 4, 64, 64, 3, 2
+    gu_row, dn_row = row_bytes(H, GGML_Q4_0), row_bytes(I, GGML_Q4_0)
+
+    # identical packed bytes for both layers
+    gate_up = torch.randint(0, 256, (E, 2 * I, gu_row), dtype=torch.uint8)
+    down = torch.randint(0, 256, (E, H, dn_row), dtype=torch.uint8)
+
+    banks = {"gate_up": [HB((E, 2 * I, gu_row), torch.uint8) for _ in range(2)],
+             "down": [HB((E, H, dn_row), torch.uint8) for _ in range(2)]}
+    banks["gate_up"][0].tensor.copy_(gate_up)
+    banks["gate_up"][1].tensor.copy_(gate_up)
+    banks["down"][0].tensor.copy_(down)
+    banks["down"][1].tensor.copy_(down)
+    banks["gate_up"][1].pin()  # only the offloaded layer needs a device alias
+    banks["down"][1].pin()
+
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=E, cache_size=E, device=device,
+        quant_format="q4_0", prefill_overlap=False,
+    )
+    cache.set_resident_banks(
+        {"gate_up": {0: gate_up.to(device)}, "down": {0: down.to(device)}}, frozenset({0})
+    )
+    cache.set_bank_sources({n: [b.tensor for b in per] for n, per in banks.items()})
+
+    layer0 = OffloadMoELayer(layer_id=0, num_experts=E, top_k=top_k, hidden_size=H,
+                             intermediate_size=I)
+    layer1 = OffloadMoELayer(layer_id=1, num_experts=E, top_k=top_k, hidden_size=H,
+                             intermediate_size=I)
+    layer0.offload_cache = cache
+    layer1.offload_cache = cache
+
+    x = torch.randn(tokens, H, dtype=torch.bfloat16, device=device)
+    topk_w = torch.rand(tokens, top_k, dtype=torch.float32, device=device)
+    topk_ids = torch.randint(0, E, (tokens, top_k), dtype=torch.int32, device=device)
+
+    resident_out = layer0._resident_expert_gemm(
+        cache, x, topk_w, topk_ids.clone(), is_prefill=True
+    )
+    cache.materialize_layer(1)
+    cache.copy_missing()
+    offload_out = layer1._expert_gemm(
+        cache, x, topk_w, topk_ids.clone(),
+        views=cache.bank_views(E), n=E, alphas=cache.alphas_for_layer(1), is_prefill=True,
+    )
+    torch.testing.assert_close(resident_out, offload_out, rtol=0, atol=0)
