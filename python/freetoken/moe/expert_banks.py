@@ -24,7 +24,7 @@ import torch
 
 from freetoken.utils import init_logger
 
-from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS
+from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS, GGUF_EXPERT_FORMATS
 
 logger = init_logger(__name__)
 
@@ -232,23 +232,31 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     )
 
 
-def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _gguf_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
     if parallel:
         raise NotImplementedError(
             "parallel reader not implemented for q4_0: GGUF is a single packed file "
             "(not safetensors), so the common reader doesn't apply -- it needs a GGUF-native "
             "parallel reader (parse the tensor table, chunked O_DIRECT over the one file)"
         )
-    from freetoken.models.weight import load_q4_0_moe_expert_sources
+    from freetoken.models.weight import load_gguf_moe_expert_sources
 
     # Native GGUF Q4_0 routed experts: packed block bytes streamed to the GPU and
     # dequantized inside the borrowed ggml MoE kernels (no bf16 expert copy). Banks are
     # per-layer HostBanks (pin-after-fill), so conversion streams each completed layer's
     # gate_up + down straight through the sink (dummy fabricates in one shot -> not streamed).
     sink = None if dummy else layer_sink
-    sources = load_q4_0_moe_expert_sources(model_path, model_config, dummy=dummy, layer_sink=sink)
+    # The bank shape is the same for every ggml quant; only row_bytes differs, so the
+    # tag on the config selects both the schema and the byte sizer.
+    tag = str(getattr(model_config, "expert_quant", "q4_0"))
+    if tag not in GGUF_EXPERT_FORMATS:
+        raise ValueError(
+            f"expert_quant {tag!r} is not a native GGUF quant; "
+            f"known: {', '.join(sorted(GGUF_EXPERT_FORMATS))}"
+        )
+    sources = load_gguf_moe_expert_sources(model_path, model_config, dummy=dummy, layer_sink=sink)
     return ExpertBanks(
-        "q4_0", {name: sources[name] for name in _BANK_SCHEMAS["q4_0"]}, streamed=sink is not None
+        tag, {name: sources[name] for name in _BANK_SCHEMAS[tag]}, streamed=sink is not None
     )
 
 
@@ -300,8 +308,10 @@ _PROVIDERS = {
     "none": _bf16_banks,
     "nvfp4": _nvfp4_banks,
     "ds_fp4": _dsfp4_banks,
-    "q4_0": _q4_0_banks,
 }
+# every native GGUF quant shares one provider; the tag picks the row_bytes sizer.
+for _tag in GGUF_EXPERT_FORMATS:
+    _PROVIDERS.setdefault(_tag, _gguf_banks)
 
 
 def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None) -> ExpertBanks:
