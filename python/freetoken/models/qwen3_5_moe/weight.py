@@ -409,9 +409,147 @@ def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
     )
 
 
+# ======================================================================================
+# MTP / nextn head weights
+# ======================================================================================
+# The MTP head ships in one of two layouts:
+#   * HF per-expert (the head tensors inside a transformers release, e.g. the mtp.* keys in
+#     the base ornith/Qwen3.5 model dir): mtp.layers.0.mlp.experts.{i}.{down,gate,up}_proj.weight
+#   * engine-packed (shisa-ai's separate "MTP-ONLY" file): mtp.layers.0.mlp.experts.{gate_up_proj,
+#     down_proj} -- already the engine's MoELayer storage layout.
+# Both are normalized here into the model's ``mtp.*`` state-dict keys (q/k/v -> qkv_proj,
+# shared-expert gate/up -> gate_up_proj, per-expert -> packed, Gemma norms +1).
+_MTP_PER_EXPERT_RE = re.compile(
+    r"^mtp\.layers\.0\.mlp\.experts\.(\d+)\.(down_proj|gate_proj|up_proj)\.weight$"
+)
+# Gemma (1+w) RMSNorm weights in the head get +1 baked in at load, exactly like the base
+# model's norms. ``.norm.weight`` only matches ``mtp.norm.weight`` (the q/k/input/post norms
+# are matched by their own, more specific suffixes above).
+_MTP_GEMMA_SUFFIXES = (
+    ".pre_fc_norm_embedding.weight",
+    ".pre_fc_norm_hidden.weight",
+    ".input_layernorm.weight",
+    ".post_attention_layernorm.weight",
+    ".self_attn.q_norm.weight",
+    ".self_attn.k_norm.weight",
+    ".norm.weight",
+)
+_MTP_PREFIX = "mtp."
+_MTP_QKV = (
+    ".self_attn.q_proj.weight",
+    ".self_attn.k_proj.weight",
+    ".self_attn.v_proj.weight",
+)
+_MTP_QKV_FUSED = ".self_attn.qkv_proj.weight"
+_MTP_SHARED_GU = (
+    ".mlp.shared_expert.gate_proj.weight",
+    ".mlp.shared_expert.up_proj.weight",
+)
+_MTP_SHARED_GU_FUSED = ".mlp.shared_expert.gate_up_proj.weight"
+_MTP_EXPERTS_GU = "mtp.layers.0.mlp.experts.gate_up_proj"
+_MTP_EXPERTS_DOWN = "mtp.layers.0.mlp.experts.down_proj"
+
+
+def _mtp_safetensors_files(model_path: str) -> list[str]:
+    """Safetensors files that may hold the head: a single file (shisa-ai's packed
+    ``model-mtp.safetensors``) or every shard under a model directory."""
+    if os.path.isfile(model_path):
+        return [model_path]
+    if not os.path.isdir(model_path):
+        raise FileNotFoundError(
+            f"MTP weights source not found: {model_path} (pass --mtp-model or the base "
+            "model dir that ships mtp.* tensors)"
+        )
+    files = sorted(
+        os.path.join(model_path, b)
+        for b in os.listdir(model_path)
+        if b.endswith(".safetensors")
+    )
+    if not files:
+        raise FileNotFoundError(f"no .safetensors files under {model_path}")
+    return files
+
+
+def load_mtp_weights(model_path: str, device: torch.device) -> dict[str, torch.Tensor]:
+    """Load the MTP head's ``mtp.*`` tensors into the engine state dict.
+
+    ``model_path`` may be a HF model directory that ships the head (per-expert layout) or a
+    single safetensors file holding the head in the engine-packed layout (e.g. the shisa-ai
+    Ornith-1.5-35B-A3B-MTP-ONLY ``model-mtp.safetensors``). Returns a dict whose keys match
+    ``Qwen3_5MoEForCausalLM``'s ``mtp.*`` state-dict keys 1:1.
+    """
+    raw: dict[str, torch.Tensor] = {}
+    for file in _mtp_safetensors_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for name in f.keys():
+                if name.startswith(_MTP_PREFIX):
+                    raw[name] = f.get_tensor(name)
+    if not raw:
+        raise RuntimeError(
+            f"no mtp.* tensors found in {model_path} -- is the model an MTP-enabled "
+            "checkpoint or an MTP-ONLY head file?"
+        )
+
+    out: dict[str, torch.Tensor] = {}
+
+    # ---- routed experts: per-expert HF layout -> packed (256 stacked experts) ----------
+    per_expert = {name: raw[name] for name in raw if _MTP_PER_EXPERT_RE.match(name)}
+    if per_expert:
+        by_proj: dict[str, dict[int, torch.Tensor]] = {"down": {}, "gate": {}, "up": {}}
+        for name, t in per_expert.items():
+            m = _MTP_PER_EXPERT_RE.match(name)
+            assert m is not None
+            idx, proj = int(m.group(1)), m.group(2)
+            kind = proj.split("_", 1)[0]  # down | gate | up
+            by_proj[kind][idx] = t
+        num_experts = max(len(slots) for slots in by_proj.values())
+        expected = sorted(by_proj["down"]) if by_proj["down"] else sorted(by_proj["gate"])
+        if list(expected) != list(range(num_experts)):
+            raise RuntimeError(
+                f"MTP expert ids are not contiguous 0..{num_experts - 1}: {expected}"
+            )
+        gate = torch.stack([by_proj["gate"][i] for i in range(num_experts)], dim=0)
+        up = torch.stack([by_proj["up"][i] for i in range(num_experts)], dim=0)
+        down = torch.stack([by_proj["down"][i] for i in range(num_experts)], dim=0)
+        out[_MTP_EXPERTS_GU] = torch.cat([gate, up], dim=1)  # [N, 2*i, H]
+        out[_MTP_EXPERTS_DOWN] = down  # [N, H, i]
+        for name in per_expert:
+            del raw[name]
+    for key in (_MTP_EXPERTS_GU, _MTP_EXPERTS_DOWN):
+        if key in raw:  # already-packed layout: pass through unchanged
+            out[key] = raw.pop(key)
+
+    # ---- attention projections: q/k/v -> qkv_proj (or pass a pre-fused qkv_proj) -------
+    fused_qkv = _MTP_PREFIX + "layers.0" + _MTP_QKV_FUSED
+    if fused_qkv in raw:
+        out[fused_qkv] = raw.pop(fused_qkv)
+    else:
+        parts = []
+        for suffix in _MTP_QKV:
+            parts.append(raw.pop(_MTP_PREFIX + "layers.0" + suffix))
+        out[fused_qkv] = torch.cat(parts, dim=0)
+
+    # ---- shared expert: gate/up -> gate_up_proj (or pass pre-merged) -------------------
+    fused_gu = _MTP_PREFIX + "layers.0" + _MTP_SHARED_GU_FUSED
+    if fused_gu in raw:
+        out[fused_gu] = raw.pop(fused_gu)
+    else:
+        gate = raw.pop(_MTP_PREFIX + "layers.0" + _MTP_SHARED_GU[0])
+        up = raw.pop(_MTP_PREFIX + "layers.0" + _MTP_SHARED_GU[1])
+        out[fused_gu] = torch.cat([gate, up], dim=0)
+
+    # ---- everything else maps 1:1; Gemma norms get their +1 baked in -------------------
+    for name, t in raw.items():
+        if name.endswith(_MTP_GEMMA_SUFFIXES):
+            t = t + 1.0
+        out[name] = t
+    return out
+
+
 __all__ = [
     "iter_weights",
     "iter_weights_parallel",
     "iter_expert_pieces",
     "nvfp4_expert_spec",
+    "load_mtp_weights",
 ]

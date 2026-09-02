@@ -501,7 +501,7 @@ class Engine:
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).
-        return _materialize_loaded_weight_state_dict(
+        state_dict = _materialize_loaded_weight_state_dict(
             model_state,
             load_weight(
                 config.model_path,
@@ -510,6 +510,24 @@ class Engine:
             ),
             device=self.device,
         )
+        # MTP head: the main qwen3_5_moe loader deliberately drops mtp.* (dropped for
+        # text-only serving when the head is off); when --mtp is on the head's weights are
+        # loaded by the dedicated mtp loader -- from the base checkpoint dir (per-expert HF
+        # layout) or from a separate packed head file (--mtp-model, e.g. shisa-ai's
+        # model-mtp.safetensors) -- and merged into the state dict with the same dtype cast.
+        if config.model_config.has_mtp:
+            from freetoken.models.qwen3_5_moe.weight import load_mtp_weights
+
+            mtp_state = load_mtp_weights(
+                config.mtp_model_path or config.model_path, self.device
+            )
+            for key, tensor in mtp_state.items():
+                expected = model_state.get(key)
+                state_dict[key] = tensor.to(
+                    device=self.device,
+                    dtype=expected.dtype if expected is not None else None,
+                )
+        return state_dict
 
     def _resident_budget(self, config: EngineConfig) -> tuple[int, int]:
         """``(bytes the KV pool will claim, bytes one MoE layer's experts occupy)``.
@@ -2019,6 +2037,27 @@ def _adjust_config(config: EngineConfig):
     if is_moe:
         object.__setattr__(model_config, "moe_strategy", config.moe_strategy)
         object.__setattr__(model_config, "decode_target", _decode_target(config))
+
+    # MTP / nextn speculative head (--mtp): opt-in on qwen3_5_moe checkpoints that declare a
+    # head (mtp_num_hidden_layers). Flipping mtp_enabled here (on the SAME ModelConfig instance
+    # the engine builds the model and KV pool from) makes the model construct its head, the KV
+    # group carry one extra full-attention slab and the weight load pull the mtp.* tensors.
+    if getattr(config, "mtp", False):
+        mtp_layers = getattr(model_config, "mtp_num_layers", 0)
+        if mtp_layers <= 0:
+            raise ValueError(
+                f"{getattr(model_config, 'model_type', 'model')} declares no "
+                "mtp_num_hidden_layers -- the --mtp head needs a checkpoint that ships a "
+                "nextn head (e.g. Qwen3.5-35B-A3B / ornith)."
+            )
+        object.__setattr__(model_config, "mtp_enabled", True)
+        object.__setattr__(
+            model_config, "mtp_draft", max(1, int(getattr(config, "mtp_draft", 1)))
+        )
+        logger.info_rank0(
+            f"MTP speculative head: {mtp_layers} nextn layer(s), "
+            f"draft={model_config.mtp_draft}"
+        )
 
     # Must stay LAST: page_size is only final here (_adjust_dsv4_config sets P=128, the
     # TRTLLM block sets 64). Also covers the programmatic LLM(...) path that bypasses parse_args.

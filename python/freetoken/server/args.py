@@ -789,6 +789,43 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--mtp",
+        action="store_true",
+        dest="mtp",
+        default=ServerArgs.mtp,
+        help=(
+            "Enable the MTP (multi-token-prediction / nextn) speculative head for "
+            "qwen3_5_moe checkpoints that ship one (mtp_num_hidden_layers in their "
+            "config.json). Loads the head weights, sizes the KV pool for the head's extra "
+            "full-attention layer and enables self-speculative decode. Off by default; "
+            "serving is unchanged without it."
+        ),
+    )
+
+    parser.add_argument(
+        "--mtp-draft",
+        type=int,
+        default=ServerArgs.mtp_draft,
+        help=(
+            "Draft lookahead for --mtp: how many tokens the head proposes per speculative "
+            "step (start with 2; matches the llama.cpp draft-mtp sweet spot)."
+        ),
+    )
+
+    parser.add_argument(
+        "--mtp-model",
+        type=str,
+        default=None,
+        dest="mtp_model_path",
+        help=(
+            "Optional path to the MTP head weights when they live outside the base "
+            "checkpoint (e.g. shisa-ai's Ornith-1.5-35B-A3B-MTP-ONLY model-mtp.safetensors). "
+            "Defaults to the base --model path (which usually already ships the mtp.* "
+            "head tensors)."
+        ),
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",

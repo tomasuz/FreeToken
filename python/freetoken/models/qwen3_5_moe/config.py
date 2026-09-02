@@ -132,6 +132,12 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attention_groups=groups,
         expert_quant=expert_quant,
         weight_block_size=weight_block_size,
+        # MTP / nextn speculative head geometry (kept even when --mtp is off; the engine
+        # flips mtp_enabled on to build + serve the head).
+        mtp_num_layers=int(getattr(text, "mtp_num_hidden_layers", 0) or 0),
+        mtp_use_dedicated_embeddings=bool(
+            getattr(text, "mtp_use_dedicated_embeddings", False)
+        ),
     )
 
 

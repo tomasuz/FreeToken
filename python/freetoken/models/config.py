@@ -342,6 +342,28 @@ class ModelConfig:
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
     slot_states: Tuple[SlotStateSpec, ...] = ()
+    # ----- MTP / nextn speculative head (qwen3_5_moe; opt-in via the engine's --mtp) -----
+    # Geometric truth from the HF text config (mtp_num_hidden_layers): how many MTP layers the
+    # checkpoint ships. Kept even when MTP is disabled (default) so parse_config stays pure.
+    mtp_num_layers: int = 0
+    mtp_use_dedicated_embeddings: bool = False
+    # Engine opt-in (--mtp). When True and mtp_num_layers > 0, the model builds its MTP head,
+    # the full-attention KV group gains one extra layer (the head's own causal KV slot, global
+    # layer id == num_layers) and the loader stops dropping the checkpoint's mtp.* tensors.
+    # Everything stays byte-for-byte unchanged while this is False.
+    mtp_enabled: bool = False
+    # Draft lookahead (--mtp-draft): how many tokens the head proposes per speculative step.
+    mtp_draft: int = 1
+
+    @property
+    def has_mtp(self) -> bool:
+        return self.mtp_enabled and self.mtp_num_layers > 0
+
+    @property
+    def mtp_layer_id(self) -> int:
+        """Global layer id of the MTP head's attention block: the layer appended right after
+        the base model's ``num_layers`` decoder layers (its own full-attention KV slot)."""
+        return self.num_layers
 
     @property
     def is_moe(self) -> bool:
@@ -489,6 +511,30 @@ class ModelConfig:
                         attn_type=AttnType.DSV4,
                     )
                 )
+
+        # MTP head: its decoder block is a plain causal full-attention layer whose KV slot is
+        # appended after the base model's full-attention layers (global id == num_layers). Give
+        # the paged pool one extra slab by extending the plain-full group's layer_ids, so the
+        # per-token KV accounting and the layer map both include the head's slot. Only fires
+        # when the engine opts in (mtp_enabled); the MTP layer is never a base attention group.
+        if self.has_mtp and specs:
+            specs = list(specs)
+            for i, spec in enumerate(specs):
+                if spec.attn_type == AttnType.FULL and not spec.mla:
+                    layer_ids = spec.layer_ids + (self.mtp_layer_id,)
+                    specs[i] = KVCacheGroupSpec(
+                        name=spec.name,
+                        layer_ids=layer_ids,
+                        num_kv_heads=spec.num_kv_heads,
+                        head_dim=spec.head_dim,
+                        sliding_window=spec.sliding_window,
+                        mla=spec.mla,
+                        index_head_dim=spec.index_head_dim,
+                        num_index_layers=spec.num_index_layers,
+                        index_ratio=spec.index_ratio,
+                        attn_type=spec.attn_type,
+                    )
+                    break
         return tuple(specs)
 
     def kv_cache_groups(self) -> List[Tuple[int, int, int]]:

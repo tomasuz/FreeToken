@@ -17,6 +17,7 @@ from freetoken.utils import nvtx_annotate
 from .attention import Qwen3_5Attention
 from .gdn import Qwen3_5GatedDeltaNet
 from .moe import Qwen3_5DenseMLP, Qwen3_5MoE
+from .mtp import Qwen3_5MTP
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -106,11 +107,37 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             quant_config=config.quant,
             prefix="lm_head",
         )
+        # MTP / nextn speculative head (opt-in via the engine's --mtp). Its attention block is
+        # the appended full-attention layer (mtp_layer_id == num_layers); the KV pool carries
+        # one extra slab for it (see ModelConfig.kv_cache_group_specs). When off (default) the
+        # model is exactly the base model it was before -- no extra weights, no extra KV.
+        if config.has_mtp:
+            self.mtp = Qwen3_5MTP(config, config.mtp_layer_id)
         super().__init__()
 
+    def _hidden(self) -> torch.Tensor:
+        """Post-final-norm hidden states for the active batch ([N, hidden_size]), i.e. the
+        input to ``lm_head`` -- also the MTP head's ``prev_hidden`` per position."""
+        return self.model.forward(get_global_ctx().batch.input_ids)
+
     def forward(self) -> torch.Tensor:
-        output = self.model.forward(get_global_ctx().batch.input_ids)
-        return self.lm_head.forward(output)
+        return self.lm_head.forward(self._hidden())
+
+    def forward_hidden(self) -> torch.Tensor:
+        """Base-model hidden states without the lm_head (used by the speculative loop to seed
+        the MTP draft; requires the active batch, like :meth:`forward`)."""
+        return self._hidden()
+
+    def forward_mtp(
+        self, prev_hidden: torch.Tensor, next_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Draft logits from the MTP head: for each row of ``prev_hidden`` (a base hidden at
+        position t) and ``next_ids`` (the token at t+1), returns logits over the token at t+2.
+        Requires ``has_mtp`` (the engine only calls this on the --mtp path)."""
+        assert self.mtp is not None, "forward_mtp requires the MTP head (serve with --mtp)"
+        return self.mtp.forward(
+            prev_hidden, next_ids, self.model.embed_tokens, self.lm_head
+        )
 
 
 __all__ = ["Qwen3_5MoEForCausalLM"]

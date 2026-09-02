@@ -122,6 +122,15 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    # MTP / nextn speculative head (--mtp): opt-in, qwen3_5_moe checkpoints that ship a head
+    # (mtp_num_hidden_layers in their config). Enables the head module, loads its weights and
+    # sizes the KV pool for the head's extra full-attention layer. Off by default -- when off,
+    # serving is byte-for-byte what it was before.
+    mtp: bool = False
+    # Draft lookahead (--mtp-draft): how many tokens the head proposes per speculative step.
+    mtp_draft: int = 1
+    # Optional path to the MTP head weights when they live outside the base checkpoint dir.
+    mtp_model_path: str | None = None
 
     def __post_init__(self):
         if self.moe_backend is None:
