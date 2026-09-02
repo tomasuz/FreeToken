@@ -216,7 +216,9 @@ class MTPDecodeMixin:
                 b.fla_metadata.mtp_boundary_dst = torch.tensor(
                     [boundary_slot], dtype=torch.int64, device=self.device
                 )
-            b.input_ids = self.token_pool[fi.input_tuple[0]]
+            # input_tuple is the (rows, cols) pair into the token pool; indexing with the
+            # whole tuple yields the flat 1-D id tensor the embed kernel expects.
+            b.input_ids = self.token_pool[fi.input_tuple]
             with self.engine.ctx.forward_batch(b):
                 hidden = self.engine.model.forward_hidden()  # [n, hidden]
             return hidden
