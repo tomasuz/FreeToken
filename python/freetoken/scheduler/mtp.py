@@ -286,6 +286,12 @@ class MTPDecodeMixin:
                 )
             )
             if finished:
+                # The request owns KV pages for positions [0, kept_processed) (one per
+                # processed-kept token). Point cached_len there before the finish-free so
+                # cache_req(finished=True) frees/donates ALL of them -- a stale (pre-step)
+                # cached_len leaks the pages this step processed (e.g. the 2 pages of a
+                # final accepted verify).
+                req.cached_len = kept_processed
                 self.decode_manager.remove_req(req)
                 self._free_req_resources(req)
                 self.finished_reqs.add(req)
