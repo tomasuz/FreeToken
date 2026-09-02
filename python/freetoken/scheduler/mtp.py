@@ -149,6 +149,11 @@ class MTPDecodeMixin:
                 if done:
                     break
         except Exception:  # noqa: BLE001 -- dev bring-up: disable, resume normal decode
+            # print the traceback explicitly: this server's logging formatter drops the
+            # exc_text that logger.exception attaches, so it would otherwise be invisible
+            import traceback
+
+            traceback.print_exc()
             logger.exception(
                 "[mtp] speculative decode step failed; disabling MTP spec "
                 "(normal decode resumes from the request's committed state)"
