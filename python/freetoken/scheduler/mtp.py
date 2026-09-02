@@ -33,6 +33,7 @@ model); past head context is not maintained, matching the validated demo's L=1 d
 from __future__ import annotations
 
 import os
+import time
 
 import torch
 import torch.nn.functional as F
@@ -118,6 +119,11 @@ class MTPDecodeMixin:
         if req is None:
             return
         self._mtp_state[req.uid] = {"draft": None}
+        # stats for this drive: forwards = base forwards run, committed = real tokens
+        # emitted, verified/accepted = drafts checked / accepted. tokens/base-forward is
+        # the headline speedup signal (plain greedy = 1.00).
+        stat = self._mtp_stat = {"forwards": 0, "committed": 0, "verified": 0, "accepted": 0}
+        t0 = time.monotonic()
         logger.info_rank0(f"[mtp] speculative decode engaged uid={req.uid} cached_len={req.cached_len}")
         try:
             while True:
@@ -129,6 +135,17 @@ class MTPDecodeMixin:
                 st = self._mtp_state.setdefault(req.uid, {"draft": None})
                 done = self._mtp_step(req, st)
                 self._flush_abort_acks()
+                if stat["forwards"] and stat["forwards"] % 40 == 0:
+                    dt = max(time.monotonic() - t0, 1e-9)
+                    logger.info_rank0(
+                        "[mtp] progress: committed %d tok in %d base-forward(s) = %.2f "
+                        "tok/forward, alpha %d/%d = %.2f, %.1f tok/s",
+                        stat["committed"], stat["forwards"],
+                        stat["committed"] / stat["forwards"],
+                        stat["accepted"], stat["verified"],
+                        (stat["accepted"] / stat["verified"]) if stat["verified"] else 0.0,
+                        stat["committed"] / dt,
+                    )
                 if done:
                     break
         except Exception:  # noqa: BLE001 -- dev bring-up: disable, resume normal decode
@@ -137,16 +154,33 @@ class MTPDecodeMixin:
                 "(normal decode resumes from the request's committed state)"
             )
             self._mtp_disabled = True
-        logger.info_rank0("[mtp] speculative decode disengaged")
+        if stat["forwards"]:
+            dt = max(time.monotonic() - t0, 1e-9)
+            logger.info_rank0(
+                "[mtp] disengaged: committed %d tok in %d base-forward(s) = %.2f tok/forward "
+                "(plain greedy = 1.00), alpha %d/%d = %.2f, %.1f tok/s",
+                stat["committed"], stat["forwards"], stat["committed"] / stat["forwards"],
+                stat["accepted"], stat["verified"],
+                (stat["accepted"] / stat["verified"]) if stat["verified"] else 0.0,
+                stat["committed"] / dt,
+            )
+        else:
+            logger.info_rank0("[mtp] speculative decode disengaged (no spec steps ran)")
 
     def _mtp_step(self, req: Req, st: dict) -> bool:
         """One spec iteration: seed (no draft) or verify (draft). Returns True when the
         request finished (removed) during this step."""
+        stat = self._mtp_stat
         draft = st.get("draft")
         if draft is None:
-            self._mtp_seed(req, st)
+            committed = self._mtp_seed(req, st)
         else:
-            self._mtp_verify(req, st, draft)
+            stat["verified"] += 1
+            committed, accepted = self._mtp_verify(req, st, draft)
+            if accepted:
+                stat["accepted"] += 1
+        stat["forwards"] += 1
+        stat["committed"] += committed
         return req not in self.decode_manager.running_reqs or req in self.finished_reqs
 
     # ------------------------------------------------------- continuation forward
@@ -205,6 +239,7 @@ class MTPDecodeMixin:
         ``kept_processed`` = this step's kept processed count = the new cached_len
         (index of the newest committed real token) once the request survives.
         A finished request is removed from the decode manager and its resources freed.
+        Returns the number of tokens actually committed (emitted) this step.
         """
         msgs: list = []
         finished = False
@@ -270,6 +305,7 @@ class MTPDecodeMixin:
                 m.swa_total_tokens = swa_total
                 m.gpu_mem_bytes = mem
             self.send_result(msgs)
+        return len(msgs)
 
     # -------------------------------------------------------------- head draft
     def _mtp_head_draft(self, req: Req, prev_hidden: torch.Tensor) -> int | None:
@@ -310,26 +346,28 @@ class MTPDecodeMixin:
             return None
 
     # ---------------------------------------------------------------- steps
-    def _mtp_seed(self, req: Req, st: dict) -> None:
+    def _mtp_seed(self, req: Req, st: dict) -> int:
         """Seed: no pending draft. Process the newest committed real token ``u`` alone
         (1-token continuation), commit its real successor, then draft the token after it.
-        (This is the demo's Case A, done once per MTP engagement.)"""
+        (This is the demo's Case A, done once per MTP engagement.) Returns the number of
+        tokens committed."""
         C = req.cached_len
         u = int(req.input_ids[C].item())
         hidden = self._mtp_run_extend(req, [u])  # [1, H]
         if hidden is None:
-            return
+            return 0
         weight = self._mtp_lmhead_weight()
         logits = F.linear(hidden, weight)  # [1, vocab]
         real = int(torch.argmax(logits, dim=-1).item())
-        self._mtp_emit(req, [real], kept_processed=C + 1)
+        committed = self._mtp_emit(req, [real], kept_processed=C + 1)
         if req in self.finished_reqs:
             st["draft"] = None
-            return
+            return committed
         # draft the token after `real`: prev_hidden = hidden of u (its predecessor)
         st["draft"] = self._mtp_head_draft(req, hidden[0:1])
+        return committed
 
-    def _mtp_verify(self, req: Req, st: dict, draft: int) -> None:
+    def _mtp_verify(self, req: Req, st: dict, draft: int) -> tuple:
         """Verify a pending draft: fused 2-token continuation [u@C, d@C+1]. logits@C
         verify d:
           accept -> commit d and the base's own next token c (=argmax@C+1); roll nothing
@@ -338,6 +376,7 @@ class MTPDecodeMixin:
           reject -> commit only the real token; roll the GDN state back to after-u (the
                     round-1 boundary snapshot in the spare slot) and free d's KV page;
                     the next draft comes from hidden[u] + real.
+        Returns (committed_tokens, accepted_bool).
         """
         C = req.cached_len
         u = int(req.input_ids[C].item())
@@ -350,22 +389,24 @@ class MTPDecodeMixin:
             real = int(torch.argmax(logits[0:1], dim=-1).item())
             if real == draft:
                 c = int(torch.argmax(logits[1:2], dim=-1).item())
-                self._mtp_emit(req, [draft, c], kept_processed=C + 2)
+                committed = self._mtp_emit(req, [draft, c], kept_processed=C + 2)
                 if req in self.finished_reqs:
                     st["draft"] = None
-                    return
+                    return committed, True
                 # newest committed = c@C+2; its predecessor d was the last kept process
                 st["draft"] = self._mtp_head_draft(req, hidden[1:2])
+                return committed, True
             else:
-                self._mtp_emit(req, [real], kept_processed=C + 1)
+                committed = self._mtp_emit(req, [real], kept_processed=C + 1)
                 if req in self.finished_reqs:
                     st["draft"] = None
-                    return
+                    return committed, False
                 # reject: drop the draft's tail KV page(s) and roll GDN back to after-u
                 self.cache_manager.free_tail_pages(req, keep_len=C + 1)
                 pool.copy_from(spare, req.linear_slot_idx)
                 # newest committed = real@C+1; its predecessor u was the kept process
                 st["draft"] = self._mtp_head_draft(req, hidden[0:1])
+                return committed, False
         finally:
             pool.free(spare)
 

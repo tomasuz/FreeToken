@@ -933,6 +933,14 @@ class Scheduler(SchedulerIOMixin, MTPDecodeMixin):
             batch.mm_embeds = torch.cat(parts, dim=0)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
+        # MTP spec drive owns the decode loop while a single greedy MTP request is
+        # decoding: do NOT schedule a normal decode batch for it. Returning None lets the
+        # in-flight overlapped batch drain (its tokens commit through the normal path) and
+        # the pipeline go empty, at which point run_forever enters the spec drive. Without
+        # this, an actively decoding request would keep the pipeline non-empty forever and
+        # the drive (which requires data is None) could never engage mid-generation.
+        if self._mtp_target() is not None:
+            return None
         # TODO: support other policies: e.g. DECODE first
         batch = (
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
