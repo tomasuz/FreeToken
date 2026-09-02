@@ -30,6 +30,7 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
+from .mtp import MTPDecodeMixin
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
 from .table import TableManager
@@ -58,7 +59,7 @@ class ForwardInput(NamedTuple):
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
-class Scheduler(SchedulerIOMixin):
+class Scheduler(SchedulerIOMixin, MTPDecodeMixin):
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
 
@@ -381,12 +382,21 @@ class Scheduler(SchedulerIOMixin):
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
-                    self.normal_loop()
+                    if self._mtp_takeover():
+                        self._mtp_drive()
+                    else:
+                        self.normal_loop()
         else:
             assert torch.cuda.current_stream() == self.stream
             data = None
             while True:
-                data = self.overlap_loop(data)
+                if self._mtp_takeover(data):
+                    # The MTP drive is synchronous (launch + decide + rollback inside
+                    # one iteration) and only takes over with an empty overlap
+                    # pipeline, so it never leaves an in-flight batch behind.
+                    data = self._mtp_drive()
+                else:
+                    data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
