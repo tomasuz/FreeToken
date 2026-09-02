@@ -165,32 +165,75 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
             )
         else:
-            mixed = self._conv_prefill(
-                conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
-            # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
-            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-            q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
-            k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
-            v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
-            g, beta = self._gate_params(a, b)
-            g = g.reshape(1, total, self.num_v_heads)
-            beta = beta.float().reshape(1, total, self.num_v_heads)
-            # The chunk kernel reads + writes back initial_state[cache_indices] in place;
-            # fresh sequences (cached_len==0) must start from a zeroed slot.
-            if fla.fresh_state_indices is not None:
-                pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
-            track = fla.track_dst is not None
-            result = gdn_prefill_chunk_fla(
-                q, k, v, g, beta,
-                state_source=pool.recurrent_states[li], indices=fla.cache_indices,
-                cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
-                return_h=track,
-            )
-            if track:
-                core_out, h = result
-                self._write_track_snapshot(pool, li, conv_in, h, fla)
+            mtp_dst = fla.mtp_boundary_dst
+            if mtp_dst is not None:
+                # --- MTP speculative verify (single req, 2-token continuation [u, d]) ---
+                # The chunk kernel only exposes recurrent states at 64-token chunk
+                # boundaries (return_h), never the mid-chunk point after the committed
+                # token u. So the recurrence is run in two 1-token sub-steps: the first
+                # leaves the LIVE slot at "after u", which we snapshot (recurrent + conv)
+                # into the caller's spare slot for a cheap reject rollback; the second
+                # advances the live slot to "after draft d" (kept on accept).
+                assert total == 2, "MTP verify chunk must be exactly 2 tokens"
+                rec = pool.recurrent_states[li]
+                cv = pool.conv_states[li]
+                src_i = int(fla.cache_indices[0].item())
+                dst_i = int(mtp_dst[0].item())
+                cv_pre = cv[src_i].clone()  # conv window before the chunk (ends at last committed)
+                # conv over both tokens in one varlen continuation pass (live conv slot -> post-d)
+                mixed = self._conv_prefill(
+                    conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+                qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+                q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
+                k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
+                v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
+                g, beta = self._gate_params(a, b)
+                g = g.reshape(1, total, self.num_v_heads)
+                beta = beta.float().reshape(1, total, self.num_v_heads)
+                cu1 = torch.arange(2, dtype=torch.int64, device=mixed.device)  # 1-token indptr [0,1]
+                idx = fla.cache_indices
+                # sub-step u (token 0): live recurrent slot becomes "after committed token u"
+                out_u = gdn_prefill_chunk_fla(
+                    q[:, 0:1], k[:, 0:1], v[:, 0:1], g[:, 0:1], beta[:, 0:1],
+                    state_source=rec, indices=idx, cu_seqlens=cu1,
+                    scale=self.head_k_dim ** -0.5)
+                # snapshot after-u: recurrent = live slot now; conv = pre window shifted + u input
+                rec.index_copy_(0, mtp_dst, rec[src_i].unsqueeze(0).clone())
+                cv_after = torch.cat([cv_pre[:, 1:], conv_in[0].unsqueeze(1)], dim=1)
+                cv[dst_i] = cv_after.to(cv.dtype)
+                # sub-step d (token 1): live recurrent slot advances to "after draft d"
+                out_d = gdn_prefill_chunk_fla(
+                    q[:, 1:2], k[:, 1:2], v[:, 1:2], g[:, 1:2], beta[:, 1:2],
+                    state_source=rec, indices=idx, cu_seqlens=cu1,
+                    scale=self.head_k_dim ** -0.5)
+                core_out = torch.cat([out_u, out_d], dim=0)  # [2, num_v_heads, head_v_dim]
             else:
-                core_out = result
+                mixed = self._conv_prefill(
+                    conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+                # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
+                qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+                q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
+                k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
+                v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
+                g, beta = self._gate_params(a, b)
+                g = g.reshape(1, total, self.num_v_heads)
+                beta = beta.float().reshape(1, total, self.num_v_heads)
+                # The chunk kernel reads + writes back initial_state[cache_indices] in place;
+                # fresh sequences (cached_len==0) must start from a zeroed slot.
+                if fla.fresh_state_indices is not None:
+                    pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
+                track = fla.track_dst is not None
+                result = gdn_prefill_chunk_fla(
+                    q, k, v, g, beta,
+                    state_source=pool.recurrent_states[li], indices=fla.cache_indices,
+                    cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+                    return_h=track,
+                )
+                if track:
+                    core_out, h = result
+                    self._write_track_snapshot(pool, li, conv_in, h, fla)
+                else:
+                    core_out = result
 
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
