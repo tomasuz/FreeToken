@@ -345,8 +345,24 @@ class MTPDecodeMixin:
             b.positions = torch.tensor([pos], dtype=torch.int32, device=self.device)
             b.out_loc = self.engine.page_table[req.table_idx, 0:1]
             self.engine.attn_backend.prepare_metadata(b)
-            with self.engine.ctx.forward_batch(b):
-                logits = model.forward_mtp(prev_hidden, ids)  # [1, vocab]
+            # The MTP head's MoE is a RESIDENT (fused) MoELayer, whose bf16 forward routes
+            # through ctx.moe_backend. This server runs the offload backend, and
+            # OffloadMoeBackend.forward raises for direct calls ("handled by
+            # OffloadMoELayer"). Swap in the fused backend just for the head's single-row
+            # draft (the head's packed experts are resident on GPU), then restore.
+            from freetoken.core import get_global_ctx
+            from freetoken.moe import create_moe_backend
+
+            if getattr(self, "_mtp_fused_moe", None) is None:
+                self._mtp_fused_moe = create_moe_backend("fused")
+            _ctx = get_global_ctx()
+            _old_backend = _ctx.moe_backend
+            _ctx.moe_backend = self._mtp_fused_moe
+            try:
+                with self.engine.ctx.forward_batch(b):
+                    logits = model.forward_mtp(prev_hidden, ids)  # [1, vocab]
+            finally:
+                _ctx.moe_backend = _old_backend
             return int(torch.argmax(logits, dim=-1).item())
         except Exception:  # noqa: BLE001 -- dev bring-up; fall back to normal decode
             import traceback
