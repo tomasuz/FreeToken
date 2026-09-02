@@ -113,6 +113,10 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
         # model is exactly the base model it was before -- no extra weights, no extra KV.
         if config.has_mtp:
             self.mtp = Qwen3_5MTP(config, config.mtp_layer_id)
+        # Speculative-draft hook: after each decode forward the engine can read the post-norm
+        # hidden of the just-processed token here (the head's prev_hidden input). Never part of
+        # the state dict (leading underscore) and unused when MTP is off.
+        self._last_hidden = None
         super().__init__()
 
     def _hidden(self) -> torch.Tensor:
@@ -121,7 +125,11 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
         return self.model.forward(get_global_ctx().batch.input_ids)
 
     def forward(self) -> torch.Tensor:
-        return self.lm_head.forward(self._hidden())
+        hidden = self._hidden()
+        # Drafting hook: stash the post-final-norm hidden of the active batch (used by the MTP
+        # speculative loop to seed the head; plain decode is unaffected).
+        self._last_hidden = hidden
+        return self.lm_head.forward(hidden)
 
     def forward_hidden(self) -> torch.Tensor:
         """Base-model hidden states without the lm_head (used by the speculative loop to seed

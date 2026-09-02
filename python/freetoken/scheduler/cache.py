@@ -281,6 +281,30 @@ class CacheManager:
                 self.swa_pool.alloc_swa(allocated)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
+    def free_tail_pages(self, req: Req, keep_len: int) -> None:
+        """Return this request's KV pages for token positions >= ``keep_len`` to the free list.
+
+        Used by the MTP speculative loop to drop a rejected draft token's KV page: after a
+        verify forward processed the speculative token at the tail, a rejection must discard
+        that page so the next (real) token reuses it. Non-MTP serving never calls this. Only
+        the paged full-attn pool is affected (the target model is GDN-hybrid; its linear-state
+        rollback is handled separately via the LinearStatePool slot).
+        """
+        row = self.page_table[req.table_idx]
+        first_pos = div_ceil(keep_len, self.page_size) * self.page_size
+        last_pos = min(
+            div_ceil(req.device_len, self.page_size) * self.page_size, row.numel()
+        )
+        if last_pos <= first_pos:
+            return
+        tail = row[first_pos:last_pos].clone()
+        if self.page_size == 1:
+            pages = tail
+        else:
+            pages = tail[:: self.page_size].unique()
+        self._free(pages)
+        row[first_pos:last_pos] = 0
+
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)
