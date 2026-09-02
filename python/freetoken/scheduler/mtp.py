@@ -189,7 +189,7 @@ class MTPDecodeMixin:
         return req not in self.decode_manager.running_reqs or req in self.finished_reqs
 
     # ------------------------------------------------------- continuation forward
-    def _mtp_run_extend(self, req: Req, tokens: list, boundary_slot: int | None):
+    def _mtp_run_extend(self, req: Req, tokens: list, boundary_slot: int | None = None):
         """Eagerly process ``tokens`` (1..2 ids) as a continuation of ``req`` at
         positions [C, C+len) where C = req.cached_len (the newest committed real token,
         unprocessed). Temporarily bumps ``req.device_len`` to C+len so the scheduler's
@@ -199,8 +199,9 @@ class MTPDecodeMixin:
         failure restores ``req.device_len`` and frees the just-allocated tail pages so
         normal decode can resume cleanly, then re-raises (drive disables spec).
 
-        ``boundary_slot`` (verify only): GDN layers snapshot the after-first-token
-        (after-committed-``u``) recurrent+conv state there for the reject rollback.
+        ``boundary_slot`` (verify only, default None): GDN layers snapshot the
+        after-first-token (after-committed-``u``) recurrent+conv state there for the
+        reject rollback.
         """
         C = req.cached_len
         n = len(tokens)
