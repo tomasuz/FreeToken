@@ -349,6 +349,9 @@ class MTPDecodeMixin:
                 logits = model.forward_mtp(prev_hidden, ids)  # [1, vocab]
             return int(torch.argmax(logits, dim=-1).item())
         except Exception:  # noqa: BLE001 -- dev bring-up; fall back to normal decode
+            import traceback
+
+            traceback.print_exc()
             logger.exception("[mtp] MTP head draft failed; disabling MTP spec")
             self._mtp_disabled = True
             return None
