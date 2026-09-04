@@ -55,16 +55,17 @@ def main() -> int:
     banks = {name: _map(e) for name, e in _SPEC["banks"].items()}
     io = {name: _map(e) for name, e in _SPEC["io"].items()}
 
-    # Pinned so the one-off staging copy below runs at full rate. Registration also gives
-    # this process a device address for the mapping, which is what a later zero-copy read
-    # would need -- see the note on materialisation below.
-    for b in banks.values():
-        b.pin()
+    # The bank mappings are deliberately NOT registered with the runtime. Registering a
+    # shared mapping that another process also holds is not something the runtime promises
+    # anything about, and it bought only a faster one-off staging copy at startup. The
+    # zero-copy read this would be a prerequisite for is a separate piece of work, and can
+    # bring its own registration when it is written.
 
     from freetoken.moe.fused_q4_0 import fused_experts_gguf
 
     ggml_type = int(_SPEC["ggml_type"])
     activation = _SPEC["activation"]
+    act_fn = _resolve_activation(activation, _SPEC.get("activation_backend", "auto"))
     flags = ctl.tensor
 
     # First cut: stage the layer's banks onto the device once, at startup. The grouped
@@ -77,7 +78,7 @@ def main() -> int:
     down = banks["down"].tensor.to(device)
     # Announce readiness only once the kernels are actually loaded: the first launch JIT
     # compiles, and a parent that started timing before that would blame the first token.
-    _warm(gate_up, down, io, device, activation, ggml_type, fused_experts_gguf)
+    _warm(gate_up, down, io, device, activation, ggml_type, fused_experts_gguf, act_fn)
     flags[_DONE] = -1  # "worker is up"; the parent waits for this before its first submit
 
     while True:
@@ -91,7 +92,7 @@ def main() -> int:
         ids = io["ids"].tensor[:bs].to(device, non_blocking=False)
         w = io["w"].tensor[:bs].to(device, non_blocking=False)
 
-        out = fused_experts_gguf(x, gate_up, down, w, ids, activation, ggml_type)
+        out = fused_experts_gguf(x, gate_up, down, w, ids, activation, ggml_type, act_fn)
         io["y"].tensor[:bs].copy_(out)  # cross-device copy; syncs on this stream
         torch.cuda.synchronize(device)
 
@@ -99,13 +100,57 @@ def main() -> int:
         flags[_DONE] = bs
 
 
-def _warm(gate_up, down, io, device, activation, ggml_type, fn) -> None:
+def _resolve_activation(name: str, backend: str):
+    """Pick the activation implementation this device can actually run.
+
+    ``"kernel"`` and ``"torch"`` say so outright. ``"auto"`` (the default) tries the
+    compiled kernel on a token-sized input and falls back to torch if it does not compile,
+    which is how a device Triton has no backend for stays usable: losing a fused kernel
+    costs speed, and refusing the device costs the device.
+
+    The probe runs here, once, rather than at the first real step -- a compile failure in
+    the middle of a decode would surface as a stalled worker instead of a clear line at
+    startup. Only a compile-time failure is caught: a launch failure means the device is
+    broken in a way a different activation will not repair, so it propagates.
+    """
+    from freetoken.layers import activation_torch
+
+    torch_fn = activation_torch.BY_NAME.get(name)
+    if backend == "torch":
+        if torch_fn is None:
+            raise ValueError(f"no torch activation for {name!r}")
+        return torch_fn
+    if backend == "kernel":
+        return None  # fused_experts_gguf keeps its own lookup
+    if backend != "auto":
+        raise ValueError(f"unknown activation_backend {backend!r}")
+
+    from freetoken.moe.fused_q4_0 import _ACT
+
+    kernel_fn = _ACT.get(name)
+    if kernel_fn is None or torch_fn is None:
+        return None
+    probe = torch.zeros(1, 2, dtype=torch.bfloat16, device="cuda")
+    try:
+        kernel_fn(probe)
+        torch.cuda.synchronize()
+    except Exception as exc:
+        print(
+            f"worker: compiled {name} activation unavailable on this device "
+            f"({type(exc).__name__}: {str(exc).splitlines()[-1][:160]}); using torch",
+            file=sys.stderr, flush=True,
+        )
+        return torch_fn
+    return None
+
+
+def _warm(gate_up, down, io, device, activation, ggml_type, fn, act_fn=None) -> None:
     """One throwaway launch so the JIT compile lands before the parent starts timing."""
     x = io["x"].tensor[:1].to(device)
     ids = io["ids"].tensor[:1].to(device)
     w = io["w"].tensor[:1].to(device)
     try:
-        fn(x, gate_up, down, w, ids, activation, ggml_type)
+        fn(x, gate_up, down, w, ids, activation, ggml_type, act_fn)
         torch.cuda.synchronize(device)
     except Exception as exc:  # a warm-up failure is the parent's problem, not a crash here
         print(f"worker warmup failed: {exc}", file=sys.stderr, flush=True)

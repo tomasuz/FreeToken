@@ -68,6 +68,10 @@ class WorkerMoeExecutor:
     different runtime configuration than the parent's gets it. ``banks`` are the layer's
     packed expert weights; they are copied once into shared memory at construction, after
     which both processes address the same pages.
+
+    ``activation_backend`` picks the activation implementation in the worker: ``"auto"``
+    uses the compiled kernel where it builds and torch where it does not, which is what
+    keeps a device usable when the kernel compiler has no backend for it.
     """
 
     def __init__(
@@ -81,10 +85,14 @@ class WorkerMoeExecutor:
         hidden_size: int | None = None,
         top_k: int | None = None,
         env: dict[str, str] | None = None,
+        activation_backend: str = "auto",
     ) -> None:
         self.device_index = device_index
         self._proc: subprocess.Popen | None = None
         self._bufs: list = []
+        self._keep_spec = False
+        self._log = None
+        self._log_path = ""
 
         gate_up = banks["gate_up"]
         down = banks["down"]
@@ -111,10 +119,10 @@ class WorkerMoeExecutor:
             "w": share("w", None, (max_batch, k), torch.float32),
             "y": share("y", None, (max_batch, h), torch.bfloat16),
         }
-        # The parent hands these addresses to its own accelerator, so they must be
-        # registered here too -- registration is per process, over the same pages.
-        for buf in self._io.values():
-            buf.pin()
+        # Not registered while the handoff is a plain copy: the pages are shared with a
+        # process driving a different device, and registering them here would be an
+        # optimisation whose only beneficiary is a stream-async copy this cut does not do.
+        # The stream-memop handshake will need it and can add it deliberately.
 
         spec = {
             "control": self._entry(self._ctl),
@@ -122,6 +130,9 @@ class WorkerMoeExecutor:
             "io": {n: self._entry(b) for n, b in self._io.items()},
             "ggml_type": int(ggml_type),
             "activation": activation,
+            # "auto" lets the worker fall back to torch where the compiled activation has
+            # no backend for its device; "kernel"/"torch" force one.
+            "activation_backend": activation_backend,
         }
         self._spec_path = os.path.join(tempfile.gettempdir(), f"freetoken-worker-{tag}.json")
         with open(self._spec_path, "w") as fh:
@@ -154,18 +165,42 @@ class WorkerMoeExecutor:
             child_env["PYTHONPATH"] = (
                 pkg_root + (os.pathsep + existing if existing else "")
             )
+        # Drop an inherited kernel-architecture selection. This process picks one from the
+        # devices *it* can see and exports it; inherited into a child pinned to a different
+        # device, it names architectures that child is not running on, and a fat binary with
+        # no code for the actual device faults on the first launch rather than failing to
+        # load. The child derives its own once the visibility below applies.
+        child_env.pop("PYTORCH_ROCM_ARCH", None)
         # Restrict the child to its device *before* its overrides, so an override that
         # names visibility itself still wins -- the caller may know better than we do.
         child_env[_visibility_var()] = str(self.device_index)
         child_env.update(env)
+        # Files, not pipes. A kernel compiler that fails can print megabytes -- Triton
+        # dumps a full MLIR reproducer -- and a child writing to a pipe nobody is draining
+        # blocks in write() once the buffer fills. The parent is meanwhile polling a flag
+        # that will now never be set, so the whole thing hangs on the one path where the
+        # output actually matters.
+        self._log_path = self._spec_path.replace(".json", ".log")
+        self._log = open(self._log_path, "w+")
         self._proc = subprocess.Popen(
             [sys.executable, "-m", "freetoken.moe._worker_main", self._spec_path],
             env=child_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=self._log,
+            stderr=subprocess.STDOUT,
             text=True,
         )
-        self._await_flag(_DONE, -1, _START_TIMEOUT_S, "start")
+        try:
+            self._await_flag(_DONE, -1, _START_TIMEOUT_S, "start")
+        except Exception:
+            # The spec names every shared buffer; keeping it lets the same child be
+            # started again by hand, which is the only way to debug a crash this side
+            # only sees as a signal number.
+            logger.warning_rank0(
+                f"MoE worker spec kept for inspection: {self._spec_path} "
+                f"(child output: {self._log_path})"
+            )
+            self._keep_spec = True
+            raise
         logger.info_rank0(f"MoE worker up on device {self.device_index}")
 
     def _await_flag(self, slot: int, want: int, timeout: float, what: str) -> None:
@@ -179,10 +214,9 @@ class WorkerMoeExecutor:
         while int(flags[slot]) != want:
             rc = self._proc.poll()
             if rc is not None:
-                err = (self._proc.stderr.read() or "").strip()
                 raise RuntimeError(
                     f"MoE worker for device {self.device_index} exited with {rc} during "
-                    f"{what}: {err[-800:] or '(no output)'}"
+                    f"{what}: {self._child_error()}"
                 )
             if time.monotonic() > deadline:
                 raise TimeoutError(
@@ -190,6 +224,30 @@ class WorkerMoeExecutor:
                     f"{timeout:.0f}s during {what}"
                 )
             time.sleep(0.001)
+
+    def _child_error(self) -> str:
+        """The child's output, trimmed from both ends.
+
+        A crash inside a kernel compiler buries the useful lines under pages of dumped IR,
+        so a plain tail of the stream is the one part guaranteed not to say what happened.
+        Keep the start (where the traceback begins) and the end (where it names the error),
+        and say how much was dropped between them.
+        """
+        try:
+            self._log.flush()
+            with open(self._log_path) as fh:
+                text = fh.read().strip()
+        except OSError:
+            text = ""
+        if not text:
+            return "(no output)"
+        lines = text.splitlines()
+        if len(lines) <= 40:
+            return "\n" + text
+        head, tail = lines[:15], lines[-15:]
+        return "\n" + "\n".join(
+            head + [f"    ... {len(lines) - 30} lines omitted ..."] + tail
+        )
 
     def decode(
         self,
@@ -228,10 +286,15 @@ class WorkerMoeExecutor:
         for buf in self._bufs:
             buf.close()
         self._bufs = []
-        try:
-            os.unlink(self._spec_path)
-        except FileNotFoundError:
-            pass
+        if self._log is not None:
+            self._log.close()
+            self._log = None
+        if not self._keep_spec:
+            for path in (self._spec_path, self._log_path):
+                try:
+                    os.unlink(path)
+                except (FileNotFoundError, OSError):
+                    pass
 
     def __enter__(self) -> "WorkerMoeExecutor":
         return self

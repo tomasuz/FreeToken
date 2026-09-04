@@ -146,8 +146,31 @@ def _module():
         sources=[str(_CSRC / "gguf_kernel.cu")],
         extra_include_paths=[str(_CSRC)],
         extra_cuda_cflags=extra_cuda_cflags,
+        build_directory=_build_directory(archs),
         verbose=True,
     )
+
+
+def _build_directory(archs: list[str]) -> str | None:
+    """A build directory per set of target architectures.
+
+    torch keys the JIT cache by extension name alone, so two processes on the same machine
+    that target different devices -- which is the whole point of deriving the targets from
+    what is visible -- share one directory and overwrite each other's build. The loser
+    loads code compiled for a device it is not running on, and faults.
+
+    ``None`` (no archs to key on) keeps torch's own choice.
+    """
+    if not archs:
+        return None
+    try:
+        from torch.utils.cpp_extension import _get_build_directory
+    except ImportError:  # private helper; if it moves, torch's default is still correct
+        return None
+    base = _get_build_directory("freetoken_gguf_kernels", verbose=False)
+    path = f"{base}-{'-'.join(archs)}"
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 # ---- thin typed wrappers (signatures mirror sgl_kernel.quantization.gguf) ----
