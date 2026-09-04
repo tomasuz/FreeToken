@@ -59,10 +59,12 @@ class EngineConfig:
     # floor. None/"" = no resident tier. Must not overlap moe_cpu_layers.
     moe_resident_layers: str | None = None
     # Directory for file-backed (spillable) expert banks; exported as
-    # FREETOKEN_BANK_SPILL_DIR. Host banks then cost reclaimable page cache instead of
-    # anonymous RAM, so the offloaded tier degrades to paging speed instead of OOM when it
-    # does not fit. Must be real storage -- a tmpfs (/dev/shm) spill file is unevictable and
-    # buys nothing. None = anonymous mmap (the default).
+    # FREETOKEN_BANK_SPILL_DIR. A spilled bank costs reclaimable page cache instead of
+    # anonymous RAM, so it degrades to paging speed instead of OOM when it does not fit.
+    # Only PAGEABLE layers are spilled (see host_banks._layer_backing): pinned/locked banks
+    # are unevictable and resident layers are released right after upload, so spilling
+    # either only adds writeback. Must be real storage -- a tmpfs (/dev/shm) spill file is
+    # unevictable and buys nothing. None = anonymous mmap (the default).
     moe_bank_spill_dir: str | None = None
     # Hybrid MoE backend (--moe-backend hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.

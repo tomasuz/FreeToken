@@ -593,11 +593,13 @@ def parse_args(
         type=str,
         default=ServerArgs.moe_bank_spill_dir,
         help=(
-            "Back the (non-resident) expert banks with a sparse file in this directory "
-            "instead of anonymous memory. Their pages become reclaimable page cache, so "
-            "banks that do not fit in RAM degrade to paging speed instead of swapping or "
-            "OOM-killing. Point it at real storage: a tmpfs path (/dev/shm) is unevictable "
-            "and buys nothing."
+            "Back PAGEABLE expert banks with a sparse file in this directory instead of "
+            "anonymous memory. Their pages become reclaimable page cache, so banks that do "
+            "not fit in RAM degrade to paging speed instead of swapping or OOM-killing. "
+            "Only pageable layers are spilled: pinned and OS-locked banks are unevictable "
+            "and resident layers are released right after upload, so spilling either would "
+            "add writeback for nothing. Point it at real storage -- a tmpfs path (/dev/shm) "
+            "is unevictable and buys nothing."
         ),
     )
 
