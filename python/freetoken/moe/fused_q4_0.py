@@ -26,10 +26,15 @@ def fused_experts_gguf(
     topk_ids: torch.Tensor,
     activation: str,
     ggml_type: int,
+    act_fn=None,
 ) -> torch.Tensor:
+    """``act_fn`` overrides the activation implementation for callers that cannot use the
+    compiled one -- a worker process on a device Triton has no backend for, say. ``None``
+    keeps the default lookup, so nothing changes for anyone who does not ask."""
     from freetoken.kernel.gguf import ggml_moe_a8_vec
 
-    act_fn = _ACT.get(activation)
+    if act_fn is None:
+        act_fn = _ACT.get(activation)
     if act_fn is None:
         raise ValueError(f"unsupported MoE activation {activation!r}")
 
