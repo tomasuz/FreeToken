@@ -475,21 +475,81 @@ class Engine:
             device=self.device,
         )
 
+    def _resident_budget(self, config: EngineConfig) -> tuple[int, int]:
+        """``(bytes the KV pool will claim, bytes one MoE layer's experts occupy)``.
+
+        Shared by the resident-layer auto sizer and, in spirit, the MoE cache sizer: both
+        carve the same free-VRAM budget. Returns ``(kv_bytes, per_layer_bytes)``;
+        ``per_layer_bytes == 0`` when the checkpoint's bank geometry is not estimable."""
+        from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
+
+        cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
+        kv_tokens = max(config.kv_reserve_tokens, min_reserve)
+        kv_bytes = (
+            fixed_cache_size
+            + state_pool_bytes(config)
+            + math.ceil(kv_tokens / page_tokens) * cache_per_page
+        )
+        num_moe_layers = config.model_config.num_moe_layers
+        bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
+        per_layer = (bank_bytes // num_moe_layers) if bank_bytes and num_moe_layers else 0
+        return kv_bytes, per_layer
+
+    def _resolve_auto_resident_layers(
+        self, config: EngineConfig, num_moe_layers: int, cpu_layer_ids: frozenset
+    ) -> frozenset[int]:
+        """Fill VRAM with whole expert layers, keeping room for KV and the slot-cache floor.
+
+        Every resident layer removes its experts from host RAM entirely, so this is the knob
+        that decides how much of the model has to be duplicated at all. The floor kept back
+        is what the remaining offloaded layers still need: ``num_experts`` slots (doubled
+        when prefill overlap borrows two full expert layers).
+        """
+        kv_bytes, per_layer = self._resident_budget(config)
+        if not per_layer:
+            logger.warning_rank0(
+                "--moe-resident-layers auto: cannot estimate this checkpoint's expert bank "
+                "geometry; keeping every layer on the host offload path"
+            )
+            return frozenset()
+        per_expert = per_layer // config.model_config.num_experts
+        slot_floor = config.model_config.num_experts * per_expert
+        if config.moe_prefill_overlap:
+            slot_floor *= 2
+        budget = int(self._baseline_free * config.memory_ratio) - self._weights_bytes
+        budget -= kv_bytes + slot_floor
+        n = 0 if budget <= 0 else min(num_moe_layers, budget // per_layer)
+        # Never make a CPU-decode layer resident: those two tiers are mutually exclusive
+        # (one has no host bank, the other decodes *from* the host bank).
+        ids = _end_layers(int(n), num_moe_layers) - cpu_layer_ids
+        logger.info_rank0(
+            f"--moe-resident-layers auto: {len(ids)}/{num_moe_layers} MoE layers resident in "
+            f"VRAM ({len(ids) * per_layer / 2**30:.2f} GiB), keeping {kv_bytes / 2**30:.2f} GiB "
+            f"for KV and {slot_floor / 2**30:.2f} GiB for the slot-cache floor"
+        )
+        return ids
+
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
         without a GPU. Reused by the Phase-2 runtime rebuild.
+
+        Resident layers are charged like weights (their VRAM was taken after the free-memory
+        baseline was read) and excluded from ``total_experts`` -- they never occupy a slot.
         """
         from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         num_experts = config.model_config.num_experts
-        total_experts = config.model_config.num_moe_layers * num_experts
+        offload_layers = config.model_config.num_moe_layers - len(banks.resident_layers)
+        # The slot cache never shrinks below one expert layer (validate_rebuild's floor, and
+        # the prefill buffers borrow from it), so an all-resident model still sizes for one.
+        total_experts = max(offload_layers, 1) * num_experts
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
-            weights_bytes=self._weights_bytes,
+            weights_bytes=self._weights_bytes + banks.resident_bytes,
             memory_ratio=config.memory_ratio,
             cache_per_page=cache_per_page,
             fixed_cache_size=fixed_cache_size,
@@ -541,6 +601,28 @@ class Engine:
             decode_target = "cpu"
         else:
             decode_target = "gpu"
+        if config.moe_bank_spill_dir:
+            # HostBank reads this at allocation time (bank_backing_default), and banks are
+            # allocated deep inside the per-model loaders -- an env var is how that ambient
+            # choice already travels (FREETOKEN_BANK_CUDA_ALLOC).
+            os.environ["FREETOKEN_BANK_SPILL_DIR"] = config.moe_bank_spill_dir
+        # Resident tier: these layers' experts are uploaded to VRAM during the bank load and
+        # their host banks released, so they cost no host RAM and no slot. Decided BEFORE the
+        # load because that is the only point where the host peak can still be avoided.
+        resident_layer_ids = _resolve_resident_layers(
+            config, config.model_config.num_moe_layers
+        )
+        if resident_layer_ids == _RESIDENT_AUTO:
+            resident_layer_ids = self._resolve_auto_resident_layers(
+                config, config.model_config.num_moe_layers, cpu_layer_ids
+            )
+        overlap_ids = resident_layer_ids & cpu_layer_ids
+        if overlap_ids:
+            raise ValueError(
+                f"layers {sorted(overlap_ids)} are in both --moe-resident-layers and "
+                f"--moe-cpu-layers; a layer's experts are either in VRAM only or on the "
+                f"host for CPU decode, never both"
+            )
         # split residency: where pinning is quota-capped (_pin_budget_bytes), pin only the GPU layers' banks and mlock the CPU layers'
         # uncapped hosts keep every bank pinned (CPU decode reads them the same; overlap prefill stays on)
         # not applied to plain --moe-backend cpu; all-locked under a cap = --moe-backend offload --moe-cpu-layers 1.0
@@ -595,6 +677,7 @@ class Engine:
                 parallel=expert_parallel,
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                 layer_residency=requested_residency,
+                resident_layers=resident_layer_ids,
             )
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
@@ -630,6 +713,9 @@ class Engine:
             )
             # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
             cache.cpu_layer_ids = cpu_layer_ids
+            # also before set_bank_sources: resident layers' host sources are released mmaps,
+            # so the copy plan must know to skip them rather than take their device alias
+            cache.set_resident_banks(banks.resident, banks.resident_layers)
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
@@ -1100,10 +1186,12 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
             override("cuda_graph_bs", kept)
 
 
-def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
-    """Parse ``--moe-cpu-layers``: an explicit MoE-layer id list (``"3,7,11"``), a count
-    (``"8"`` -> 8 layers evenly strided across depth), or a fraction (``"0.5"``). Ids are
-    indices into the MoE layers, ``[0, num_moe_layers)``."""
+def _parse_layer_count(spec: str, num_moe_layers: int, flag: str) -> int | frozenset[int]:
+    """Shared ``--moe-cpu-layers`` / ``--moe-resident-layers`` spec syntax.
+
+    Returns an explicit id set for a list spec (``"3,7,11"``), else the layer COUNT a
+    bare number (``"8"``) or fraction (``"0.5"``) asks for -- each flag then places that
+    many layers with its own policy."""
     s = spec.strip()
     if not s:
         return frozenset()
@@ -1111,22 +1199,59 @@ def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
         ids = {int(x) for x in s.split(",") if x.strip()}
         for i in ids:
             if not 0 <= i < num_moe_layers:
-                raise ValueError(
-                    f"--moe-cpu-layers id {i} out of range [0, {num_moe_layers})"
-                )
+                raise ValueError(f"{flag} id {i} out of range [0, {num_moe_layers})")
         return frozenset(ids)
     if "." in s:
         frac = float(s)
         if not 0.0 <= frac <= 1.0:
-            raise ValueError(f"--moe-cpu-layers fraction {frac} must be in [0, 1]")
-        k = round(frac * num_moe_layers)
-    else:
-        k = int(s)
-        if not 0 <= k <= num_moe_layers:
-            raise ValueError(f"--moe-cpu-layers count {k} must be in [0, {num_moe_layers}]")
+            raise ValueError(f"{flag} fraction {frac} must be in [0, 1]")
+        return round(frac * num_moe_layers)
+    k = int(s)
+    if not 0 <= k <= num_moe_layers:
+        raise ValueError(f"{flag} count {k} must be in [0, {num_moe_layers}]")
+    return k
+
+
+def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
+    """Parse ``--moe-cpu-layers``: an explicit MoE-layer id list (``"3,7,11"``), a count
+    (``"8"`` -> 8 layers evenly strided across depth), or a fraction (``"0.5"``). Ids are
+    indices into the MoE layers, ``[0, num_moe_layers)``."""
+    k = _parse_layer_count(spec, num_moe_layers, "--moe-cpu-layers")
+    if isinstance(k, frozenset):
+        return k
     # k layers spread evenly across depth (frozenset dedups any rounding collisions;
     # k == 0 yields an empty range, hence an empty set).
     return frozenset(round(i * num_moe_layers / k) for i in range(k))
+
+
+def _end_layers(n: int, num_moe_layers: int) -> frozenset[int]:
+    """``n`` layers taken from both ends (head + tail).
+
+    Per-layer decode miss rates are U-shaped, so the ends are the layers that cost the most
+    on the PCIe offload path -- exactly the ones worth making resident. The complement (the
+    middle) keeps the cheapest miss profile for the slot cache."""
+    n = max(0, min(n, num_moe_layers))
+    head = (n + 1) // 2
+    return frozenset(range(head)) | frozenset(range(num_moe_layers - (n - head), num_moe_layers))
+
+
+# --moe-resident-layers "auto": the count is only solvable once the engine's free-memory
+# baseline is known, so the spec resolver hands back this sentinel and the engine fills it in.
+_RESIDENT_AUTO = "auto"
+
+
+def _resolve_resident_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int] | str:
+    """MoE layer ids whose experts live in VRAM only (no host bank, no slot cache).
+
+    Same spec syntax as ``--moe-cpu-layers`` but placed from the ends (see
+    :func:`_end_layers`); ``"auto"`` returns the sentinel for the engine to size."""
+    spec = config.moe_resident_layers
+    if not spec or not is_offload_moe_backend(config.moe_backend):
+        return frozenset()
+    if spec.strip().lower() == _RESIDENT_AUTO:
+        return _RESIDENT_AUTO
+    k = _parse_layer_count(spec, num_moe_layers, "--moe-resident-layers")
+    return k if isinstance(k, frozenset) else _end_layers(k, num_moe_layers)
 
 
 def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int]:
@@ -1221,6 +1346,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cache_rate": None,
     "moe_cache_auto": False,
     "moe_cpu_layers": None,
+    "moe_resident_layers": None,
     "moe_bank_spill_dir": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,

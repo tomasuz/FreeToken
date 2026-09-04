@@ -226,6 +226,13 @@ class OffloadMoeCache:
         # _unpinned_layers is the derived id set the hot paths test against
         self.layer_residency: list[str] = []
         self._unpinned_layers: frozenset = frozenset()
+        # GPU-RESIDENT layers: their experts live in VRAM only (no host copy at all), so
+        # they never touch the slot cache. Set by set_resident_banks BEFORE
+        # set_bank_sources, which needs the id set to skip them in the copy plan --
+        # their host sources are released mmaps whose pages are gone.
+        # resident_banks: {bank name: {layer_id: [num_experts, ...] device tensor}}.
+        self.resident_layer_ids: frozenset = frozenset()
+        self.resident_banks: dict[str, dict[int, torch.Tensor]] = {}
         # marlin/b12x per-expert global scales ([L*E], GPU resident, see set_alphas).
         self.gate_up_alpha: torch.Tensor | None = None
         self.down_alpha: torch.Tensor | None = None
@@ -350,6 +357,8 @@ class OffloadMoeCache:
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
             head = per_layer[0]
             for layer_id, source in enumerate(per_layer):
+                if layer_id in self.resident_layer_ids:
+                    continue  # released host bank: shape is still right, the pages are not there
                 assert source.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
                 assert source.size(0) == self.num_experts, (name, layer_id, source.shape)
                 assert source.shape == head.shape and source.dtype == head.dtype, (
@@ -408,8 +417,10 @@ class OffloadMoeCache:
             if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
                 return  # leave fused disabled; copy_missing uses the per-bank path
             for layer_id, source in enumerate(per_layer):
-                if layer_id in self._unpinned_layers:
-                    # unregistered layer: no device alias exists, and the row is never consumed (CPU decode; pageable prefill)
+                if layer_id in self._unpinned_layers or layer_id in self.resident_layer_ids:
+                    # unregistered layer: no device alias exists, and the row is never consumed
+                    # (CPU decode; pageable prefill; or -- for a resident layer -- the host bank
+                    # was uploaded and released, so its pages are gone and nothing may read it)
                     # a 0 placeholder keeps the descriptor shape
                     layer_src_ptrs[layer_id].append(0)
                     continue
@@ -565,6 +576,50 @@ class OffloadMoeCache:
         """Whether ``layer_id`` decodes on the CPU executor (vs the GPU offload path)."""
         return layer_id in self.cpu_layer_ids
 
+    def set_resident_banks(
+        self, resident: dict[str, dict[int, torch.Tensor]], layers: frozenset
+    ) -> None:
+        """Register the VRAM-only expert banks for ``layers`` (call BEFORE set_bank_sources).
+
+        These layers are excluded from every movement path: no slot is ever assigned to
+        them, ``copy_missing`` never reads their host sources (whose pages the loader
+        released), and their MoE layers read ``resident_views`` directly with raw expert ids
+        -- position == expert id, exactly like a materialized prefill layer."""
+        if not layers:
+            self.resident_layer_ids = frozenset()
+            self.resident_banks = {}
+            return
+        assert set(resident) == set(self.bank_schema), (
+            f"resident banks {sorted(resident)} do not match the "
+            f"{self.quant_format!r} schema {self.bank_schema}"
+        )
+        for name, per_layer in resident.items():
+            missing = sorted(layers - set(per_layer))
+            assert not missing, f"resident bank {name!r} missing layers {missing}"
+            for layer_id in layers:
+                t = per_layer[layer_id]
+                # A tensor's device always carries an index; self.device may be the bare
+                # "cuda" the caller constructed the cache with, so compare index-tolerantly.
+                assert t.device.type == self.device.type and (
+                    self.device.index is None or t.device.index == self.device.index
+                ), (name, layer_id, t.device, self.device)
+                assert t.size(0) == self.num_experts, (name, layer_id, t.shape)
+        overlap = layers & self.cpu_layer_ids
+        assert not overlap, (
+            f"layers {sorted(overlap)} are both GPU-resident and CPU-decode; "
+            "--moe-resident-layers and --moe-cpu-layers must not overlap"
+        )
+        self.resident_layer_ids = frozenset(layers)
+        self.resident_banks = {name: dict(per) for name, per in resident.items()}
+
+    def is_resident_layer(self, layer_id: int) -> bool:
+        """Whether ``layer_id``'s experts live in VRAM only (no host bank, no slot cache)."""
+        return layer_id in self.resident_layer_ids
+
+    def resident_views(self, layer_id: int) -> tuple[torch.Tensor, ...]:
+        """This layer's VRAM expert banks in registration order; row == expert id."""
+        return tuple(self.resident_banks[name][layer_id] for name in self.bank_schema)
+
     def is_unpinned_layer(self, layer_id: int) -> bool:
         """Whether ``layer_id``'s host banks have no device address (LOCKED/PAGEABLE): the GPU slot-gather paths cannot serve it.
         ``copy_missing`` takes the whole-layer pageable branch, which presumes materialize's position == expert id (never ``ensure_experts``'s LRU slot remap)."""
@@ -667,6 +722,13 @@ class OffloadMoeCache:
             return
         if layer_id < 0:
             raise ValueError(f"Invalid prefill layer id: {layer_id}")
+        if layer_id in self.resident_layer_ids:
+            # A resident layer's banks are already on the device and its host source is a
+            # released mmap -- prefetching it would copy dropped (zero) pages into the
+            # buffer. It is also pure waste: the layer reads its VRAM banks directly.
+            # Guarding here rather than at the call site also covers the look-ahead
+            # prefetch of layer_id + 1 in OffloadMoELayer._wait_prefill_overlap.
+            return
 
         assert self.banks and self.prefill_bank_buffers
 

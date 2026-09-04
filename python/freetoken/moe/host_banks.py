@@ -229,7 +229,9 @@ class HostBank:
     def release(self) -> None:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
 
-        For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped.
+        For buffers that are done being read (the converter, and the resident-expert
+        uploader once a layer's rows are in VRAM). No-op for born-pinned banks: registered
+        pages cannot be dropped.
 
         A file-backed bank additionally punches a hole in its spill file, so the bytes are
         returned to the filesystem too -- ``MADV_DONTNEED`` alone would only drop the RAM
@@ -257,6 +259,9 @@ class HostBank:
             return
         self._locked = True
 
+
+# Queue tag for PinPipeline's resident-upload item (distinct from any real layer id).
+_RESIDENT = "resident"
 
 _os_locked_total = 0  # bytes locked so far; the OS lock ceiling is a per-process quota
 _os_lock_failed = False  # sticky: once over quota, later (bigger-total) locks fail too
@@ -330,6 +335,40 @@ class _ResidencyPlan:
 
 _requested_residency: _ResidencyPlan | None = None
 
+# Ambient resident-expert uploader for the enclosed bank load, installed by
+# ``load_expert_banks``. Same trick as ``_requested_residency``: the settle points consult
+# it, so no loader signature grows a parameter. ``None`` = every layer stays on the host.
+_resident_uploader = None
+
+
+@contextlib.contextmanager
+def resident_upload(uploader):
+    """Install the ambient resident-expert uploader for the enclosed bank load.
+
+    ``uploader`` implements ``claims(layer_id) -> bool`` and ``upload(layer_id, banks)``;
+    a claimed layer is copied to the device at layer-completion time and its host banks are
+    released instead of pinned, so its bytes never occupy host RAM past the copy."""
+    global _resident_uploader
+    if uploader is None:
+        yield None
+        return
+    prev, _resident_uploader = _resident_uploader, uploader
+    try:
+        yield uploader
+    finally:
+        _resident_uploader = prev
+
+
+def _upload_resident(uploader, layer_id: int, banks: dict[str, "HostBank"]) -> None:
+    """Copy a completed layer's banks to the device, then drop their host pages.
+
+    Ordering matters: ``upload`` must fully synchronize before ``release``, or the
+    ``MADV_DONTNEED`` races an in-flight copy and the device gets zeros. The uploader does
+    a blocking copy from unregistered memory, which is synchronous by construction."""
+    uploader.upload(layer_id, banks)
+    for bank in banks.values():
+        bank.release()
+
 
 @contextlib.contextmanager
 def requested_residency(labels: list[str] | None):
@@ -356,11 +395,21 @@ def _settle(bank: HostBank, residency: str) -> None:
 
 def pin_banks(banks: dict[str, HostBank | list[HostBank]]) -> None:
     """Settle every bank after it has been filled -- pin-after-fill by default.
-    List-valued entries are per-layer and honor the ambient :func:`requested_residency` plan; scalar banks always pin."""
+    List-valued entries are per-layer and honor the ambient :func:`requested_residency` plan; scalar banks always pin.
+    Layers claimed by the ambient :func:`resident_upload` plan are uploaded to the device and released instead."""
     plan = _requested_residency
+    uploader = _resident_uploader
+    if uploader is not None:
+        per_layer = {name: b for name, b in banks.items() if isinstance(b, list)}
+        num_layers = len(next(iter(per_layer.values()))) if per_layer else 0
+        for layer_id in range(num_layers):
+            if uploader.claims(layer_id):
+                _upload_resident(uploader, layer_id, {n: b[layer_id] for n, b in per_layer.items()})
     for bank in banks.values():
         if isinstance(bank, list):
             for layer_id, layer_bank in enumerate(bank):
+                if uploader is not None and uploader.claims(layer_id):
+                    continue  # already uploaded + released
                 residency = (
                     HostResidency.PINNED.value if plan is None
                     else plan.residency_for(layer_id)
@@ -397,8 +446,12 @@ class PinPipeline:
                 return
             if self._exc is not None:
                 continue  # drain without settling after a failure
-            bank, residency, plan, layer_id = item
+            kind, a, b, c = item
             try:
+                if kind == _RESIDENT:
+                    _upload_resident(a, b, c)
+                    continue
+                bank, residency, plan, layer_id = a, b, c, kind
                 _settle(bank, residency)
                 if plan is not None and residency == HostResidency.LOCKED.value:
                     plan.record(layer_id, bank.residency.value)
@@ -407,10 +460,19 @@ class PinPipeline:
 
     def submit(self, bank: HostBank, residency: str = HostResidency.PINNED.value,
                plan=None, layer_id: int | None = None) -> None:
-        self._q.put((bank, residency, plan, layer_id))
+        self._q.put((layer_id, bank, residency, plan))
+
+    def submit_resident(self, uploader, layer_id: int, banks: dict[str, HostBank]) -> None:
+        """Queue a whole layer for device upload + host release instead of pinning."""
+        self._q.put((_RESIDENT, uploader, layer_id, banks))
 
     def __call__(self, layer_id: int, banks: dict[str, HostBank]) -> None:
-        """Layer-completion sink: queue every bank of the completed layer at its ambient :func:`requested_residency` label."""
+        """Layer-completion sink: upload the layer if the ambient :func:`resident_upload`
+        plan claims it, else queue every bank at its ambient :func:`requested_residency` label."""
+        uploader = _resident_uploader
+        if uploader is not None and uploader.claims(layer_id):
+            self.submit_resident(uploader, layer_id, banks)
+            return
         plan = _requested_residency
         residency = (
             HostResidency.PINNED.value if plan is None else plan.residency_for(layer_id)

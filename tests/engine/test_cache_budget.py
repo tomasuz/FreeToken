@@ -309,6 +309,10 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
             "gate_up": [torch.zeros(4, 32, 8, dtype=torch.float16)] * 2,  # row = 32*8*2 = 512
             "down": [torch.zeros(4, 8, 16, dtype=torch.float16)] * 2,     # row = 8*16*2 = 256
         }
+        # no VRAM-resident tier here: every layer is offloaded, so the sizer sees the
+        # whole expert population and charges nothing extra against the weights budget
+        resident_layers = frozenset()
+        resident_bytes = 0
 
     from freetoken.kvcache.mha_pool import MHAKVCache
 

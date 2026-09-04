@@ -573,15 +573,31 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-resident-layers",
+        type=str,
+        default=ServerArgs.moe_resident_layers,
+        help=(
+            "With --moe-backend offload/hybrid: which MoE layers keep their experts in "
+            "VRAM only. A resident layer is uploaded while its banks load and its host "
+            "banks are released immediately, so its weights never sit in RAM and VRAM at "
+            "once and it never spends a slot in the offload cache -- host RAM only has to "
+            "hold the layers that stay offloaded. Explicit id list ('3,7,11'), a count "
+            "('8', placed from both ends, where decode miss rates are highest), a fraction "
+            "('0.5'), or 'auto' to fill VRAM after weights, KV and the slot-cache floor. "
+            "Must not overlap --moe-cpu-layers."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-bank-spill-dir",
         type=str,
         default=ServerArgs.moe_bank_spill_dir,
         help=(
-            "Back the expert banks with a sparse file in this directory instead of "
-            "anonymous memory. Their pages become reclaimable page cache, so banks that do "
-            "not fit in RAM degrade to paging speed instead of swapping or OOM-killing. "
-            "Point it at real storage: a tmpfs path (/dev/shm) is unevictable and buys "
-            "nothing."
+            "Back the (non-resident) expert banks with a sparse file in this directory "
+            "instead of anonymous memory. Their pages become reclaimable page cache, so "
+            "banks that do not fit in RAM degrade to paging speed instead of swapping or "
+            "OOM-killing. Point it at real storage: a tmpfs path (/dev/shm) is unevictable "
+            "and buys nothing."
         ),
     )
 
