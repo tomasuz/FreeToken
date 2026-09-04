@@ -573,6 +573,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-bank-spill-dir",
+        type=str,
+        default=ServerArgs.moe_bank_spill_dir,
+        help=(
+            "Back the expert banks with a sparse file in this directory instead of "
+            "anonymous memory. Their pages become reclaimable page cache, so banks that do "
+            "not fit in RAM degrade to paging speed instead of swapping or OOM-killing. "
+            "Point it at real storage: a tmpfs path (/dev/shm) is unevictable and buys "
+            "nothing."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-hybrid-max-fetch",
         type=int,
         default=ServerArgs.moe_hybrid_max_fetch,

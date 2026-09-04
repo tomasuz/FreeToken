@@ -530,6 +530,11 @@ class Engine:
             cpu_layer_ids = _auto_cpu_layers(
                 config, config.model_config.num_moe_layers, reserved=self._host_tables_bytes
             )
+        if config.moe_bank_spill_dir:
+            # HostBank reads this at allocation time (bank_backing_default), and banks are
+            # allocated deep inside the per-model loaders -- an env var is how that ambient
+            # choice already travels (FREETOKEN_BANK_CUDA_ALLOC).
+            os.environ["FREETOKEN_BANK_SPILL_DIR"] = config.moe_bank_spill_dir
         if config.moe_backend == "hybrid":
             decode_target = "hybrid"
         elif cpu_layer_ids:
@@ -1216,6 +1221,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cache_rate": None,
     "moe_cache_auto": False,
     "moe_cpu_layers": None,
+    "moe_bank_spill_dir": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
