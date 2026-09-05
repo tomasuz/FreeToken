@@ -121,11 +121,11 @@ class WorkerMoeExecutor:
             "y": share("y", None, (max_batch, h), torch.bfloat16),
         }
         num_experts = gate_up.shape[0]
-        # A step must hold every expert it routes to at once, so the floor is one step's
-        # worst-case demand; below that the worker would have to evict a row the same
-        # launch still needs. Unset means hold the whole layer, which is what this did
-        # before there was a cache at all.
-        self.slots = min(num_experts, max(max_batch * k, int(slots or num_experts)))
+        # One token's experts are read by a single launch, so top_k is the floor. A wider
+        # step is split into several launches by the worker's cache, which is what keeps
+        # this a memory choice rather than a cap on batch width. Unset holds the whole
+        # layer, which is what this did before there was a cache at all.
+        self.slots = min(num_experts, max(k, int(slots or num_experts)))
         # Not registered while the handoff is a plain copy: the pages are shared with a
         # process driving a different device, and registering them here would be an
         # optimisation whose only beneficiary is a stream-async copy this cut does not do.

@@ -31,12 +31,13 @@ from __future__ import annotations
 
 import torch
 
-# A step needs every expert it routes to resident at once, so the cache can never be
-# smaller than one step's demand. The caller sizes slots; this is the floor it must respect.
+# A single token's experts are read by one launch and cannot be split, so top_k is the
+# hard floor. Anything above that is a choice: a step whose demand exceeds the cache is
+# served in several launches instead (see :meth:`WorkerSlotCache.partition`).
 MIN_SLOTS_MESSAGE = (
-    "worker slot cache too small: this step routes to {wanted} distinct experts but the "
-    "cache holds {slots}. Size it at least max_batch * top_k (--moe-worker-slots), or the "
-    "step cannot be served without evicting an expert it still needs."
+    "worker slot cache too small: one token routes to {wanted} experts but the cache holds "
+    "{slots}. A single token's experts are read by one launch and cannot be split across "
+    "refills, so --moe-worker-slots can never be below top_k."
 )
 
 
@@ -99,6 +100,38 @@ class WorkerSlotCache:
             if oldest is None or self._used[slot] < oldest:
                 victim, oldest = slot, self._used[slot]
         return victim
+
+    def partition(self, expert_ids: torch.Tensor) -> list[tuple[int, int]]:
+        """Split ``[tokens, top_k]`` ids into token ranges the cache can hold one at a time.
+
+        Sizing the cache would be pointless if a step's demand set the floor: prefill hands
+        this device hundreds of tokens at once, whose union is the whole expert set, so any
+        cache smaller than the layer would be rejected and the option would collapse back
+        to holding everything. Tokens are independent, though -- each is a separate row of
+        the grouped GEMV -- so a step too wide for the cache becomes several launches over
+        contiguous ranges, each within its reach.
+
+        Ranges are grown greedily, which keeps the common case (everything fits) to exactly
+        one range and no copying at all.
+        """
+        rows = expert_ids.tolist()
+        if not rows:
+            return []
+        ranges: list[tuple[int, int]] = []
+        start, union = 0, set()
+        for token, row in enumerate(rows):
+            experts = {int(e) for e in row}
+            if len(experts) > self.slots:
+                raise RuntimeError(
+                    MIN_SLOTS_MESSAGE.format(wanted=len(experts), slots=self.slots)
+                )
+            if token > start and len(union | experts) > self.slots:
+                ranges.append((start, token))
+                start, union = token, set(experts)
+            else:
+                union |= experts
+        ranges.append((start, len(rows)))
+        return ranges
 
     def ensure(self, expert_ids: torch.Tensor) -> torch.Tensor:
         """Make every expert in ``expert_ids`` resident; return the ids remapped to slots.

@@ -82,12 +82,52 @@ def test_an_expert_filled_this_step_is_not_evicted_by_a_later_one():
         assert torch.equal(cache.dev["gate_up"][slot], host["gate_up"][expert])
 
 
-def test_demand_larger_than_the_cache_is_refused_with_the_fix_in_the_message():
-    """Silently evicting a row the step still needs would corrupt the result instead."""
+def test_one_token_wider_than_the_cache_is_refused_with_the_fix_in_the_message():
+    """A single token's experts are one launch; there is no splitting that saves this."""
     cache = WorkerSlotCache(banks(), slots=2, device=CPU)
 
     with pytest.raises(RuntimeError, match="moe-worker-slots"):
-        cache.ensure(ids([0, 1, 2]))
+        cache.partition(ids([0, 1, 2]))
+
+
+def test_a_step_wider_than_the_cache_is_split_rather_than_refused():
+    """Cache size must be a memory choice, not a cap on how wide a step may be."""
+    cache = WorkerSlotCache(banks(), slots=4, device=CPU)
+
+    ranges = cache.partition(ids([0, 1], [2, 3], [4, 5], [6, 7]))
+
+    assert ranges == [(0, 2), (2, 4)]  # two tokens per launch at four slots
+    assert [hi - lo for lo, hi in ranges] == [2, 2]
+
+
+def test_a_step_that_fits_is_one_range_and_no_splitting():
+    cache = WorkerSlotCache(banks(), slots=8, device=CPU)
+
+    assert cache.partition(ids([0, 1], [2, 3], [0, 1])) == [(0, 3)]
+
+
+def test_partition_ranges_cover_every_token_exactly_once():
+    """A dropped or repeated token would silently corrupt the layer's output."""
+    cache = WorkerSlotCache(banks(), slots=3, device=CPU)
+    rows = ids([0, 1], [2, 3], [4, 5], [6, 7], [0, 7])
+
+    ranges = cache.partition(rows)
+
+    covered = [t for lo, hi in ranges for t in range(lo, hi)]
+    assert covered == list(range(rows.shape[0]))
+
+
+def test_each_partitioned_range_can_actually_be_made_resident():
+    """Splitting is only correct if every range it produces then fits in the cache."""
+    cache = WorkerSlotCache(banks(), slots=4, device=CPU)
+    rows = ids([0, 1], [2, 3], [4, 5], [6, 7])
+
+    for lo, hi in cache.partition(rows):
+        remapped = cache.ensure(rows[lo:hi])  # must not raise
+        for token, row in enumerate(remapped.tolist()):
+            for k, slot in enumerate(row):
+                expert = int(rows[lo + token][k])
+                assert torch.equal(cache.dev["gate_up"][slot], banks()["gate_up"][expert])
 
 
 def test_slots_are_capped_at_the_expert_count():

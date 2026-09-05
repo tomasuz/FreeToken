@@ -94,13 +94,17 @@ def main() -> int:
         x = io["x"].tensor[:bs].to(device, non_blocking=False)
         w = io["w"].tensor[:bs].to(device, non_blocking=False)
         # The ids stay on the host for one more moment: placement is decided here, and what
-        # the kernel receives is slot numbers, not expert ids.
-        ids = cache.ensure(io["ids"].tensor[:bs])
-
-        out = fused_experts_gguf(
-            x, cache.dev["gate_up"], cache.dev["down"], w, ids, activation, ggml_type, act_fn
-        )
-        io["y"].tensor[:bs].copy_(out)  # cross-device copy; syncs on this stream
+        # the kernel receives is slot numbers, not expert ids. A step wider than the cache
+        # becomes several launches -- one range at a time, each refilled before it runs, so
+        # the cache size is a memory choice and never a limit on batch width.
+        host_ids = io["ids"].tensor[:bs]
+        for lo, hi in cache.partition(host_ids):
+            ids = cache.ensure(host_ids[lo:hi])
+            out = fused_experts_gguf(
+                x[lo:hi], cache.dev["gate_up"], cache.dev["down"], w[lo:hi],
+                ids, activation, ggml_type, act_fn,
+            )
+            io["y"].tensor[lo:hi].copy_(out)  # cross-device copy; syncs on this stream
         torch.cuda.synchronize(device)
 
         flags[_HITS], flags[_MISSES] = cache.stats()
