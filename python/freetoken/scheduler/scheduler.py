@@ -193,6 +193,18 @@ class Scheduler(SchedulerIOMixin):
             routing = cache.decode_routing_stats()
         except Exception:
             routing = {}
+        for layer_id, executor in sorted(getattr(cache, "worker_executors", {}).items()):
+            stats = getattr(executor, "slot_stats", None)
+            if stats is None:
+                continue
+            st = stats()
+            if st["hits"] + st["misses"] == 0:
+                continue
+            logger.info_rank0(
+                f"moe worker layer {layer_id}: {st['slots']} slots, "
+                f"hit rate {st['hit_rate'] * 100:.1f}% "
+                f"({st['hits']} hits, {st['misses']} misses, cumulative)"
+            )
         if routing:
             # oracle_hit is the ceiling any policy could reach on the observed routing, so
             # it separates "the cache is badly run" from "this model is not cacheable".
