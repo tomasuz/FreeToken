@@ -233,6 +233,11 @@ class OffloadMoeCache:
         # resident_banks: {bank name: {layer_id: [num_experts, ...] device tensor}}.
         self.resident_layer_ids: frozenset = frozenset()
         self.resident_banks: dict[str, dict[int, torch.Tensor]] = {}
+        # Layers served by a worker process on another device. Like the resident ones they
+        # are excluded from every movement path -- the worker owns their weights, in shared
+        # memory of its own -- but the compute lands elsewhere rather than here.
+        self.worker_layer_ids: frozenset = frozenset()
+        self.worker_executors: dict = {}
         # marlin/b12x per-expert global scales ([L*E], GPU resident, see set_alphas).
         self.gate_up_alpha: torch.Tensor | None = None
         self.down_alpha: torch.Tensor | None = None
@@ -357,7 +362,7 @@ class OffloadMoeCache:
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
             head = per_layer[0]
             for layer_id, source in enumerate(per_layer):
-                if layer_id in self.resident_layer_ids:
+                if self._skips_movement(layer_id):
                     continue  # released host bank: shape is still right, the pages are not there
                 assert source.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
                 assert source.size(0) == self.num_experts, (name, layer_id, source.shape)
@@ -417,7 +422,7 @@ class OffloadMoeCache:
             if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
                 return  # leave fused disabled; copy_missing uses the per-bank path
             for layer_id, source in enumerate(per_layer):
-                if layer_id in self._unpinned_layers or layer_id in self.resident_layer_ids:
+                if layer_id in self._unpinned_layers or self._skips_movement(layer_id):
                     # unregistered layer: no device alias exists, and the row is never consumed
                     # (CPU decode; pageable prefill; or -- for a resident layer -- the host bank
                     # was uploaded and released, so its pages are gone and nothing may read it)
@@ -616,6 +621,31 @@ class OffloadMoeCache:
         """Whether ``layer_id``'s experts live in VRAM only (no host bank, no slot cache)."""
         return layer_id in self.resident_layer_ids
 
+    def set_worker_executors(self, executors: dict) -> None:
+        """Attach per-layer worker executors (call BEFORE set_bank_sources).
+
+        Their layers join the set the copy plan skips: the worker holds those weights in
+        its own shared memory and the host bank here has been released, so there is nothing
+        for this side to move and nothing safe to read."""
+        overlap = frozenset(executors) & self.cpu_layer_ids
+        assert not overlap, (
+            f"layers {sorted(overlap)} are assigned to both a worker and CPU decode"
+        )
+        overlap = frozenset(executors) & self.resident_layer_ids
+        assert not overlap, (
+            f"layers {sorted(overlap)} are both worker-served and VRAM-resident"
+        )
+        self.worker_executors = dict(executors)
+        self.worker_layer_ids = frozenset(executors)
+
+    def is_worker_layer(self, layer_id: int) -> bool:
+        """Whether ``layer_id``'s experts are computed by a worker on another device."""
+        return layer_id in self.worker_layer_ids
+
+    def _skips_movement(self, layer_id: int) -> bool:
+        """Layers this cache never moves bytes for: someone else owns their weights."""
+        return layer_id in self.resident_layer_ids or layer_id in self.worker_layer_ids
+
     def resident_views(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """This layer's VRAM expert banks in registration order; row == expert id."""
         return tuple(self.resident_banks[name][layer_id] for name in self.bank_schema)
@@ -722,8 +752,8 @@ class OffloadMoeCache:
             return
         if layer_id < 0:
             raise ValueError(f"Invalid prefill layer id: {layer_id}")
-        if layer_id in self.resident_layer_ids:
-            # A resident layer's banks are already on the device and its host source is a
+        if self._skips_movement(layer_id):
+            # A resident or worker-served layer's banks are elsewhere and its host source is a
             # released mmap -- prefetching it would copy dropped (zero) pages into the
             # buffer. It is also pure waste: the layer reads its VRAM banks directly.
             # Guarding here rather than at the call site also covers the look-ahead

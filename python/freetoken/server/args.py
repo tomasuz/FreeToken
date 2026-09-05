@@ -589,6 +589,32 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-worker-layers",
+        type=str,
+        default=ServerArgs.moe_worker_layers,
+        help=(
+            "Serve these expert layers from a worker process on another device: "
+            "'<device>:<spec>' (repeat with ';'), where <spec> is the --moe-cpu-layers "
+            "syntax -- an id list ('3,7,11'), a count ('8'), or a fraction ('0.25'). The "
+            "layer's weights move into shared memory the worker owns, so it spends no slot "
+            "and crosses no PCIe: only activations do. Use --moe-worker-env for a device "
+            "that needs its runtime configured differently than this process."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-worker-env",
+        type=str,
+        default=ServerArgs.moe_worker_env,
+        help=(
+            "Environment for --moe-worker-layers workers: '<device>:<K>=<V>[,<K>=<V>]' "
+            "(repeat with ';'). Applied to that worker before it starts. Settings that "
+            "select an architecture or a runtime library are process-wide, which is why a "
+            "device needing different ones can only be driven from a process of its own."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-bank-spill-dir",
         type=str,
         default=ServerArgs.moe_bank_spill_dir,

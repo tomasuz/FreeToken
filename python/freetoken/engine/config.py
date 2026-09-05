@@ -58,6 +58,17 @@ class EngineConfig:
     # (highest-miss layers first); "auto" fills VRAM after weights, KV and the slot-cache
     # floor. None/"" = no resident tier. Must not overlap moe_cpu_layers.
     moe_resident_layers: str | None = None
+    # Expert layers served by a worker process on another device, as
+    # "<device>:<spec>[;<device>:<spec>...]" where <spec> is the moe_cpu_layers syntax (id
+    # list, count, or fraction). The weights move into shared memory the worker owns and
+    # this process stops holding them, so such a layer costs no slot and no PCIe traffic;
+    # only activations cross. A device the engine's own process cannot drive is exactly
+    # what this is for -- see moe_worker_env.
+    moe_worker_layers: str | None = None
+    # Per-device environment for those workers, as "<device>:<K>=<V>[,<K>=<V>...][;...]".
+    # Some devices need a runtime configured differently than the parent's, and those
+    # settings are process-wide, so a worker is the only place they can be applied.
+    moe_worker_env: str | None = None
     # Directory for file-backed (spillable) expert banks; exported as
     # FREETOKEN_BANK_SPILL_DIR. A spilled bank costs reclaimable page cache instead of
     # anonymous RAM, so it degrades to paging speed instead of OOM when it does not fit.

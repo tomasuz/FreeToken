@@ -609,13 +609,16 @@ class Engine:
         # Resident tier: these layers' experts are uploaded to VRAM during the bank load and
         # their host banks released, so they cost no host RAM and no slot. Decided BEFORE the
         # load because that is the only point where the host peak can still be avoided.
+        worker_layers = _resolve_worker_layers(config, config.model_config.num_moe_layers)
         resident_layer_ids = _resolve_resident_layers(
             config, config.model_config.num_moe_layers
         )
+        worker_claimed = frozenset().union(*worker_layers.values()) if worker_layers else frozenset()
         if resident_layer_ids == _RESIDENT_AUTO:
             resident_layer_ids = self._resolve_auto_resident_layers(
-                config, config.model_config.num_moe_layers, cpu_layer_ids
+                config, config.model_config.num_moe_layers, cpu_layer_ids | worker_claimed
             )
+        resident_layer_ids -= worker_claimed  # an explicit worker assignment wins
         overlap_ids = resident_layer_ids & cpu_layer_ids
         if overlap_ids:
             raise ValueError(
@@ -716,6 +719,12 @@ class Engine:
             # also before set_bank_sources: resident layers' host sources are released mmaps,
             # so the copy plan must know to skip them rather than take their device alias
             cache.set_resident_banks(banks.resident, banks.resident_layers)
+            # before set_bank_sources for the same reason as the resident tier: these
+            # layers' host banks are handed to their worker and released here, so the copy
+            # plan must be told not to take their addresses
+            cache.set_worker_executors(
+                self._init_worker_executors(config, cache, banks, worker_layers)
+            )
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
@@ -768,6 +777,68 @@ class Engine:
             f"--moe-hybrid-max-fetch auto: fetching {fraction:.1%} of each decode step's "
             "expert misses over PCIe (benched PCIe/CPU bandwidth ratio), the rest on the CPU"
         )
+
+    def _init_worker_executors(self, config: EngineConfig, cache, banks, worker_layers) -> dict:
+        """Start one worker per assigned layer and hand it that layer's expert weights.
+
+        Sized for the engine's largest batch, because the worker serves prefill as well as
+        decode; the buffers are activations, not weights, so that costs megabytes.
+
+        One thing this cut does NOT do: give the host bank back. The executor stages the
+        weights into shared memory it owns, so a worker layer is held twice -- once in the
+        bank the loader filled, once in the worker's buffer. Releasing the first needs the
+        HostBank handle (ExpertBanks carries only the tensor) and, more awkwardly, the bank
+        is pinned by then, and dropping pages under a registration is not something to do
+        casually. The fix is to let the loader fill the shared buffer directly, which is a
+        change to the load path rather than to this wiring. Until then the layers are still
+        excluded from the copy plan -- nothing reads the stale copy -- they just cost their
+        own size again.
+        """
+        if not worker_layers:
+            return {}
+        from freetoken.gguf_quant import GGUF_EXPERT_FORMATS
+        from freetoken.moe.worker_executor import WorkerMoeExecutor
+
+        if cache.quant_format not in GGUF_EXPERT_FORMATS:
+            raise NotImplementedError(
+                f"--moe-worker-layers serves native GGUF experts; this checkpoint's "
+                f"expert format is {cache.quant_format!r}"
+            )
+        envs = {
+            dev: dict(
+                kv.split("=", 1) for kv in spec.split(",") if "=" in kv
+            )
+            for dev, spec in _parse_per_device(config.moe_worker_env, "--moe-worker-env").items()
+        }
+        max_batch = max(1, int(config.max_extend_tokens or 1))
+        model_config = config.model_config
+        executors: dict[int, object] = {}
+        for device, layer_ids in worker_layers.items():
+            for layer_id in sorted(layer_ids):
+                layer_banks = {
+                    name: banks.sources[name][layer_id] for name in cache.bank_schema
+                }
+                executors[layer_id] = WorkerMoeExecutor(
+                    device,
+                    layer_banks,
+                    ggml_type=GGUF_EXPERT_FORMATS[cache.quant_format],
+                    activation=getattr(model_config, "hidden_act", "silu"),
+                    max_batch=max_batch,
+                    hidden_size=model_config.hidden_size,
+                    top_k=model_config.num_experts_per_tok,
+                    env=envs.get(device, {}),
+                )
+        held = sum(
+            banks.sources[name][layer_id].numel() * banks.sources[name][layer_id].element_size()
+            for layer_id in executors
+            for name in cache.bank_schema
+        )
+        logger.info_rank0(
+            f"--moe-worker-layers: {len(executors)} layers served by workers on devices "
+            f"{sorted(worker_layers)}; {held / 2**30:.2f} GiB still held twice (host bank "
+            f"not yet released -- see _init_worker_executors)"
+        )
+        return executors
 
     def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
         """Build the persistent CPU MoE executor (decode-time expert compute).
@@ -1254,6 +1325,67 @@ def _resolve_resident_layers(config: EngineConfig, num_moe_layers: int) -> froze
     return k if isinstance(k, frozenset) else _end_layers(k, num_moe_layers)
 
 
+def _parse_per_device(spec: str | None, what: str) -> dict[int, str]:
+    """``"<device>:<value>[;<device>:<value>...]"`` -> ``{device: value}``.
+
+    Shared by the worker layer and worker environment flags so a machine's devices are
+    named the same way in both.
+    """
+    out: dict[int, str] = {}
+    for part in (spec or "").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise ValueError(f"{what}: expected '<device>:<value>', got {part!r}")
+        dev, value = part.split(":", 1)
+        try:
+            index = int(dev)
+        except ValueError:
+            raise ValueError(f"{what}: {dev!r} is not a device index") from None
+        if index in out:
+            raise ValueError(f"{what}: device {index} named twice")
+        out[index] = value.strip()
+    return out
+
+
+def _resolve_worker_layers(
+    config: EngineConfig, num_moe_layers: int
+) -> dict[int, frozenset[int]]:
+    """MoE layers to serve from a worker process, per device.
+
+    Layers are taken from the middle outward, the mirror of the resident tier's ends-first
+    placement: decode miss rates are U-shaped, so the middle is what an offload cache serves
+    most cheaply and therefore what is cheapest to hand away.
+    """
+    if not config.moe_worker_layers or not is_offload_moe_backend(config.moe_backend):
+        return {}
+    out: dict[int, frozenset[int]] = {}
+    taken: set[int] = set()
+    for device, spec in _parse_per_device(config.moe_worker_layers, "--moe-worker-layers").items():
+        k = _parse_layer_count(spec, num_moe_layers, "--moe-worker-layers")
+        if isinstance(k, frozenset):
+            ids = k
+        else:
+            free = [i for i in _middle_first(num_moe_layers) if i not in taken]
+            ids = frozenset(free[:k])
+        clash = ids & taken
+        if clash:
+            raise ValueError(
+                f"--moe-worker-layers: layers {sorted(clash)} assigned to more than one device"
+            )
+        taken |= ids
+        if ids:
+            out[device] = ids
+    return out
+
+
+def _middle_first(n: int) -> list[int]:
+    """Layer ids ordered from the middle outward."""
+    mid = (n - 1) / 2
+    return sorted(range(n), key=lambda i: (abs(i - mid), i))
+
+
 def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int]:
     """MoE layer ids whose decode runs on the CPU executor.
 
@@ -1347,6 +1479,8 @@ _DENSE_MOE_SETTINGS = {
     "moe_cache_auto": False,
     "moe_cpu_layers": None,
     "moe_resident_layers": None,
+    "moe_worker_layers": None,
+    "moe_worker_env": None,
     "moe_bank_spill_dir": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,

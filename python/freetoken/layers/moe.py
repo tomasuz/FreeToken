@@ -307,6 +307,10 @@ class OffloadMoELayer(MoELayer):
         if cache.is_resident_layer(self.layer_id):
             return self._resident_expert_gemm(cache, hidden_states, topk_weights, topk_ids,
                                               is_prefill=False)
+        if cache.is_worker_layer(self.layer_id):
+            return cache.worker_executors[self.layer_id].decode(
+                hidden_states, topk_weights, topk_ids
+            )
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
@@ -387,11 +391,18 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
-        if cache.is_resident_layer(self.layer_id):
+        if cache.is_resident_layer(self.layer_id) or cache.is_worker_layer(self.layer_id):
             if self.layer_id == 0:
                 # begin_prefill normally rides on _wait_prefill_overlap's layer-0 call; a
-                # resident layer 0 never gets there, so open the prefill here instead.
+                # layer 0 that skips the movement path never gets there, so open it here.
                 cache.begin_prefill()
+            if cache.is_worker_layer(self.layer_id):
+                # The worker takes prefill on the same call as decode -- it is one grouped
+                # GEMV over however many rows arrive, and its buffers are sized for the
+                # engine's largest batch.
+                return cache.worker_executors[self.layer_id].decode(
+                    hidden_states, topk_weights, topk_ids
+                )
             return self._resident_expert_gemm(cache, hidden_states, topk_weights, topk_ids,
                                               is_prefill=True)
         if cache.prefill_overlap:

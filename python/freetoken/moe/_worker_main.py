@@ -146,9 +146,12 @@ def _resolve_activation(name: str, backend: str):
 
 def _warm(gate_up, down, io, device, activation, ggml_type, fn, act_fn=None) -> None:
     """One throwaway launch so the JIT compile lands before the parent starts timing."""
-    x = io["x"].tensor[:1].to(device)
-    ids = io["ids"].tensor[:1].to(device)
-    w = io["w"].tensor[:1].to(device)
+    # Built here rather than sliced from the shared buffers: a warm-up wants representative
+    # shapes, not whatever those pages happen to hold, and routing ids that are merely
+    # "whatever was in memory" are not a launch worth compiling against.
+    x = torch.zeros(1, io["x"].tensor.shape[1], dtype=io["x"].tensor.dtype, device=device)
+    ids = torch.zeros(1, io["ids"].tensor.shape[1], dtype=torch.int32, device=device)
+    w = torch.ones(1, io["w"].tensor.shape[1], dtype=torch.float32, device=device)
     try:
         fn(x, gate_up, down, w, ids, activation, ggml_type, act_fn)
         torch.cuda.synchronize(device)
