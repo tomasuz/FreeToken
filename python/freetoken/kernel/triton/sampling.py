@@ -525,8 +525,26 @@ _COOPERATIVE_DISABLED = set()
 _COOP_CTAS_PER_SM = 2  # the fused kernels use ~80 regs/thread at 8 warps; 4/SM fails the cooperative launch
 
 
+def _cooperative_launch_supported() -> bool:
+    """Whether a cooperative grid here really means the grid is co-resident.
+
+    The multi-CTA path parks a row's CTAs on a spin barrier, which only terminates if every
+    one of them is resident at once. The fallback that exists for when it is not is driven
+    by catching a launch error -- and that is the part that does not travel: on HIP the
+    cooperative flag raises nothing, the grid launches as an ordinary one, and the CTAs that
+    were never scheduled are waited on forever. A hang is not an exception, so the guard
+    never fires and the sampler simply never returns.
+
+    The occupancy budget above is calibrated for NVIDIA register pressure as well, so even a
+    launch that did succeed would be sized by the wrong limit.
+    """
+    import torch
+
+    return not getattr(torch.version, "hip", None)
+
+
 def _fused_plan(B, V, device, force_single=False):
-    if force_single:
+    if force_single or not _cooperative_launch_supported():
         return 1, V
     # the cooperative launch needs the whole grid co-resident, so cap B*G by an occupancy budget instead of _plan's one CTA per SM
     g_by_sm = max(1, (_COOP_CTAS_PER_SM * _num_sm(device)) // B)
