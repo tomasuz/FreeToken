@@ -804,6 +804,14 @@ class Engine:
                 f"--moe-worker-layers serves native GGUF experts; this checkpoint's "
                 f"expert format is {cache.quant_format!r}"
             )
+        # A worker is a second process with its own accelerator runtime, and it starts at
+        # the point where this one is holding every expert bank it has not yet given away.
+        # On a host that is already tight, the runtime does not report the shortage -- it
+        # faults -- so record what was left before blaming the worker for dying.
+        logger.info_rank0(
+            f"--moe-worker-layers: host has {_mem_available_gib():.2f} GiB available and "
+            f"{_swap_free_gib():.2f} GiB of swap free before starting workers"
+        )
         envs = {
             dev: dict(
                 kv.split("=", 1) for kv in spec.split(",") if "=" in kv
@@ -1323,6 +1331,26 @@ def _resolve_resident_layers(config: EngineConfig, num_moe_layers: int) -> froze
         return _RESIDENT_AUTO
     k = _parse_layer_count(spec, num_moe_layers, "--moe-resident-layers")
     return k if isinstance(k, frozenset) else _end_layers(k, num_moe_layers)
+
+
+def _meminfo_gib(field: str) -> float:
+    """One /proc/meminfo field in GiB, or 0.0 where the file is not available."""
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith(field):
+                    return int(line.split()[1]) / 2**20
+    except OSError:
+        pass
+    return 0.0
+
+
+def _mem_available_gib() -> float:
+    return _meminfo_gib("MemAvailable:")
+
+
+def _swap_free_gib() -> float:
+    return _meminfo_gib("SwapFree:")
 
 
 def _parse_per_device(spec: str | None, what: str) -> dict[int, str]:
