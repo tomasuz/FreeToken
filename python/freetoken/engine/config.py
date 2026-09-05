@@ -69,6 +69,10 @@ class EngineConfig:
     # Some devices need a runtime configured differently than the parent's, and those
     # settings are process-wide, so a worker is the only place they can be applied.
     moe_worker_env: str | None = None
+    # Device slots a worker keeps for its layers' experts. Unset = hold the whole layer,
+    # which is a residency plan rather than a cache; smaller trades hit rate for the
+    # worker device's memory, the same bargain the main device's slot cache makes.
+    moe_worker_slots: str | None = None
     # Directory for file-backed (spillable) expert banks; exported as
     # FREETOKEN_BANK_SPILL_DIR. A spilled bank costs reclaimable page cache instead of
     # anonymous RAM, so it degrades to paging speed instead of OOM when it does not fit.

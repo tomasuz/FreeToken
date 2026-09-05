@@ -628,6 +628,21 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-worker-slots",
+        type=str,
+        default=ServerArgs.moe_worker_slots,
+        help=(
+            "How many experts a --moe-worker-layers worker keeps on its device: "
+            "'<device>:<count>' (repeat with ';'), or a bare count for every worker. The "
+            "worker fills these slots from its layer's shared host bank as routing asks "
+            "for experts and evicts least-recently-used ones, so a worker layer answers to "
+            "demand like any other. Unset holds the layer's full expert count, which never "
+            "evicts. The floor is max_batch * top_k, since a step needs every expert it "
+            "routes to resident at once."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-bank-spill-dir",
         type=str,
         default=ServerArgs.moe_bank_spill_dir,

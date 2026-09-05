@@ -128,3 +128,32 @@ def test_worker_layers_suppress_cuda_graph_capture():
     assert _determine_cuda_graph_bs(cuda_graph_bs=[], cuda_graph_max_bs=160, free_memory=1 << 34) == []
     # and what it passes without them, for contrast
     assert _determine_cuda_graph_bs(cuda_graph_bs=None, cuda_graph_max_bs=4, free_memory=1 << 34) == [1, 2, 4]
+
+
+def test_worker_slots_accepts_a_bare_count_for_every_device():
+    """Devices that are alike should not each have to be named to say the same thing."""
+    from freetoken.engine.engine import _parse_worker_slots
+
+    assert _parse_worker_slots("64", [1, 2]) == {1: 64, 2: 64}
+
+
+def test_worker_slots_accepts_per_device_counts():
+    from freetoken.engine.engine import _parse_worker_slots
+
+    assert _parse_worker_slots("1:64;2:32", [1, 2]) == {1: 64, 2: 32}
+
+
+def test_worker_slots_unset_leaves_every_device_to_its_default():
+    from freetoken.engine.engine import _parse_worker_slots
+
+    assert _parse_worker_slots(None, [1]) == {}
+    assert _parse_worker_slots("  ", [1]) == {}
+
+
+def test_worker_slots_rejects_a_non_number_instead_of_guessing():
+    from freetoken.engine.engine import _parse_worker_slots
+
+    with pytest.raises(ValueError, match="moe-worker-slots"):
+        _parse_worker_slots("plenty", [1])
+    with pytest.raises(ValueError, match="integer slot count"):
+        _parse_worker_slots("1:plenty", [1])

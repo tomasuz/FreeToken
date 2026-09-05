@@ -837,6 +837,7 @@ class Engine:
         }
         max_batch = max(1, int(config.max_extend_tokens or 1))
         model_config = config.model_config
+        slots = _parse_worker_slots(config.moe_worker_slots, sorted(worker_layers))
         executors: dict[int, object] = {}
         for device, layer_ids in worker_layers.items():
             for layer_id in sorted(layer_ids):
@@ -852,6 +853,7 @@ class Engine:
                     hidden_size=model_config.hidden_size,
                     top_k=model_config.num_experts_per_tok,
                     env=envs.get(device, {}),
+                    slots=slots.get(device),
                 )
         held = sum(
             banks.sources[name][layer_id].numel() * banks.sources[name][layer_id].element_size()
@@ -863,6 +865,19 @@ class Engine:
             f"{sorted(worker_layers)}; {held / 2**30:.2f} GiB still held twice (host bank "
             f"not yet released -- see _init_worker_executors)"
         )
+        for device, layer_ids in sorted(worker_layers.items()):
+            any_layer = sorted(layer_ids)[0]
+            ex = executors[any_layer]
+            n_slots, n_experts = ex.slots, model_config.num_experts
+            how = (
+                "holds every expert, so it never evicts"
+                if n_slots >= n_experts
+                else f"fills on demand from the host bank, evicting least-recently-used"
+            )
+            logger.info_rank0(
+                f"--moe-worker-slots: device {device} keeps {n_slots}/{n_experts} experts "
+                f"per layer on device and {how}"
+            )
         return executors
 
     def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
@@ -1368,6 +1383,36 @@ def _mem_available_gib() -> float:
 
 def _swap_free_gib() -> float:
     return _meminfo_gib("SwapFree:")
+
+
+def _parse_worker_slots(spec: str | None, devices: list[int]) -> dict[int, int]:
+    """``--moe-worker-slots`` -> ``{device: slots}``; unset or unnamed devices are absent.
+
+    Accepts the per-device form used by the other worker flags, and also a bare count,
+    which applies to every worker -- a machine whose extra devices are alike should not
+    have to name each one to say the same thing about them.
+    """
+    text = (spec or "").strip()
+    if not text:
+        return {}
+    if ":" not in text:
+        try:
+            count = int(text)
+        except ValueError:
+            raise ValueError(
+                f"--moe-worker-slots: expected a count or '<device>:<count>', got {text!r}"
+            ) from None
+        return {device: count for device in devices}
+    out: dict[int, int] = {}
+    for device, value in _parse_per_device(text, "--moe-worker-slots").items():
+        try:
+            out[device] = int(value)
+        except ValueError:
+            raise ValueError(
+                f"--moe-worker-slots: device {device} needs an integer slot count, "
+                f"got {value!r}"
+            ) from None
+    return out
 
 
 def _parse_per_device(spec: str | None, what: str) -> dict[int, str]:

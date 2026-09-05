@@ -28,10 +28,11 @@ _SPEC = json.loads(open(sys.argv[1]).read())
 import torch  # noqa: E402
 
 from freetoken.moe.shared_host import open_shared  # noqa: E402
+from freetoken.moe.worker_slots import WorkerSlotCache  # noqa: E402
 
 # Flag layout in the control buffer, one int64 each. Kept adjacent so the parent can hand
 # both addresses to a single stream memop pair.
-_READY, _DONE, _STOP = 0, 1, 2
+_READY, _DONE, _STOP, _HITS, _MISSES = 0, 1, 2, 3, 4
 
 _DTYPES = {
     "uint8": torch.uint8,
@@ -68,17 +69,19 @@ def main() -> int:
     act_fn = _resolve_activation(activation, _SPEC.get("activation_backend", "auto"))
     flags = ctl.tensor
 
-    # First cut: stage the layer's banks onto the device once, at startup. The grouped
-    # GEMV takes torch tensors, and a registered host mapping has a device address but no
-    # tensor that names it, so reading the shared pages in place needs a kernel entry that
-    # accepts a raw pointer. Until then this costs one copy of the layer on the worker's
-    # device -- which for a device whose memory *is* host memory means the bytes are
-    # resident twice. Correctness first; the zero-copy read is the obvious follow-up.
-    gate_up = banks["gate_up"].tensor.to(device)
-    down = banks["down"].tensor.to(device)
+    # Experts reach this device through a slot cache filled from the shared host bank, the
+    # same arrangement the engine's own device uses -- so a worker layer is subject to the
+    # same economics as every other layer instead of being a static assignment decided at
+    # startup. With slots equal to the expert count the cache never evicts and this is
+    # simply a residency plan, filled lazily rather than in one copy at startup.
+    cache = WorkerSlotCache(
+        {name: buf.tensor for name, buf in banks.items()},
+        slots=int(_SPEC.get("slots") or banks["gate_up"].tensor.shape[0]),
+        device=device,
+    )
     # Announce readiness only once the kernels are actually loaded: the first launch JIT
     # compiles, and a parent that started timing before that would blame the first token.
-    _warm(gate_up, down, io, device, activation, ggml_type, fused_experts_gguf, act_fn)
+    _warm(cache, io, device, activation, ggml_type, fused_experts_gguf, act_fn)
     flags[_DONE] = -1  # "worker is up"; the parent waits for this before its first submit
 
     while True:
@@ -89,13 +92,18 @@ def main() -> int:
             continue
         bs = int(flags[_READY])  # the batch size doubles as the doorbell; 0 means idle
         x = io["x"].tensor[:bs].to(device, non_blocking=False)
-        ids = io["ids"].tensor[:bs].to(device, non_blocking=False)
         w = io["w"].tensor[:bs].to(device, non_blocking=False)
+        # The ids stay on the host for one more moment: placement is decided here, and what
+        # the kernel receives is slot numbers, not expert ids.
+        ids = cache.ensure(io["ids"].tensor[:bs])
 
-        out = fused_experts_gguf(x, gate_up, down, w, ids, activation, ggml_type, act_fn)
+        out = fused_experts_gguf(
+            x, cache.dev["gate_up"], cache.dev["down"], w, ids, activation, ggml_type, act_fn
+        )
         io["y"].tensor[:bs].copy_(out)  # cross-device copy; syncs on this stream
         torch.cuda.synchronize(device)
 
+        flags[_HITS], flags[_MISSES] = cache.stats()
         flags[_READY] = 0
         flags[_DONE] = bs
 
@@ -144,16 +152,18 @@ def _resolve_activation(name: str, backend: str):
     return None
 
 
-def _warm(gate_up, down, io, device, activation, ggml_type, fn, act_fn=None) -> None:
+def _warm(cache, io, device, activation, ggml_type, fn, act_fn=None) -> None:
     """One throwaway launch so the JIT compile lands before the parent starts timing."""
     # Built here rather than sliced from the shared buffers: a warm-up wants representative
     # shapes, not whatever those pages happen to hold, and routing ids that are merely
     # "whatever was in memory" are not a launch worth compiling against.
     x = torch.zeros(1, io["x"].tensor.shape[1], dtype=io["x"].tensor.dtype, device=device)
-    ids = torch.zeros(1, io["ids"].tensor.shape[1], dtype=torch.int32, device=device)
     w = torch.ones(1, io["w"].tensor.shape[1], dtype=torch.float32, device=device)
+    # Route the warm-up through the cache too, so the fill path is exercised before the
+    # first real step and its own failures surface here rather than mid-request.
+    ids = cache.ensure(torch.zeros(1, io["ids"].tensor.shape[1], dtype=torch.int32))
     try:
-        fn(x, gate_up, down, w, ids, activation, ggml_type, act_fn)
+        fn(x, cache.dev["gate_up"], cache.dev["down"], w, ids, activation, ggml_type, act_fn)
         torch.cuda.synchronize(device)
     except Exception as exc:  # a warm-up failure is the parent's problem, not a crash here
         print(f"worker warmup failed: {exc}", file=sys.stderr, flush=True)

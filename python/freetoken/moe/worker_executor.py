@@ -39,8 +39,8 @@ from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
 
-_READY, _DONE, _STOP = 0, 1, 2
-_CTL_SLOTS = 3
+_READY, _DONE, _STOP, _HITS, _MISSES = 0, 1, 2, 3, 4
+_CTL_SLOTS = 5
 
 # A cold worker pays process start, torch import, and a JIT compile of the expert kernel
 # for its architecture. The compile is the long pole and happens once per machine.
@@ -86,6 +86,7 @@ class WorkerMoeExecutor:
         top_k: int | None = None,
         env: dict[str, str] | None = None,
         activation_backend: str = "auto",
+        slots: int | None = None,
     ) -> None:
         self.device_index = device_index
         self._proc: subprocess.Popen | None = None
@@ -119,6 +120,12 @@ class WorkerMoeExecutor:
             "w": share("w", None, (max_batch, k), torch.float32),
             "y": share("y", None, (max_batch, h), torch.bfloat16),
         }
+        num_experts = gate_up.shape[0]
+        # A step must hold every expert it routes to at once, so the floor is one step's
+        # worst-case demand; below that the worker would have to evict a row the same
+        # launch still needs. Unset means hold the whole layer, which is what this did
+        # before there was a cache at all.
+        self.slots = min(num_experts, max(max_batch * k, int(slots or num_experts)))
         # Not registered while the handoff is a plain copy: the pages are shared with a
         # process driving a different device, and registering them here would be an
         # optimisation whose only beneficiary is a stream-async copy this cut does not do.
@@ -128,6 +135,7 @@ class WorkerMoeExecutor:
             "control": self._entry(self._ctl),
             "banks": {n: self._entry(b) for n, b in bank_bufs.items()},
             "io": {n: self._entry(b) for n, b in self._io.items()},
+            "slots": self.slots,
             "ggml_type": int(ggml_type),
             "activation": activation,
             # "auto" lets the worker fall back to torch where the compiled activation has
@@ -274,6 +282,23 @@ class WorkerMoeExecutor:
         flags[_READY] = bs  # doorbell
         self._await_flag(_DONE, bs, _STEP_TIMEOUT_S, "decode")
         return self._io["y"].tensor[:bs].to(hidden_states.device)
+
+    def slot_stats(self) -> dict:
+        """Hits and misses the worker's slot cache has seen, for the parent to report.
+
+        Read from the control buffer rather than asked for over the doorbell: the worker
+        writes them at the end of every step, so this costs a shared-memory read and never
+        interrupts the worker to answer.
+        """
+        flags = self._ctl.tensor
+        hits, misses = int(flags[_HITS]), int(flags[_MISSES])
+        looks = hits + misses
+        return {
+            "slots": self.slots,
+            "hits": hits,
+            "misses": misses,
+            "hit_rate": (hits / looks) if looks else 0.0,
+        }
 
     def close(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
