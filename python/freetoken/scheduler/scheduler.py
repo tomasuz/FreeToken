@@ -144,7 +144,69 @@ class Scheduler(SchedulerIOMixin):
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
+        self._log_moe_layer_stats()
         self.cache_manager.check_integrity()
+
+    def _log_moe_layer_stats(self) -> None:
+        """Dump the per-layer decode miss profile under --moe-collect-stats, then reset.
+
+        Which layers deserve to be resident, and which are cheap to leave in the slot
+        cache, rests on a claim about the shape of this curve -- that miss rates are
+        U-shaped, so the ends cost the most. That claim is currently baked into the layer
+        placement without ever being checked against the model in front of it. Idle is the
+        natural point to read the counters: no decode step is in flight, so the device-side
+        accumulation is complete, and resetting here scopes each miss dump to one burst of
+        traffic instead of blending every request since start-up. The routing histogram is
+        deliberately NOT reset -- it estimates a stationary distribution, which more samples
+        only sharpen -- so those figures are cumulative and the log says so.
+        """
+        cache = getattr(self.engine, "moe_offload_cache", None)
+        if cache is None or not getattr(cache, "collect_stats", False):
+            return
+        try:
+            overall = cache.decode_miss_stats()
+            per_layer = cache.decode_miss_stats_per_layer()
+        except Exception as exc:  # diagnostics must never take the scheduler down
+            logger.info_rank0(f"moe layer stats unavailable: {exc}")
+            return
+        if not overall.get("layer_calls"):
+            return  # nothing decoded since the last dump
+        logger.info_rank0(
+            f"moe decode profile: {overall['active_per_layer']:.1f} active, "
+            f"{overall['missing_per_layer']:.1f} missing experts per layer-step, "
+            f"miss rate {overall['miss_rate'] * 100:.1f}%"
+        )
+        rows = [r for r in per_layer.get("per_layer", []) if r.get("steps")]
+        for row in rows:
+            logger.info_rank0(
+                f"moe layer {row['layer']:>3}: steps={row['steps']:>6} "
+                f"active/step={row['active_per_step']:>5.2f} "
+                f"missing/step={row['missing_per_step']:>5.2f} "
+                f"miss_rate={row['miss_rate'] * 100:>5.1f}%"
+            )
+        if not rows:
+            logger.info_rank0(
+                "moe layer stats: every layer is resident or CPU-served, so no layer "
+                "goes through the slot cache and there is no miss profile to report"
+            )
+        try:
+            routing = cache.decode_routing_stats()
+        except Exception:
+            routing = {}
+        if routing:
+            # oracle_hit is the ceiling any policy could reach on the observed routing, so
+            # it separates "the cache is badly run" from "this model is not cacheable".
+            logger.info_rank0(
+                f"moe routing skew (cumulative since start): "
+                f"{routing['slots_per_layer']:.1f} slots/layer, "
+                f"working set {routing['working_set_mean']:.1f} experts "
+                f"(max {routing['working_set_max']}), "
+                f"{routing['experts_for_90pct']:.1f} experts cover 90% of picks, "
+                f"normalised entropy {routing['norm_entropy']:.3f}, "
+                f"best possible hit rate at this cache size "
+                f"{routing['oracle_hit_at_slots'] * 100:.1f}%"
+            )
+        cache.reset_stats()
 
     @torch.inference_mode()
     def rebuild_cache(

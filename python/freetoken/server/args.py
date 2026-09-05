@@ -541,6 +541,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Accumulate per-layer decode hit/miss counters and log them each time the "
+            "scheduler goes idle. The counters are what the resident-layer and cache "
+            "policies assume about a model; this is how to check the assumption against "
+            "the model actually being served. Device-side accumulation, no per-step host "
+            "sync, but it is diagnostic -- leave it off for benchmarking."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],
