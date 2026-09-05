@@ -414,12 +414,26 @@ class Engine:
         if self.linear_state_pool is not None:
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+        # A worker layer's forward is a host-side handshake with another process: copy the
+        # activations into shared memory, wake the worker, wait for it to answer. The wait
+        # is ordinary Python, so a capture would record the copies around a worker that
+        # never ran on replay and hand back whatever the buffer happened to hold -- wrong
+        # numbers, silently. The CPU executor solves the same problem with a host-function
+        # node in the graph; until the worker path grows one, a worker means eager decode.
+        graph_bs = config.cuda_graph_bs
+        if getattr(self.moe_offload_cache, "worker_executors", None):
+            if graph_bs != []:
+                logger.info_rank0(
+                    "--moe-worker-layers: not capturing CUDA graphs -- a worker layer's "
+                    "forward waits on another process, which a graph cannot replay"
+                )
+            graph_bs = []
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
+            cuda_graph_bs=graph_bs,
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,

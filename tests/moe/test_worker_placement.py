@@ -113,3 +113,18 @@ def test_a_layer_cannot_be_owned_twice():
     cache2.set_resident_banks(resident, frozenset({2}))
     with pytest.raises(AssertionError, match="worker-served and VRAM-resident"):
         cache2.set_worker_executors({2: object()})
+
+
+def test_worker_layers_suppress_cuda_graph_capture():
+    """A captured graph would replay a worker layer's copies without the worker.
+
+    The handoff waits on another process from Python, which no capture can record, so the
+    replay would read a stale buffer and return wrong numbers with nothing to show for it.
+    Guard the decision itself: workers present means an empty capture set.
+    """
+    from freetoken.engine.graph import _determine_cuda_graph_bs
+
+    # what the engine passes once it has seen worker executors
+    assert _determine_cuda_graph_bs(cuda_graph_bs=[], cuda_graph_max_bs=160, free_memory=1 << 34) == []
+    # and what it passes without them, for contrast
+    assert _determine_cuda_graph_bs(cuda_graph_bs=None, cuda_graph_max_bs=4, free_memory=1 << 34) == [1, 2, 4]
