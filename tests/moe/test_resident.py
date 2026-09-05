@@ -361,3 +361,63 @@ def test_resident_layer_matches_offload_path_bitwise():
         views=cache.bank_views(E), n=E, alphas=cache.alphas_for_layer(1), is_prefill=True,
     )
     torch.testing.assert_close(resident_out, offload_out, rtol=0, atol=0)
+
+
+# ---------------------------------------------------------------------------
+# staged upload
+# ---------------------------------------------------------------------------
+
+
+def test_staged_copy_is_byte_exact_across_chunk_boundaries():
+    """A bounce buffer smaller than the source must still reproduce it exactly."""
+    from freetoken.moe.expert_banks import _staged_copy
+
+    src = torch.randint(0, 256, (7, 331), dtype=torch.uint8)
+    dst = torch.zeros_like(src)
+    stage = torch.empty(64, dtype=torch.uint8)  # deliberately not a divisor of 7*331
+
+    _staged_copy(dst, src, stage)
+
+    assert torch.equal(dst, src)
+
+
+def test_staged_copy_handles_dtypes_wider_than_a_byte():
+    """Banks are not all uint8, so the chunker works on the byte view, not the elements."""
+    from freetoken.moe.expert_banks import _staged_copy
+
+    src = torch.randn(129, dtype=torch.float32)
+    dst = torch.zeros_like(src)
+    stage = torch.empty(100, dtype=torch.uint8)  # spans partial elements at every boundary
+
+    _staged_copy(dst, src, stage)
+
+    assert torch.equal(dst, src)
+
+
+def test_staged_copy_reuses_one_bounce_buffer():
+    """The staging cost must be one buffer, not one per bank -- that is the whole point."""
+    from freetoken.moe.expert_banks import _staged_copy
+
+    src = torch.randint(0, 256, (4096,), dtype=torch.uint8)
+    dst = torch.zeros_like(src)
+    stage = torch.empty(512, dtype=torch.uint8)
+    before = stage.data_ptr()
+
+    _staged_copy(dst, src, stage)
+
+    assert stage.data_ptr() == before
+    assert torch.equal(dst, src)
+
+
+def test_stage_bytes_env_overrides_and_disables(monkeypatch):
+    """Operators need both a size knob and an off switch for the bounce buffer."""
+    from freetoken.moe.expert_banks import _STAGE_BYTES_DEFAULT, _STAGE_BYTES_ENV, _stage_bytes
+
+    monkeypatch.delenv(_STAGE_BYTES_ENV, raising=False)
+    assert _stage_bytes() == _STAGE_BYTES_DEFAULT
+
+    monkeypatch.setenv(_STAGE_BYTES_ENV, "8")
+    assert _stage_bytes() == 8 << 20
+
+    monkeypatch.setenv(_STAGE_BYTES_ENV, "0")
+    assert _stage_bytes() == 0  # disabled: fall back to a direct copy

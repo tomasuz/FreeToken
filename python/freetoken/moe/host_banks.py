@@ -189,7 +189,13 @@ class HostBank:
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False
         else:
-            self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
+            # PRIVATE, not the module default. mmap(-1, n) maps MAP_SHARED, which is
+            # tmpfs-backed: the pages count as Shmem and MADV_DONTNEED does not return
+            # them, so release() silently frees nothing and a bank handed away stays
+            # resident for the life of the process. A private mapping releases properly.
+            self._buf = mmap.mmap(  # lazy: address space only, no resident pages yet
+                -1, asize, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
+            )
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False
@@ -235,7 +241,14 @@ class HostBank:
 
         A file-backed bank additionally punches a hole in its spill file, so the bytes are
         returned to the filesystem too -- ``MADV_DONTNEED`` alone would only drop the RAM
-        copy and leave the (now useless) file blocks allocated."""
+        copy and leave the (now useless) file blocks allocated.
+
+        One caveat worth knowing before calling this: the advice is silently ignored for
+        pages the GPU driver has registered, and a direct host-to-device copy registers its
+        source range and keeps it registered. A bank that has been the source of one is
+        therefore unreleasable, with no error to say so -- transfer through a bounce buffer
+        instead (``freetoken.moe.expert_banks._staged_copy``) if it must be released after.
+        """
         if self._pinned:
             return
         self._buf.madvise(mmap.MADV_DONTNEED)

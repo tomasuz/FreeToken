@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 
+import pytest
 import torch
 
 from freetoken.moe.host_banks import HostBank, bank_backing_default
@@ -121,3 +122,56 @@ def test_no_spill_dir_means_no_spill_files():
 
     banks = alloc_layer_banks(_specs(), 3)
     assert all(b._spill is None for b in banks["gate_up"])
+
+
+# ---------------------------------------------------------------------------
+# release() has to actually return the memory
+# ---------------------------------------------------------------------------
+
+
+def _meminfo(field: str) -> float:
+    with open("/proc/meminfo") as fh:
+        for line in fh:
+            if line.startswith(field):
+                return int(line.split()[1]) / 1024  # MiB
+    return 0.0
+
+
+@pytest.mark.skipif(not os.path.exists("/proc/meminfo"), reason="needs /proc/meminfo")
+def test_release_actually_returns_the_pages():
+    """The failure this guards was silent: release() ran, logged, and freed nothing.
+
+    mmap(-1, n) maps MAP_SHARED, which is tmpfs-backed -- those pages count as Shmem and
+    MADV_DONTNEED does not reclaim them. A bank "handed away" then stays resident for the
+    life of the process, which on a tight host is the difference between a second process
+    starting and being killed by the allocator.
+    """
+    size_mib = 512
+    before = _meminfo("MemAvailable:")
+    bank = HostBank((size_mib, 1024, 1024), torch.uint8)
+    bank.tensor[:, ::4096, 0] = 1  # touch a page in every 4 MiB to fault them in
+    bank.tensor.fill_(7)
+    filled = _meminfo("MemAvailable:")
+    assert before - filled > size_mib * 0.5, (
+        f"filling {size_mib} MiB should show up in MemAvailable "
+        f"(saw {before - filled:.0f} MiB)"
+    )
+
+    bank.release()
+    after = _meminfo("MemAvailable:")
+    recovered = after - filled
+    assert recovered > size_mib * 0.5, (
+        f"release() returned only {recovered:.0f} MiB of {size_mib} MiB -- the mapping is "
+        f"probably shared, where MADV_DONTNEED does not reclaim"
+    )
+
+
+@pytest.mark.skipif(not os.path.exists("/proc/meminfo"), reason="needs /proc/meminfo")
+def test_anonymous_banks_do_not_land_in_shmem():
+    """Shmem accounting is the tell: a shared mapping shows there, a private one does not."""
+    before = _meminfo("Shmem:")
+    bank = HostBank((256, 1024, 1024), torch.uint8)
+    bank.tensor.fill_(3)
+    grew = _meminfo("Shmem:") - before
+    bank.release()
+    assert grew < 64, f"anonymous bank added {grew:.0f} MiB of Shmem; it should add none"

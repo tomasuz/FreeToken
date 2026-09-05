@@ -65,6 +65,43 @@ class ExpertBanks:
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
 
 
+# Bytes of pinned bounce buffer the resident uploader copies through. See
+# :func:`_staged_copy` for why the copy may not read a host bank directly.
+_STAGE_BYTES_ENV = "FREETOKEN_RESIDENT_STAGE_MIB"
+_STAGE_BYTES_DEFAULT = 32 << 20
+
+
+def _stage_bytes() -> int:
+    """Size of the resident uploader's bounce buffer; 0 disables staging."""
+    raw = os.environ.get(_STAGE_BYTES_ENV, "").strip()
+    if not raw:
+        return _STAGE_BYTES_DEFAULT
+    return max(0, int(float(raw) * (1 << 20)))
+
+
+def _staged_copy(dst: torch.Tensor, src: torch.Tensor, stage: torch.Tensor) -> None:
+    """Copy ``src`` into ``dst`` in ``stage``-sized chunks, never reading ``src`` by DMA.
+
+    A direct H2D copy out of pageable memory makes the driver register the source range for
+    the transfer, and a registered range stops honoring ``MADV_DONTNEED``: measured here,
+    every bank uploaded that way stayed 100% resident for the life of the process, so the
+    resident tier freed nothing and the host paid for weights that were already in VRAM.
+    Copying host->host into a pinned buffer first, and transferring only from that buffer,
+    leaves the bank ordinary pageable memory that ``HostBank.release()`` can actually drop.
+
+    Both tensors are flattened to bytes, so this is dtype- and shape-agnostic; the pinned
+    chunk is reused, so the extra host cost is one ``stage``, not one bank.
+    """
+    flat_src = src.reshape(-1).view(torch.uint8)
+    flat_dst = dst.reshape(-1).view(torch.uint8)
+    step = stage.numel()
+    for off in range(0, flat_src.numel(), step):
+        chunk = flat_src[off:off + step]
+        window = stage[:chunk.numel()]
+        window.copy_(chunk)  # host -> host: the bank is read by the CPU, not the driver
+        flat_dst[off:off + chunk.numel()].copy_(window, non_blocking=False)
+
+
 class ResidentUploader:
     """Moves a claimed layer's expert banks into VRAM as they finish loading.
 
@@ -74,10 +111,12 @@ class ResidentUploader:
     still take the full host-RAM peak this exists to avoid. The banks are lazy mmaps, so
     only the layers in flight are ever resident on the host.
 
-    The copy source is unregistered host memory, so ``Tensor.to`` is a synchronous
-    (staging-buffer) H2D: it has fully landed before ``upload`` returns, which is what makes
-    the caller's immediate ``release()`` safe. Runs on the ``PinPipeline`` worker, hence the
-    explicit ``set_device`` -- CUDA's current device is thread-local.
+    The copy goes through a pinned bounce buffer rather than straight off the bank, because
+    a direct transfer would pin the bank behind the uploader's back and defeat the release
+    that gives the tier its whole point -- see :func:`_staged_copy`. Each chunk transfer is
+    synchronous, so the layer has fully landed before ``upload`` returns, which is what
+    makes the caller's immediate ``release()`` safe. Runs on the ``PinPipeline`` worker,
+    hence the explicit ``set_device`` -- CUDA's current device is thread-local.
     """
 
     def __init__(self, layers: frozenset, device: torch.device) -> None:
@@ -86,17 +125,33 @@ class ResidentUploader:
         self._lock = threading.Lock()
         self.banks: dict[str, dict[int, torch.Tensor]] = {}
         self.bytes_uploaded = 0
+        self._stage: torch.Tensor | None = None
 
     def claims(self, layer_id: int) -> bool:
         return layer_id in self.layers
 
+    def _bounce(self) -> torch.Tensor | None:
+        """The pinned bounce buffer, allocated on first use (on the pipeline's thread)."""
+        if self._stage is None:
+            nbytes = _stage_bytes() if self._device.type == "cuda" else 0
+            if nbytes == 0:
+                return None
+            self._stage = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+        return self._stage
+
+    def _to_device(self, src: torch.Tensor) -> torch.Tensor:
+        dst = torch.empty_like(src, device=self._device)
+        stage = self._bounce()
+        if stage is None:
+            dst.copy_(src, non_blocking=False)  # staging disabled: the bank stays pinned
+        else:
+            _staged_copy(dst, src, stage)
+        return dst
+
     def upload(self, layer_id: int, banks) -> None:
         if self._device.type == "cuda":
             torch.cuda.set_device(self._device)
-        staged = {
-            name: bank.tensor.to(self._device, non_blocking=False)
-            for name, bank in banks.items()
-        }
+        staged = {name: self._to_device(bank.tensor) for name, bank in banks.items()}
         if self._device.type == "cuda":
             torch.cuda.synchronize(self._device)  # belt and braces before the release()
         nbytes = sum(t.numel() * t.element_size() for t in staged.values())
