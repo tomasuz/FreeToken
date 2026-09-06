@@ -365,6 +365,15 @@ class WorkerMoeExecutor:
         self.stream_handshake = False
         if not torch.cuda.is_available():
             return
+        if os.getenv("FREETOKEN_WORKER_STREAM_HANDSHAKE", "0") != "1":
+            # Off by default, and deliberately. The handshake below is the thing that makes
+            # a captured decode possible, and it does capture -- but the worker's own
+            # contribution is not yet right under replay, so capture is disabled anyway and
+            # this path buys nothing while it lasts. It also carries a fault of its own:
+            # exercised here, the address-issued copies produce an illegal access that
+            # surfaces asynchronously a step later. Both are the same piece of unfinished
+            # work; whoever picks it up can turn this on and see them.
+            return
         try:
             from freetoken.kernel import _cpu_moe
         except Exception as exc:  # the extension is optional; the polled path still works
