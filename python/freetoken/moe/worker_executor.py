@@ -191,12 +191,21 @@ class WorkerMoeExecutor:
         }
         self._slots: dict[tuple[int, int], int] = {}
         self._next_slot = 0
-        # Whether this device can compute an expert where it already lies, instead of
-        # having a copy of it made in the device's own memory. Decided by measurement in
-        # the child, which is the only process that can ask its own device; the parent
-        # only carries the answer. Default is to try, since an expert not copied is an
-        # expert not paid for twice.
-        self.reads_in_place = os.getenv("FREETOKEN_WORKER_READ_IN_PLACE", "1") == "1"
+        # Whether this device computes experts where they already lie, instead of having a
+        # copy made in its own memory. Worth having: measured on this machine, an
+        # integrated device reads the host bank at 38.0 GB/s against 45.2 GB/s from its own
+        # carve-out -- 16% for a copy avoided entirely and no second residency -- and the
+        # results are bit-identical.
+        #
+        # Off by default all the same, because registering the shared bank fails inside the
+        # worker with "invalid argument" and I could not reproduce it: file-backed shared
+        # mappings, double registration, registration from a second process, the integrated
+        # device, and the real bank size all register cleanly in isolation. The one
+        # difference left untested is that the engine registers these same pages for ITS
+        # device and the worker registers them for another. Worse, the failed call appears
+        # to leave the context unusable -- the fallback then dies allocating an ordinary
+        # tensor -- so this cannot be left on to fail gracefully.
+        self.reads_in_place = os.getenv("FREETOKEN_WORKER_READ_IN_PLACE", "0") == "1"
         num_experts = banks.num_experts
         self.layers = sorted(banks.layers)
         # One token's experts are read by a single launch, so top_k is the floor. A wider
