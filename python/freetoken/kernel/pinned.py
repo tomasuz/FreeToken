@@ -46,8 +46,19 @@ def alloc_pinned_tensor(*shape: int, dtype: torch.dtype) -> torch.Tensor:
 
 
 def host_register(addr: int, nbytes: int) -> None:
-    """cudaHostRegister ``nbytes`` at ``addr`` as portable+mapped (pin-after-fill)."""
-    _load_pinned_extension().host_register(addr, nbytes)
+    """cudaHostRegister ``nbytes`` at ``addr`` as portable+mapped (pin-after-fill).
+
+    A rejection here says only "invalid argument", which fits several very different
+    causes, so the numbers that would separate them travel with it: the runtime wants a
+    page-aligned address, and the caller usually believes it has one.
+    """
+    try:
+        _load_pinned_extension().host_register(addr, nbytes)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"{exc} (addr=0x{addr:x}, page offset {addr % 4096}, "
+            f"{nbytes} bytes, {nbytes % 4096} over a page)"
+        ) from None
 
 
 @lru_cache(maxsize=1)

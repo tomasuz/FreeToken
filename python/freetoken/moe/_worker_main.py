@@ -66,6 +66,7 @@ class _BankLibrary:
         self._spec = spec
         self._slots = slots
         self._in_place = in_place
+        self._in_place_warned = False
         self._maps: dict[int, dict] = {}
         self._caches: dict[int, WorkerSlotCache] = {}
         any_name = next(iter(spec))
@@ -82,11 +83,22 @@ class _BankLibrary:
                 path, tuple(entry["shape"]), _DTYPES[entry["dtype"]]
             ).tensor
         self._maps[layer_id] = tensors
+        cache = None
         if self._in_place:
             # Nothing is copied and nothing is evicted: the device reads the engine's own
             # bank where it lies. Costs no device memory, so every layer can have one.
-            cache = WorkerInPlaceBanks(tensors, device=device)
-        else:
+            try:
+                cache = WorkerInPlaceBanks(tensors, device=device)
+            except Exception as exc:
+                # Reading in place is an optimisation, not a requirement. A runtime that
+                # will not map these pages for this device is a reason to copy them, not a
+                # reason for the engine to stop -- say so once and take the other path.
+                if self._in_place_warned is False:
+                    print(f"worker: cannot read banks in place ({exc}); copying instead",
+                          file=sys.stderr, flush=True)
+                    self._in_place_warned = True
+                self._in_place = False
+        if cache is None:
             cache = WorkerSlotCache(
                 tensors, slots=self._slots or tensors[next(iter(tensors))].shape[0],
                 device=device,
