@@ -85,21 +85,43 @@ def _cache(num_layers=4, num_experts=8):
     )
 
 
-def test_worker_layers_are_excluded_from_movement():
-    """A layer someone else owns must not be read or copied by this cache."""
+def test_a_worker_layer_is_shared_with_this_device_not_surrendered_to_the_worker():
+    """This device fetches its share of a worker layer, so the bank must stay readable.
+
+    The worker used to own its layer outright and the copy plan skipped it. Now the layer's
+    misses are divided between the worker and this device, and this device can only take
+    its share if the host bank is still in the plan -- it was never released, only excluded.
+    """
     cache = _cache()
     cache.set_worker_executors({1: object(), 2: object()})
+
     assert cache.is_worker_layer(1) and cache.is_worker_layer(2)
     assert not cache.is_worker_layer(0)
-    assert cache._skips_movement(1) and not cache._skips_movement(0)
+    assert not cache._skips_movement(1), "a worker layer's bank is still there to read"
 
+
+def test_a_worker_layer_is_still_kept_out_of_the_prefill_stream():
+    """Prefill is answered by the worker in one call, so streaming it fills a buffer
+    nobody releases -- which the overlap machinery asserts on."""
+    cache = _cache()
+    cache.set_worker_executors({1: object()})
+
+    assert cache._skips_prefill_stream(1)
+    assert not cache._skips_prefill_stream(0)
+
+
+def test_a_worker_layers_bank_is_validated_like_any_other():
+    """It is read now, so a malformed one has to be caught rather than waved through."""
+    cache = _cache()
+    cache.set_worker_executors({1: object()})
     sources = {
         n: [torch.zeros(8, 32, dtype=torch.uint8) for _ in range(4)]
         for n in ("gate_up", "down")
     }
-    # a worker layer's source may be anything by now; validation must not touch it
-    sources["gate_up"][1] = torch.zeros(8, 64, dtype=torch.uint8)[:, ::2]
-    cache.set_bank_sources(sources)  # must not raise
+    sources["gate_up"][1] = torch.zeros(8, 64, dtype=torch.uint8)[:, ::2]  # not contiguous
+
+    with pytest.raises(AssertionError):
+        cache.set_bank_sources(sources)
 
 
 def test_a_layer_cannot_be_owned_twice():

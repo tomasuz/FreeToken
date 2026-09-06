@@ -1,4 +1,4 @@
-import os
+import time
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -20,12 +20,6 @@ if TYPE_CHECKING:
 # ``_run_experts`` (dense) with a precomputed routing instead of going through the
 # generic softmax+top-k path.
 TopK = Tuple[torch.Tensor, torch.Tensor]
-
-# Hybrid decode overlaps the CPU overflow GEMV behind the GPU PCIe fetch + GEMM by
-# default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
-# GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
-_HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
-
 
 class MoELayer(BaseOP):
     def __init__(
@@ -195,6 +189,62 @@ class MoELayer(BaseOP):
         return self._maybe_all_reduce(final_hidden_states)
 
 
+def _submit(executor, layer_id: int, hidden_states, topk_weights, ids):
+    """Start work on an executor without waiting, whatever kind of executor it is.
+
+    The CPU pool takes a layer id (one pool serves every layer); a worker process is bound
+    to one layer already and does not. Papering over that here keeps the split loop free of
+    a branch per executor kind, which is what lets a new kind be added without touching it.
+    """
+    try:
+        return executor.decode_submit(layer_id, hidden_states, topk_weights, ids)
+    except TypeError:
+        return executor.decode_submit(hidden_states, topk_weights, ids)
+
+
+def _sync(executor, handle):
+    return executor.decode_sync(handle)
+
+
+def _assign_overflow(overflow, shares: list[tuple[str, float]]) -> dict:
+    """Divide the routes this device did not take among the other executors.
+
+    Shares are fractions of the *whole* step, so they are renormalised over the helpers
+    before being applied to what actually overflowed -- the kernel's fetch cap is only
+    approximately the share it was given, and the leftover has to be divided by the
+    proportions the executors earned among themselves.
+
+    Routes are handed out in flat order, which is arbitrary but fixed: the same overflow
+    always splits the same way, so a difference between two runs means something changed.
+    Any remainder goes to the first executor rather than being dropped, because a route
+    nobody computes is a silently wrong answer.
+    """
+    import torch as _torch
+
+    positions = overflow.reshape(-1).nonzero(as_tuple=True)[0]
+    total = int(positions.numel())
+    assignment = {
+        name: _torch.zeros_like(overflow, dtype=_torch.bool) for name, _ in shares
+    }
+    if total == 0 or not shares:
+        return assignment
+
+    weights = [max(0.0, w) for _, w in shares]
+    if sum(weights) <= 0.0:  # nothing measured yet: an equal split is the honest guess
+        weights = [1.0] * len(shares)
+    scale = total / sum(weights)
+    counts = [int(w * scale) for w in weights]
+    counts[0] += total - sum(counts)  # the remainder must land somewhere
+
+    flat = {name: assignment[name].reshape(-1) for name, _ in shares}
+    offset = 0
+    for (name, _), count in zip(shares, counts):
+        if count > 0:
+            flat[name][positions[offset:offset + count]] = True
+            offset += count
+    return assignment
+
+
 class OffloadMoELayer(MoELayer):
     def __init__(
         self,
@@ -307,16 +357,15 @@ class OffloadMoELayer(MoELayer):
         if cache.is_resident_layer(self.layer_id):
             return self._resident_expert_gemm(cache, hidden_states, topk_weights, topk_ids,
                                               is_prefill=False)
-        if cache.is_worker_layer(self.layer_id):
-            return cache.worker_executors[self.layer_id].decode(
-                hidden_states, topk_weights, topk_ids
-            )
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
-        if cache.decode_target == "hybrid":
-            return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        helpers = cache.split_helpers(self.layer_id)
+        if helpers:
+            return self._decode_split(
+                cache, helpers, hidden_states, topk_weights, topk_ids
+            )
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
         return self._expert_gemm(
@@ -330,43 +379,64 @@ class OffloadMoELayer(MoELayer):
             is_prefill=False,
         )
 
-    def _decode_hybrid(
+    def _decode_split(
         self,
         cache: OffloadMoeCache,
+        helpers: dict,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Hybrid decode: GPU computes cache hits + <=K freshly-fetched experts, the CPU
-        computes the overflow misses, overlapped, then the partials merge.
+        """Decode this layer with its misses divided among every executor that can take them.
 
-        The CPU pool is kicked off (``decode_submit``) before the GPU PCIe fetch + GEMM so
-        the CPU overflow GEMV runs concurrently with the GPU work. Capture-safe: the
-        routing split is device-side elementwise and the CPU submit/sync are host nodes.
-        Each route is computed exactly once -- the GPU weights are zeroed for CPU-assigned
-        routes and the CPU ids are -1 for GPU-assigned routes (the C++ kernel skips id<0).
+        This device always participates: it computes the experts it already holds, which
+        cost nothing to reach, plus the share of the misses it is told to fetch. Everything
+        it does not fetch goes to the other executors -- the CPU, a worker on another
+        accelerator, or both -- in proportion to how fast each has actually been getting
+        through experts. Rates come from :class:`~freetoken.moe.placement.RateTracker`,
+        which learns them from these same steps, so a device that is slower than expected
+        loses its share within a few tokens rather than at the next restart.
+
+        Every executor is submitted before any is waited on. Waiting for each in turn would
+        cost the sum of their times, and the split was computed to cost the longest.
+
+        Each route is computed exactly once: the ids handed to an executor are ``-1``
+        wherever a different one owns that route, and the partials are summed.
         """
-        executor = cache.cpu_executor
-        assert executor is not None, "CPU MoE executor was not initialized"
-        raw = topk_ids.clone()  # raw expert ids for the CPU partial
+        raw = topk_ids.clone()  # raw expert ids, before the kernel rewrites them to slots
+        names = list(helpers)
+        shares = cache.split_shares(self.layer_id, names)
+
+        # The kernel fetches this fraction of the misses; the rest overflow to the helpers.
+        cache.hybrid_fetch_fraction = float(shares.get("gpu", 1.0))
         cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
         if cache.collect_stats:
             cache.record_decode_stats_hybrid(self.layer_id)
         on_gpu = topk_ids >= 0
 
-        cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
-        pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
+        assignment = _assign_overflow(~on_gpu, [(n, shares.get(n, 0.0)) for n in names])
+        pending, started = {}, {}
+        for name, mask in assignment.items():
+            if not bool(mask.any()):
+                continue
+            ids = torch.where(mask, raw, raw.new_full((), -1)).contiguous()
+            started[name] = time.perf_counter()
+            pending[name] = _submit(helpers[name], self.layer_id, hidden_states,
+                                    topk_weights, ids)
 
-        # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
-        # PCIe fetch + GPU GEMM, serializing the two so an A/B isolates the overlap win.
-        cpu_routed_early = (
-            executor.decode_sync(pending) if not _HYBRID_OVERLAP else None
-        )
-
+        # Time the fetch alone. What the split needs from this device is the cost of one
+        # *more* miss, and that is a transfer -- averaging it with the hits, which cost no
+        # transfer at all, would report a device several times faster than its link and
+        # hand it work the link cannot carry. The GEMM that follows is work this device
+        # owes whatever the split decides, so it is charged as time already committed
+        # rather than as part of the price of a miss.
+        fetch_start = cache.record_event()
         cache.copy_missing()
+        fetch_end = cache.record_event()
+
         gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
         gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
-        gpu_routed = self._expert_gemm(
+        out = self._expert_gemm(
             cache,
             hidden_states,
             gpu_w,
@@ -376,8 +446,15 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
-        cpu_routed = cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending)
-        return gpu_routed + cpu_routed
+        cache.note_step_timing(fetch_start, fetch_end, cache.record_event())
+
+        for name, handle in pending.items():
+            out = out + _sync(helpers[name], handle)
+            cache.rate_tracker.observe(
+                name, int(assignment[name].sum()), time.perf_counter() - started[name],
+                cache.bytes_per_expert,
+            )
+        return out
 
     def _prefill_routed(
         self,

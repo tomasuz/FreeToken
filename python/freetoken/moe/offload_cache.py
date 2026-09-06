@@ -85,6 +85,10 @@ from freetoken.kernel.aot_models import fp8_block_scale_pad
 
 # bytes per (expert, layer) as f(hidden, moe_intermediate), from the bank shapes above; keep in sync with _BANK_SCHEMAS
 # keyed by the config-time format tag (expert_quant / moe_weight_format), not quant_format: "mxfp4" sizes the mxfp4_triton banks, "nvfp4" also covers its repacked variants
+# Steps that may be in flight with their timing unread. Deeper costs pinned buffers and
+# staler rates; shallower starts discarding measurements on a busy stream.
+_TIMING_RING = 8
+
 _BANK_BYTES_PER_EXPERT = {
     "bf16": lambda H, I: 3 * I * H * 2,
     "fp8_block": lambda H, I: 3 * I * H + (
@@ -274,6 +278,17 @@ class OffloadMoeCache:
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
+        # How fast each executor gets through experts, learned from the steps it runs. The
+        # split between this device and any others reads it; see freetoken.moe.placement.
+        # Seeded from the benchmark profile where the engine has one, else from the first
+        # steps' own measurements.
+        from freetoken.moe.placement import RateTracker
+
+        self.rate_tracker = RateTracker()
+        self._gpu_busy_seconds = 0.0
+        self._pending_timings: list = []
+        self._fetched_staging: list = []
+        self._timing_slot = 0
         # (per-layer sources, cache) per bank, in schema order. Every piece of cache
         # machinery that moves bank bytes (copy_missing, the prefill double buffers,
         # bank_views) iterates this list, so the slot cache is bank-count agnostic.
@@ -624,9 +639,13 @@ class OffloadMoeCache:
     def set_worker_executors(self, executors: dict) -> None:
         """Attach per-layer worker executors (call BEFORE set_bank_sources).
 
-        Their layers join the set the copy plan skips: the worker holds those weights in
-        its own shared memory and the host bank here has been released, so there is nothing
-        for this side to move and nothing safe to read."""
+        Their layers stay in the copy plan. A worker used to own its layer outright, so
+        this side had no reason to be able to move those bytes; now the layer is shared --
+        the placement gives some of each step's misses to the worker and the rest to this
+        device -- and this device can only take its share if the host bank is still
+        reachable. It is: the bank was never released, only excluded, which is the "held
+        twice" the worker wiring reports. Both consumers now read the copy that was already
+        being paid for."""
         overlap = frozenset(executors) & self.cpu_layer_ids
         assert not overlap, (
             f"layers {sorted(overlap)} are assigned to both a worker and CPU decode"
@@ -639,11 +658,140 @@ class OffloadMoeCache:
         self.worker_layer_ids = frozenset(executors)
 
     def is_worker_layer(self, layer_id: int) -> bool:
-        """Whether ``layer_id``'s experts are computed by a worker on another device."""
+        """Whether a worker on another device can compute ``layer_id``'s experts.
+
+        "Can", not "does": the worker is one of the executors this layer's misses are
+        divided among, and how many it gets is decided per step by :meth:`split_shares`.
+        """
         return layer_id in self.worker_layer_ids
 
+    # --- placing a step's misses across whatever executors this layer has ---------------
+
+    @property
+    def bytes_per_expert(self) -> int:
+        """One expert's weight across every bank, measured from the banks themselves.
+
+        Taken from the registered tensors rather than the format table because the table is
+        keyed by the config-time tag and this only needs a number that is right for the
+        banks actually loaded. The split is scale-invariant, so this matters for the
+        reported rates rather than for the decision -- but a rate in the wrong units is a
+        log line nobody can check against a bandwidth measurement.
+        """
+        if not self.banks:
+            return 1
+        total = 0
+        for _, cache_tensor in self.banks:
+            total += cache_tensor[0].numel() * cache_tensor.element_size()
+        return max(1, total)
+
+    def split_helpers(self, layer_id: int) -> dict:
+        """Executors besides this device that can take some of ``layer_id``'s misses.
+
+        Empty means there is nothing to divide and the caller should take the plain path;
+        that is the ordinary single-device case and it must stay free of any of this.
+        """
+        helpers: dict = {}
+        if self.decode_target == "hybrid" and self.cpu_executor is not None:
+            helpers["cpu"] = self.cpu_executor
+        worker = self.worker_executors.get(layer_id)
+        if worker is not None:
+            helpers[f"worker{getattr(worker, 'device_index', '?')}"] = worker
+        return helpers
+
+    def record_event(self):
+        """A stream marker for timing device work, or ``None`` where there is no device."""
+        if self.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
+            return None
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    def note_step_timing(self, fetch_start, fetch_end, gemm_end) -> None:
+        """Queue this step's device timings, and harvest an older step's if it has landed.
+
+        The fetch is enqueued on the stream and returns before a byte has moved, so wall
+        clock around it measures the launch and reports a link hundreds of times faster
+        than it is -- which would hand this device every miss on the strength of work it
+        had not done yet. Stream events measure the work itself, but reading one costs a
+        synchronisation, and synchronising here would destroy the overlap the split exists
+        to create. So the reading is deferred: a step's events are collected once a later
+        step finds them already complete, which never blocks and is a step or two behind --
+        far finer than the rates themselves move.
+
+        The fetched count has the same problem and the same answer: it is copied to pinned
+        host memory on the stream and read when the events say the copy has landed.
+        """
+        if fetch_end is None or gemm_end is None:
+            return
+        if not self._fetched_staging:
+            # A ring rather than one buffer: several steps can be in flight, and each needs
+            # its own landing place. Pinned, because the copy has to be able to ride the
+            # stream -- a pageable destination would make it synchronous and put the
+            # blocking wait back exactly where this is trying to avoid it.
+            self._fetched_staging = [
+                torch.empty_like(self.num_indices, device="cpu").pin_memory()
+                for _ in range(_TIMING_RING)
+            ]
+        staged = self._fetched_staging[self._timing_slot]
+        self._timing_slot = (self._timing_slot + 1) % _TIMING_RING
+        staged.copy_(self.num_indices, non_blocking=True)
+        # Gate on an event recorded *after* the count copy, not on the GEMM's. The copy is
+        # enqueued behind the GEMM, so the GEMM finishing says nothing about whether the
+        # count has landed -- reading on that signal would pair this step's timings with a
+        # previous step's count, silently and only sometimes.
+        ready = torch.cuda.Event()
+        ready.record()
+        self._pending_timings.append((fetch_start, fetch_end, gemm_end, staged, ready))
+
+        while self._pending_timings and self._pending_timings[0][4].query():
+            start, end, gemm, count, _ = self._pending_timings.pop(0)
+            self.rate_tracker.observe(
+                "gpu", int(count.item()), start.elapsed_time(end) / 1e3, self.bytes_per_expert
+            )
+            self._gpu_busy_seconds = end.elapsed_time(gemm) / 1e3
+        if len(self._pending_timings) >= _TIMING_RING:
+            # Nothing is completing, and the ring is about to be reused underneath entries
+            # that have not been read. Drop the oldest rather than report a count that
+            # belongs to a different step.
+            del self._pending_timings[: len(self._pending_timings) - _TIMING_RING + 1]
+
+    def split_shares(self, layer_id: int, helper_names: list[str]) -> dict[str, float]:
+        """Fraction of this step's misses each executor should take, this device included.
+
+        The main device is named ``"gpu"`` and is always in the split: it is the one
+        executor that is always present, and the fraction it gets is what the capped-fetch
+        kernel is told to fetch.
+        """
+        from freetoken.moe.placement import split_misses
+
+        names = ["gpu", *helper_names]
+        # The GEMM this device owes regardless of the split is time it starts the step
+        # already committed to, so it is given proportionally fewer misses.
+        rates = self.rate_tracker.rates(
+            names, busy={"gpu": getattr(self, "_gpu_busy_seconds", 0.0)}
+        )
+        # A large nominal count keeps rounding out of the ratio; the kernel and the route
+        # assignment both work in fractions, so only the proportions matter here.
+        placement = split_misses(rates, 1024, self.bytes_per_expert)
+        return {name: placement.counts[name] / 1024 for name in names if name in placement.counts}
+
     def _skips_movement(self, layer_id: int) -> bool:
-        """Layers this cache never moves bytes for: someone else owns their weights."""
+        """Layers whose host bank this cache can never read: the pages are gone.
+
+        Only resident layers qualify -- their bank was uploaded and released. A worker
+        layer's bank is still there and still valid, so this device fetches the share of it
+        the placement leaves here, which is what makes the layer shared rather than
+        surrendered."""
+        return layer_id in self.resident_layer_ids
+
+    def _skips_prefill_stream(self, layer_id: int) -> bool:
+        """Layers the prefill double buffer must not stream.
+
+        Wider than :meth:`_skips_movement`, and for a different reason. A resident layer
+        has nothing to stream; a worker layer has something, but prefill for it is answered
+        by the worker in one grouped call, so streaming it here would fill a buffer nobody
+        releases -- and the overlap machinery asserts on exactly that.
+        """
         return layer_id in self.resident_layer_ids or layer_id in self.worker_layer_ids
 
     def resident_views(self, layer_id: int) -> tuple[torch.Tensor, ...]:
@@ -752,10 +900,10 @@ class OffloadMoeCache:
             return
         if layer_id < 0:
             raise ValueError(f"Invalid prefill layer id: {layer_id}")
-        if self._skips_movement(layer_id):
-            # A resident or worker-served layer's banks are elsewhere and its host source is a
-            # released mmap -- prefetching it would copy dropped (zero) pages into the
-            # buffer. It is also pure waste: the layer reads its VRAM banks directly.
+        if self._skips_prefill_stream(layer_id):
+            # A resident layer's host source is a released mmap -- prefetching it would copy
+            # dropped (zero) pages into the buffer -- and a worker-served layer's prefill is
+            # answered by the worker, so the buffer would be filled and never released.
             # Guarding here rather than at the call site also covers the look-ahead
             # prefetch of layer_id + 1 in OffloadMoELayer._wait_prefill_overlap.
             return

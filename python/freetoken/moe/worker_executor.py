@@ -273,6 +273,27 @@ class WorkerMoeExecutor:
         assert bs <= self._io["x"].tensor.shape[0], (
             f"batch {bs} exceeds the worker's max_batch {self._io['x'].tensor.shape[0]}"
         )
+        pending = self.decode_submit(hidden_states, topk_weights, topk_ids)
+        return self.decode_sync(pending)
+
+    def decode_submit(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ):
+        """Ring the doorbell and return without waiting.
+
+        Splitting the step this way is what lets several executors run at once. A placement
+        that hands work to three devices and then waits for each in turn would take the sum
+        of their times, not the longest -- which is the opposite of the arrangement it was
+        computed to produce.
+        """
+        bs = hidden_states.shape[0]
+        assert bs >= 1, "batch size doubles as the doorbell, so it cannot be zero"
+        assert bs <= self._io["x"].tensor.shape[0], (
+            f"batch {bs} exceeds the worker's max_batch {self._io['x'].tensor.shape[0]}"
+        )
         self._io["x"].tensor[:bs].copy_(hidden_states)
         self._io["ids"].tensor[:bs].copy_(topk_ids.to(torch.int32))
         self._io["w"].tensor[:bs].copy_(topk_weights.to(torch.float32))
@@ -280,8 +301,13 @@ class WorkerMoeExecutor:
         flags = self._ctl.tensor
         flags[_DONE] = 0
         flags[_READY] = bs  # doorbell
+        return (bs, hidden_states.device)
+
+    def decode_sync(self, pending) -> torch.Tensor:
+        """Wait for the work :meth:`decode_submit` rang for, and bring the result back."""
+        bs, device = pending
         self._await_flag(_DONE, bs, _STEP_TIMEOUT_S, "decode")
-        return self._io["y"].tensor[:bs].to(hidden_states.device)
+        return self._io["y"].tensor[:bs].to(device)
 
     def slot_stats(self) -> dict:
         """Hits and misses the worker's slot cache has seen, for the parent to report.

@@ -193,6 +193,18 @@ class Scheduler(SchedulerIOMixin):
             routing = cache.decode_routing_stats()
         except Exception:
             routing = {}
+        tracker = getattr(cache, "rate_tracker", None)
+        if tracker is not None and tracker.describe():
+            logger.info_rank0(f"moe executor rates: {tracker.describe()}")
+            # Show the division those rates produce, since the rates alone do not say what
+            # the engine did with them.
+            for layer_id in sorted(getattr(cache, "worker_layer_ids", ()) or ()):
+                helpers = list(cache.split_helpers(layer_id))
+                if helpers:
+                    shares = cache.split_shares(layer_id, helpers)
+                    text = ", ".join(f"{n}={v * 100:.0f}%" for n, v in sorted(shares.items()))
+                    logger.info_rank0(f"moe split for layer {layer_id}: {text}")
+                    break  # one example is enough; the rates are shared across layers
         for layer_id, executor in sorted(getattr(cache, "worker_executors", {}).items()):
             stats = getattr(executor, "slot_stats", None)
             if stats is None:
