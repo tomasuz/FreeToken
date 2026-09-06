@@ -28,7 +28,10 @@ _SPEC = json.loads(open(sys.argv[1]).read())
 import torch  # noqa: E402
 
 from freetoken.moe.shared_host import open_shared  # noqa: E402
-from freetoken.moe.worker_slots import WorkerSlotCache  # noqa: E402
+from freetoken.moe.worker_slots import (  # noqa: E402
+    WorkerInPlaceBanks,
+    WorkerSlotCache,
+)
 
 # Flag layout in the control buffer, one int64 each. Kept adjacent so the parent can hand
 # both addresses to a single stream memop pair.
@@ -59,9 +62,10 @@ class _BankLibrary:
     step rather than at start-up.
     """
 
-    def __init__(self, spec: dict, slots: int) -> None:
+    def __init__(self, spec: dict, slots: int, in_place: bool) -> None:
         self._spec = spec
         self._slots = slots
+        self._in_place = in_place
         self._maps: dict[int, dict] = {}
         self._caches: dict[int, WorkerSlotCache] = {}
         any_name = next(iter(spec))
@@ -78,9 +82,15 @@ class _BankLibrary:
                 path, tuple(entry["shape"]), _DTYPES[entry["dtype"]]
             ).tensor
         self._maps[layer_id] = tensors
-        cache = WorkerSlotCache(
-            tensors, slots=self._slots or tensors[next(iter(tensors))].shape[0], device=device
-        )
+        if self._in_place:
+            # Nothing is copied and nothing is evicted: the device reads the engine's own
+            # bank where it lies. Costs no device memory, so every layer can have one.
+            cache = WorkerInPlaceBanks(tensors, device=device)
+        else:
+            cache = WorkerSlotCache(
+                tensors, slots=self._slots or tensors[next(iter(tensors))].shape[0],
+                device=device,
+            )
         self._caches[layer_id] = cache
         return cache
 
@@ -101,7 +111,9 @@ def main() -> int:
     # page is touched, so holding all of them costs nothing for the layers this worker is
     # never asked about -- and the ones it is asked about read the same pages the engine
     # holds rather than a second copy of them.
-    library = _BankLibrary(_SPEC["banks"], int(_SPEC.get("slots") or 0))
+    library = _BankLibrary(
+        _SPEC["banks"], int(_SPEC.get("slots") or 0), bool(_SPEC.get("read_in_place"))
+    )
 
     # The bank mappings are deliberately NOT registered with the runtime. Registering a
     # shared mapping that another process also holds is not something the runtime promises

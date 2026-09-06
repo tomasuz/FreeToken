@@ -191,6 +191,12 @@ class WorkerMoeExecutor:
         }
         self._slots: dict[tuple[int, int], int] = {}
         self._next_slot = 0
+        # Whether this device can compute an expert where it already lies, instead of
+        # having a copy of it made in the device's own memory. Decided by measurement in
+        # the child, which is the only process that can ask its own device; the parent
+        # only carries the answer. Default is to try, since an expert not copied is an
+        # expert not paid for twice.
+        self.reads_in_place = os.getenv("FREETOKEN_WORKER_READ_IN_PLACE", "1") == "1"
         num_experts = banks.num_experts
         self.layers = sorted(banks.layers)
         # One token's experts are read by a single launch, so top_k is the floor. A wider
@@ -205,6 +211,7 @@ class WorkerMoeExecutor:
             "io": {n: self._entry(b) for n, b in self._io.items()},
             "flags": {n: self._entry(b) for n, b in self._flags.items()},
             "slots": self.slots,
+            "read_in_place": self.reads_in_place,
             "ggml_type": int(ggml_type),
             "activation": activation,
             # "auto" lets the worker fall back to torch where the compiled activation has

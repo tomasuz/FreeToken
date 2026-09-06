@@ -194,3 +194,60 @@ def test_a_step_of_only_unowned_routes_asks_for_nothing():
     cache.ensure(ids([-1, -1]))
 
     assert cache.misses == 0 and cache.fills == 0
+
+
+# ---------------------------------------------------------------------------
+# experts read where they already are
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a device to map into")
+def test_reading_in_place_gives_the_same_answer_as_copying():
+    """The whole idea is worthless if the bytes read in place are not the same bytes."""
+    from freetoken.moe.worker_slots import WorkerInPlaceBanks
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    host = {name: t.contiguous() for name, t in banks(16).items()}
+
+    view = WorkerInPlaceBanks(host, device=device)
+
+    for name, tensor in host.items():
+        assert torch.equal(view.dev[name].cpu(), tensor)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a device to map into")
+def test_an_in_place_reader_never_fetches_and_never_evicts():
+    """It is a cache with no capacity limit, so every question about placement says yes."""
+    from freetoken.moe.worker_slots import WorkerInPlaceBanks
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    view = WorkerInPlaceBanks({n: t.contiguous() for n, t in banks(16).items()}, device=device)
+
+    out = view.ensure(ids([0, 15], [7, 3]))
+
+    assert view.holds_everything and view.misses == 0 and view.fills == 0
+    assert out.tolist() == [[0, 15], [7, 3]], "an expert's id is already its row"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a device to map into")
+def test_a_step_of_any_width_is_one_launch_when_reading_in_place():
+    from freetoken.moe.worker_slots import WorkerInPlaceBanks
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    view = WorkerInPlaceBanks({n: t.contiguous() for n, t in banks(16).items()}, device=device)
+
+    assert view.partition(ids(*[[0, 1]] * 64)) == [(0, 64)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a device to map into")
+def test_routes_another_executor_owns_still_name_a_readable_row():
+    """Their weight is zero, so which row cannot matter -- but -1 is not a row."""
+    from freetoken.moe.worker_slots import WorkerInPlaceBanks
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    view = WorkerInPlaceBanks({n: t.contiguous() for n, t in banks(16).items()}, device=device)
+
+    out = view.ensure(ids([-1, 4]))
+
+    assert out.min().item() >= 0
+    assert out.tolist()[0][1] == 4

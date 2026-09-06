@@ -185,3 +185,70 @@ class WorkerSlotCache:
     def stats(self) -> tuple[int, int]:
         """``(hits, misses)`` since construction, for the parent to report."""
         return self.hits, self.misses
+
+
+class WorkerInPlaceBanks:
+    """The layer's experts read where they already are, with nothing copied anywhere.
+
+    A slot cache exists to make a small fast memory serve a large working set. Where the
+    device can address the host bank directly, there is no smaller memory and no working
+    set to manage: every expert is reachable at all times, so this is a cache with no
+    capacity limit and no misses -- which is why it answers the same questions and always
+    says yes.
+
+    Measured against copying into the device's own memory first: on an integrated device,
+    whose memory is the same DRAM, reading in place costs 16% and copying costs a full
+    transfer plus a second residency, so in place wins outright. On a discrete device the
+    trade reverses as soon as an expert is reused, which is what its slot cache is for.
+    Nothing here decides that -- the caller picks, and this is the half that does not copy.
+
+    The bank tensors name memory the allocator never handed out, so the mappings they point
+    at must outlive them; ``host_banks`` is held for exactly that reason.
+    """
+
+    __slots__ = ("device", "num_experts", "slots", "host", "dev", "hits", "misses", "fills")
+
+    def __init__(self, host_banks: dict[str, torch.Tensor], *, device: torch.device) -> None:
+        from freetoken.kernel.pinned import (
+            device_ptr,
+            host_register,
+            tensor_from_device_ptr,
+        )
+
+        assert host_banks, "an in-place reader needs at least one bank"
+        counts = {t.shape[0] for t in host_banks.values()}
+        assert len(counts) == 1, f"banks disagree on expert count: {counts}"
+        self.num_experts = counts.pop()
+        self.device = device
+        self.host = host_banks  # keeps the mappings the device tensors point into alive
+        self.dev = {}
+        for name, tensor in host_banks.items():
+            host_register(tensor.data_ptr(), tensor.numel() * tensor.element_size())
+            self.dev[name] = tensor_from_device_ptr(
+                device_ptr(tensor), tensor.shape, tensor.dtype, device.index or 0
+            )
+        self.slots = self.num_experts
+        self.hits = 0
+        self.misses = 0
+        self.fills = 0
+
+    @property
+    def holds_everything(self) -> bool:
+        return True
+
+    def partition(self, expert_ids: torch.Tensor) -> list[tuple[int, int]]:
+        """One range, always: there is no capacity to run out of."""
+        return [(0, expert_ids.shape[0])] if expert_ids.shape[0] else []
+
+    def ensure(self, expert_ids: torch.Tensor) -> torch.Tensor:
+        """Nothing to fetch. An expert's id is already its row, so the ids pass through.
+
+        Routes another executor owns still have to name a readable row -- their weight is
+        zero, so which row cannot matter, but a negative index would wander off the front
+        of the bank.
+        """
+        self.hits += int((expert_ids >= 0).sum())
+        return expert_ids.clamp_min(0).to(self.device)
+
+    def stats(self) -> tuple[int, int]:
+        return self.hits, self.misses
