@@ -415,19 +415,33 @@ class Engine:
         if self.linear_state_pool is not None:
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
-        # A worker layer's forward is a host-side handshake with another process: copy the
-        # activations into shared memory, wake the worker, wait for it to answer. The wait
-        # is ordinary Python, so a capture would record the copies around a worker that
-        # never ran on replay and hand back whatever the buffer happened to hold -- wrong
-        # numbers, silently. The CPU executor solves the same problem with a host-function
-        # node in the graph; until the worker path grows one, a worker means eager decode.
+        # A worker's forward waits on another process. Whether that is capturable depends
+        # on how the wait is expressed: as Python it is not -- a replay would run the
+        # copies around a worker that never ran and hand back whatever the buffer held --
+        # but as a stream memory operation the wait is a node like any other, and a replay
+        # drives the worker for real. Each worker reports which it got; one that fell back
+        # to polling takes capture down for everyone, since a single uncapturable layer is
+        # enough to make a captured decode wrong.
         graph_bs = config.cuda_graph_bs
-        if getattr(self.moe_offload_cache, "worker_executors", None):
-            if graph_bs != []:
-                logger.info_rank0(
-                    "--moe-worker-layers: not capturing CUDA graphs -- a worker layer's "
-                    "forward waits on another process, which a graph cannot replay"
-                )
+        workers = list((getattr(self.moe_offload_cache, "worker_executors", None) or {}).values())
+        if workers and graph_bs != []:
+            # The handshake is capturable now: expressed as stream memory operations it is
+            # a pair of nodes, a capture records them, and a replay drives the worker for
+            # real. Verified by giving the worker a zero share with capture on, where the
+            # output is exactly right -- so the memops, the copies and the route split all
+            # replay correctly.
+            #
+            # What is NOT yet right is the worker's own contribution under replay: with a
+            # nonzero share the answers degrade. Eager decode with the same worker is
+            # correct, so the fault is somewhere in the replayed handoff rather than in the
+            # split or the arithmetic. Until that is found, a worker means eager decode --
+            # a slower right answer beats a faster wrong one, and this is not a knob to
+            # leave for someone to find.
+            logger.info_rank0(
+                "--moe-worker-layers: not capturing CUDA graphs. The stream handshake "
+                "makes capture possible, but a worker's contribution is not yet correct "
+                "under replay, so decode stays eager"
+            )
             graph_bs = []
         self.graph_runner = GraphRunner(
             stream=self.stream,

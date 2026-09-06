@@ -168,3 +168,29 @@ def test_stats_report_what_the_parent_logs():
 
     hits, misses = cache.stats()
     assert (hits, misses) == (1, 3)  # 2 was already there; 1, 2 and 3 arrived
+
+
+def test_routes_another_executor_owns_are_not_treated_as_experts():
+    """A -1 id marks a route this executor does not own, and Python indexes -1 happily.
+
+    Left alone it selects the last slot and computes a real expert for a route that belongs
+    to someone else. The weight is zero so the arithmetic survives, but the expert is
+    fetched, the cache is polluted, and the placement is charged for work nobody asked for.
+    """
+    host = banks()
+    cache = WorkerSlotCache(host, slots=4, device=CPU)
+
+    out = cache.ensure(ids([2, -1]))
+
+    assert out[0][1].item() == 0, "an unowned route must name a harmless slot"
+    assert cache.misses == 1, "only the real expert should have been fetched"
+    assert cache._expert_of.count(-1) == 3, "no sentinel should have taken a slot"
+
+
+def test_a_step_of_only_unowned_routes_asks_for_nothing():
+    cache = WorkerSlotCache(banks(), slots=2, device=CPU)
+
+    assert cache.partition(ids([-1, -1], [-1, -1])) == [(0, 2)]
+    cache.ensure(ids([-1, -1]))
+
+    assert cache.misses == 0 and cache.fills == 0

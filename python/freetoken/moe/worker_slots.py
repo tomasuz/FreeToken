@@ -120,7 +120,7 @@ class WorkerSlotCache:
         ranges: list[tuple[int, int]] = []
         start, union = 0, set()
         for token, row in enumerate(rows):
-            experts = {int(e) for e in row}
+            experts = {int(e) for e in row if int(e) >= 0}
             if len(experts) > self.slots:
                 raise RuntimeError(
                     MIN_SLOTS_MESSAGE.format(wanted=len(experts), slots=self.slots)
@@ -141,7 +141,11 @@ class WorkerSlotCache:
         straight to the grouped GEMV in place of the original ids.
         """
         rows = expert_ids.tolist()
-        wanted = {int(e) for row in rows for e in row}
+        # A negative id marks a route another executor owns. Its weight is zero, so what it
+        # computes cannot matter -- but it still has to name a slot the kernel can read, and
+        # Python would happily let -1 index the last one. Point them at slot 0 instead of
+        # letting a sentinel wander into the cache as if it were an expert.
+        wanted = {int(e) for row in rows for e in row if int(e) >= 0}
         if len(wanted) > self.slots:
             raise RuntimeError(MIN_SLOTS_MESSAGE.format(wanted=len(wanted), slots=self.slots))
 
@@ -173,7 +177,9 @@ class WorkerSlotCache:
             self._clock += 1
             self._used[self._slot_of[expert]] = self._clock
 
-        remapped = [[self._slot_of[int(e)] for e in row] for row in rows]
+        remapped = [
+            [self._slot_of[int(e)] if int(e) >= 0 else 0 for e in row] for row in rows
+        ]
         return torch.tensor(remapped, dtype=expert_ids.dtype, device=self.device)
 
     def stats(self) -> tuple[int, int]:

@@ -204,43 +204,55 @@ def _sync(executor, handle):
     return executor.decode_sync(handle)
 
 
-def _assign_overflow(overflow, shares: list[tuple[str, float]]) -> dict:
+def _assign_overflow(overflow, owner, shares: list[tuple[str, float]]) -> dict:
     """Divide the routes this device did not take among the other executors.
 
-    Shares are fractions of the *whole* step, so they are renormalised over the helpers
-    before being applied to what actually overflowed -- the kernel's fetch cap is only
-    approximately the share it was given, and the leftover has to be divided by the
-    proportions the executors earned among themselves.
+    Elementwise on purpose. The obvious way to split a set of routes is to find them and
+    deal them out, but finding them means counting them, and counting on the device means
+    asking the host how many -- a synchronisation, which a stream in the middle of a graph
+    capture refuses outright. The two-way version this generalises never had the problem
+    because it expressed its split as a mask; so does this one.
 
-    Routes are handed out in flat order, which is arbitrary but fixed: the same overflow
-    always splits the same way, so a difference between two runs means something changed.
-    Any remainder goes to the first executor rather than being dropped, because a route
-    nobody computes is a silently wrong answer.
+    ``owner`` labels every *position* with an executor, in the proportions the placement
+    asked for, and is built without reference to which positions actually overflowed. A
+    route goes to executor ``i`` where it overflowed and its position is labelled ``i`` --
+    two elementwise ops, no counts, nothing the device has to tell the host.
+
+    The cost of not counting is that the division is only proportional on average: which
+    positions overflow is not correlated with the labelling, so over a step the shares come
+    out right, and over a single route they may not. That is the correct trade for a
+    quantity the placement is already smoothing over many steps.
     """
-    import torch as _torch
-
-    positions = overflow.reshape(-1).nonzero(as_tuple=True)[0]
-    total = int(positions.numel())
-    assignment = {
-        name: _torch.zeros_like(overflow, dtype=_torch.bool) for name, _ in shares
+    return {
+        name: overflow & (owner == index)
+        for index, (name, _) in enumerate(shares)
     }
-    if total == 0 or not shares:
-        return assignment
 
+
+def _fill_owner_map(owner_host, shares: list[tuple[str, float]]) -> None:
+    """Label each route position with the executor that will take it if it overflows.
+
+    Written into pinned host memory that a captured graph copies from, so the labelling can
+    change between replays without recapturing: the copy is a node, and a node re-reads its
+    source every time it runs.
+
+    Positions are dealt in contiguous runs rather than interleaved. Runs keep each
+    executor's routes together, which matters for the one that reads them from a slot cache
+    -- scattered routes touch more experts than clustered ones do.
+    """
     weights = [max(0.0, w) for _, w in shares]
-    if sum(weights) <= 0.0:  # nothing measured yet: an equal split is the honest guess
+    total = float(sum(weights))
+    n = owner_host.numel()
+    if total <= 0.0:  # nothing measured yet: an equal division is the honest guess
         weights = [1.0] * len(shares)
-    scale = total / sum(weights)
-    counts = [int(w * scale) for w in weights]
-    counts[0] += total - sum(counts)  # the remainder must land somewhere
-
-    flat = {name: assignment[name].reshape(-1) for name, _ in shares}
-    offset = 0
-    for (name, _), count in zip(shares, counts):
-        if count > 0:
-            flat[name][positions[offset:offset + count]] = True
-            offset += count
-    return assignment
+        total = float(len(shares))
+    flat = owner_host.view(-1)
+    start = 0
+    for index, weight in enumerate(weights):
+        stop = n if index == len(weights) - 1 else start + int(round(n * weight / total))
+        stop = min(max(stop, start), n)
+        flat[start:stop] = index
+        start = stop
 
 
 class OffloadMoELayer(MoELayer):
@@ -412,15 +424,24 @@ class OffloadMoELayer(MoELayer):
             cache.record_decode_stats_hybrid(self.layer_id)
         on_gpu = topk_ids >= 0
 
-        assignment = _assign_overflow(~on_gpu, [(n, shares.get(n, 0.0)) for n in names])
+        share_list = [(n, shares.get(n, 0.0)) for n in names]
+        owner = cache.owner_map(self.layer_id, topk_ids.shape, share_list)
+        assignment = _assign_overflow(~on_gpu, owner, share_list)
         pending, started = {}, {}
         for name, mask in assignment.items():
-            if not bool(mask.any()):
-                continue
+            # No "is this mask empty" test: answering it needs the device to tell the host
+            # something, which a capture forbids. An executor handed a step with nothing in
+            # it computes zeros for it, which the sum below adds harmlessly.
             ids = torch.where(mask, raw, raw.new_full((), -1)).contiguous()
+            # Zero the weights this executor does not own, exactly as the device path does
+            # for the routes it does not own. Marking an id -1 says "not yours" only to a
+            # consumer that checks; the weight is what actually decides whether a route
+            # contributes, so a route left with its weight adds whatever the -1 happened to
+            # select. The sum below is over partials that must not overlap.
+            weights = torch.where(mask, topk_weights, topk_weights.new_zeros(())).contiguous()
             started[name] = time.perf_counter()
             pending[name] = _submit(helpers[name], self.layer_id, hidden_states,
-                                    topk_weights, ids)
+                                    weights, ids)
 
         # Time the fetch alone. What the split needs from this device is the cost of one
         # *more* miss, and that is a transfer -- averaging it with the hits, which cost no
@@ -448,6 +469,12 @@ class OffloadMoELayer(MoELayer):
 
         for name, handle in pending.items():
             out = out + _sync(helpers[name], handle)
+            # Count the routes this executor actually received. Reading a device tensor
+            # costs a synchronisation, which is why this cannot stand if decode is ever
+            # captured -- but the alternative tried first, charging it the share it was
+            # given, measures a different quantity from the one the main device is measured
+            # in, and the two are then not comparable. That put a 1400 GB/s reading on the
+            # slower device and sent it 99% of the work.
             cache.rate_tracker.observe(
                 name, int(assignment[name].sum()), time.perf_counter() - started[name],
                 cache.bytes_per_expert,

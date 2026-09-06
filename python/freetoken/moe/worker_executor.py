@@ -39,8 +39,16 @@ from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
 
-_READY, _DONE, _STOP, _HITS, _MISSES, _LAYER = 0, 1, 2, 3, 4, 5
-_CTL_SLOTS = 6
+# Legacy control words, still used for shutdown and for reporting cache statistics.
+_STOP, _HITS, _MISSES, _UP = 0, 1, 2, 3
+_CTL_SLOTS = 4
+
+# Flag slots per layer: one per distinct decode batch size that gets its own captured
+# graph. The slot is what makes the handshake capturable -- a replay must write the same
+# address every time, so the layer and batch size have to be baked into the address rather
+# than written into a shared word each step. More sizes than this keeps the polled path,
+# which is functional and only slower.
+_SLOTS_PER_LAYER = 8
 
 # A cold worker pays process start, torch import, and a JIT compile of the expert kernel
 # for its architecture. The compile is the long pole and happens once per machine.
@@ -163,12 +171,26 @@ class WorkerMoeExecutor:
 
         self._ctl = share("ctl", (_CTL_SLOTS,), torch.int64)
         self._ctl.tensor.zero_()
+        num_layers = (max(banks.layers) + 1) if banks.layers else 1
+        self._capacity = num_layers * _SLOTS_PER_LAYER
+        # ready/done are the handshake the GPU front end drives; the descriptors tell the
+        # worker what a raised slot means, written once when the slot is handed out.
+        self._flags = {
+            "ready": share("ready", (self._capacity,), torch.int64),
+            "done": share("done", (self._capacity,), torch.int64),
+            "slot_layer": share("slot_layer", (self._capacity,), torch.int64),
+            "slot_bs": share("slot_bs", (self._capacity,), torch.int64),
+        }
+        for buf in self._flags.values():
+            buf.tensor.zero_()
         self._io = {
             "x": share("x", (max_batch, h), torch.bfloat16),
             "ids": share("ids", (max_batch, k), torch.int32),
             "w": share("w", (max_batch, k), torch.float32),
             "y": share("y", (max_batch, h), torch.bfloat16),
         }
+        self._slots: dict[tuple[int, int], int] = {}
+        self._next_slot = 0
         num_experts = banks.num_experts
         self.layers = sorted(banks.layers)
         # One token's experts are read by a single launch, so top_k is the floor. A wider
@@ -181,6 +203,7 @@ class WorkerMoeExecutor:
             "control": self._entry(self._ctl),
             "banks": banks.spec(),
             "io": {n: self._entry(b) for n, b in self._io.items()},
+            "flags": {n: self._entry(b) for n, b in self._flags.items()},
             "slots": self.slots,
             "ggml_type": int(ggml_type),
             "activation": activation,
@@ -244,7 +267,7 @@ class WorkerMoeExecutor:
             text=True,
         )
         try:
-            self._await_flag(_DONE, -1, _START_TIMEOUT_S, "start")
+            self._await_flag(_UP, 1, _START_TIMEOUT_S, "start")
         except Exception:
             # The spec names every shared buffer; keeping it lets the same child be
             # started again by hand, which is the only way to debug a crash this side
@@ -256,6 +279,7 @@ class WorkerMoeExecutor:
             self._keep_spec = True
             raise
         logger.info_rank0(f"MoE worker up on device {self.device_index}")
+        self._enable_stream_handshake()
 
     def _await_flag(self, slot: int, want: int, timeout: float, what: str) -> None:
         """Poll a control flag, failing loudly if the worker died or stopped answering.
@@ -323,6 +347,71 @@ class WorkerMoeExecutor:
         pending = self.decode_submit(layer_id, hidden_states, topk_weights, topk_ids)
         return self.decode_sync(pending)
 
+    def _enable_stream_handshake(self) -> None:
+        """Try to move the handshake onto the GPU front end, and say what happened.
+
+        The polled version cannot be captured: the wait is Python, so a graph would record
+        the copies around a worker that never ran and replay stale output. Stream memory
+        operations put both halves -- raise ready, wait on done -- on the stream itself,
+        where a capture records them like any other node and a replay drives the worker for
+        real. That is what the CPU executor already does; the mechanism is not specific to
+        where the work lands.
+
+        Everything the GPU touches has to be registered for it to address: the flags it
+        writes and waits on, and the activation buffers it copies through. Registering a
+        shared mapping is what makes those pages reachable from both the device and the
+        other process at once.
+        """
+        self.stream_handshake = False
+        if not torch.cuda.is_available():
+            return
+        try:
+            from freetoken.kernel import _cpu_moe
+        except Exception as exc:  # the extension is optional; the polled path still works
+            logger.info_rank0(
+                f"worker on device {self.device_index}: stream handshake unavailable "
+                f"({type(exc).__name__}), using the polled one -- decode will not be "
+                f"captured into CUDA graphs"
+            )
+            return
+        from freetoken.kernel.pinned import alloc_pinned_tensor
+
+        probe = alloc_pinned_tensor(1, dtype=torch.int64)
+        probe.zero_()
+        if not _cpu_moe.memops_probe(
+            torch.cuda.current_stream().cuda_stream, probe.data_ptr()
+        ):
+            logger.info_rank0(
+                f"worker on device {self.device_index}: CUDA stream memory operations are "
+                f"not supported here, using the polled handshake -- decode will not be "
+                f"captured into CUDA graphs"
+            )
+            return
+        for buf in list(self._flags.values()) + list(self._io.values()):
+            buf.pin()
+        self._memops = _cpu_moe
+        self.stream_handshake = True
+
+    def _slot_for(self, layer_id: int, bs: int) -> int | None:
+        """The flag slot for this (layer, batch size), or ``None`` if none is left.
+
+        Handed out on first use and never moved, because a captured graph bakes the address
+        in. The descriptors are written here, before any capture can happen, so the worker
+        can tell what a raised slot means without anything being written per step.
+        """
+        key = (int(layer_id), int(bs))
+        slot = self._slots.get(key)
+        if slot is not None:
+            return slot
+        if self._next_slot >= self._capacity:
+            return None  # more shapes than slots: fall back rather than reuse one
+        slot = self._next_slot
+        self._next_slot += 1
+        self._slots[key] = slot
+        self._flags["slot_layer"].tensor[slot] = layer_id
+        self._flags["slot_bs"].tensor[slot] = bs
+        return slot
+
     def decode_submit(
         self,
         layer_id: int,
@@ -342,21 +431,83 @@ class WorkerMoeExecutor:
         assert bs <= self._io["x"].tensor.shape[0], (
             f"batch {bs} exceeds the worker's max_batch {self._io['x'].tensor.shape[0]}"
         )
-        self._io["x"].tensor[:bs].copy_(hidden_states)
-        self._io["ids"].tensor[:bs].copy_(topk_ids.to(torch.int32))
-        self._io["w"].tensor[:bs].copy_(topk_weights.to(torch.float32))
+        slot = self._slot_for(layer_id, bs) if self.stream_handshake else None
+        ids32 = topk_ids.to(torch.int32).contiguous()
+        w32 = topk_weights.to(torch.float32).contiguous()
+        if slot is not None:
+            # Copy by address. The shared buffers are registered with the driver, but the
+            # tensor library keeps its own record of what is page-locked and a mapping it
+            # did not allocate is not in it -- so an ordinary copy here is treated as a
+            # pageable one, which is synchronous, which a capture rejects.
+            stream = torch.cuda.current_stream().cuda_stream
+            for buf, src in (
+                (self._io["x"], hidden_states.contiguous()),
+                (self._io["ids"], ids32),
+                (self._io["w"], w32),
+            ):
+                self._memops.memcpy_async(
+                    stream, buf.tensor.data_ptr(), src.data_ptr(),
+                    src.numel() * src.element_size(),
+                )
+        else:
+            self._io["x"].tensor[:bs].copy_(hidden_states)
+            self._io["ids"].tensor[:bs].copy_(ids32)
+            self._io["w"].tensor[:bs].copy_(w32)
+        if slot is None:
+            # Polled fallback: correct, and the reason capture stays off when it is in use.
+            self._flags["slot_layer"].tensor[0] = layer_id
+            self._flags["slot_bs"].tensor[0] = bs
+            self._flags["done"].tensor[0] = 0
+            self._flags["ready"].tensor[0] = 1
+            return (0, bs, hidden_states.device, False)
 
-        flags = self._ctl.tensor
-        flags[_LAYER] = int(layer_id)  # written before the doorbell it is read behind
-        flags[_DONE] = 0
-        flags[_READY] = bs  # doorbell
-        return (bs, hidden_states.device)
+        # Both halves go on the stream, so a capture records them and a replay drives the
+        # worker for real instead of reading whatever the buffer held last.
+        self._memops.memop_submit(
+            torch.cuda.current_stream().cuda_stream,
+            self._flags["done"].tensor.data_ptr(),
+            self._flags["ready"].tensor.data_ptr(),
+            slot,
+        )
+        return (slot, bs, hidden_states.device, True)
 
     def decode_sync(self, pending) -> torch.Tensor:
         """Wait for the work :meth:`decode_submit` rang for, and bring the result back."""
-        bs, device = pending
-        self._await_flag(_DONE, bs, _STEP_TIMEOUT_S, "decode")
-        return self._io["y"].tensor[:bs].to(device)
+        slot, bs, device, on_stream = pending
+        if not on_stream:
+            self._await_slot(slot, _STEP_TIMEOUT_S)
+            return self._io["y"].tensor[:bs].to(device)
+        # A front-end wait: this stream's later nodes do not run until the worker reports
+        # done, and the wait itself is a node like any other.
+        stream = torch.cuda.current_stream().cuda_stream
+        self._memops.memop_sync(stream, self._flags["done"].tensor.data_ptr(), slot)
+        out = torch.empty(
+            (bs, self._io["y"].tensor.shape[1]), dtype=self._io["y"].tensor.dtype,
+            device=device,
+        )
+        self._memops.memcpy_async(
+            stream, out.data_ptr(), self._io["y"].tensor.data_ptr(),
+            out.numel() * out.element_size(),
+        )
+        return out
+
+    def _await_slot(self, slot: int, timeout: float) -> None:
+        """Poll one done flag, the fallback for a shape with no slot of its own."""
+        done = self._flags["done"].tensor
+        deadline = time.time() + timeout
+        while not int(done[slot]):
+            rc = self._proc.poll() if self._proc is not None else None
+            if rc is not None:
+                raise RuntimeError(
+                    f"MoE worker for device {self.device_index} exited with {rc} during "
+                    f"decode: {self._child_error()}"
+                )
+            if time.time() > deadline:
+                raise TimeoutError(
+                    f"MoE worker on device {self.device_index} did not answer within "
+                    f"{timeout:.0f}s"
+                )
+            time.sleep(0)
 
     def serves(self, layer_id: int) -> bool:
         """Whether this worker can reach ``layer_id``'s weights at all."""

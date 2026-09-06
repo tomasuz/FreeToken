@@ -89,6 +89,9 @@ from freetoken.kernel.aot_models import fp8_block_scale_pad
 # staler rates; shallower starts discarding measurements on a busy stream.
 _TIMING_RING = 8
 
+# Diagnostic: route every miss to the main device while leaving the split path in place.
+_FORCE_GPU_ONLY = os.getenv("FREETOKEN_SPLIT_GPU_ONLY", "0") == "1"
+
 _BANK_BYTES_PER_EXPERT = {
     "bf16": lambda H, I: 3 * I * H * 2,
     "fp8_block": lambda H, I: 3 * I * H + (
@@ -287,6 +290,7 @@ class OffloadMoeCache:
         self.rate_tracker = RateTracker()
         self._gpu_busy_seconds = 0.0
         self._hybrid_ensure_ran = False
+        self._owner_maps: dict = {}
         self._pending_timings: list = []
         self._fetched_staging: list = []
         self._timing_slot = 0
@@ -698,6 +702,33 @@ class OffloadMoeCache:
             helpers[f"worker{getattr(worker, 'device_index', '?')}"] = worker
         return helpers
 
+    def owner_map(self, layer_id: int, shape, shares: list) -> torch.Tensor:
+        """Per-route executor labels for this layer, as a device tensor a graph can read.
+
+        Kept as a pinned host buffer plus a device copy, and the copy is issued here on the
+        stream. A captured graph records the copy as a node, so a later step can change the
+        labelling by writing the host buffer and the replay picks it up -- the division
+        stays adjustable without recapturing anything.
+
+        The host buffer is rewritten only when the shares actually move, since rewriting it
+        is Python over every route position and the shares are already smoothed.
+        """
+        from freetoken.layers.moe import _fill_owner_map
+
+        key = (layer_id, tuple(shape))
+        entry = self._owner_maps.get(key)
+        if entry is None:
+            host = torch.zeros(shape, dtype=torch.int32, device="cpu").pin_memory()
+            device = torch.zeros(shape, dtype=torch.int32, device=self.device)
+            entry = self._owner_maps[key] = [host, device, None]
+        host, device, previous = entry
+        current = tuple(round(w, 3) for _, w in shares)
+        if current != previous:
+            _fill_owner_map(host, shares)
+            entry[2] = current
+        device.copy_(host, non_blocking=True)
+        return device
+
     def record_event(self):
         """A stream marker for timing device work, or ``None`` where there is no device."""
         if self.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
@@ -765,6 +796,11 @@ class OffloadMoeCache:
         from freetoken.moe.placement import split_misses
 
         names = ["gpu", *helper_names]
+        if _FORCE_GPU_ONLY:
+            # Diagnostic: keep every executor in the wiring but give the work to this
+            # device, so a wrong answer can be attributed to the split itself rather than
+            # to what the other executors did with their share.
+            return {name: (1.0 if name == "gpu" else 0.0) for name in names}
         # The GEMM this device owes regardless of the split is time it starts the step
         # already committed to, so it is given proportionally fewer misses.
         rates = self.rate_tracker.rates(

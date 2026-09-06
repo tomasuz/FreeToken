@@ -32,7 +32,7 @@ from freetoken.moe.worker_slots import WorkerSlotCache  # noqa: E402
 
 # Flag layout in the control buffer, one int64 each. Kept adjacent so the parent can hand
 # both addresses to a single stream memop pair.
-_READY, _DONE, _STOP, _HITS, _MISSES, _LAYER = 0, 1, 2, 3, 4, 5
+_STOP, _HITS, _MISSES, _UP = 0, 1, 2, 3
 
 _DTYPES = {
     "uint8": torch.uint8,
@@ -96,6 +96,7 @@ def main() -> int:
 
     ctl = _map(_SPEC["control"])
     io = {name: _map(e) for name, e in _SPEC["io"].items()}
+    flags = {name: _map(e) for name, e in _SPEC["flags"].items()}
     # Every offloaded layer, mapped rather than copied. Mapping is address space until a
     # page is touched, so holding all of them costs nothing for the layers this worker is
     # never asked about -- and the ones it is asked about read the same pages the engine
@@ -113,22 +114,30 @@ def main() -> int:
     ggml_type = int(_SPEC["ggml_type"])
     activation = _SPEC["activation"]
     act_fn = _resolve_activation(activation, _SPEC.get("activation_backend", "auto"))
-    flags = ctl.tensor
-
     # Announce readiness only once the kernels are actually loaded: the first launch JIT
     # compiles, and a parent that started timing before that would blame the first token.
     _warm(library.cache_for(library.layers[0], device), io, device, activation, ggml_type,
           fused_experts_gguf, act_fn)
-    flags[_DONE] = -1  # "worker is up"; the parent waits for this before its first submit
+    ctl.tensor[_UP] = 1  # the parent waits for this before its first submit
 
+    ready, done = flags["ready"].tensor, flags["done"].tensor
+    slot_layer, slot_bs = flags["slot_layer"].tensor, flags["slot_bs"].tensor
+    control = ctl.tensor
     while True:
-        if flags[_STOP]:
+        if control[_STOP]:
             return 0
-        if not flags[_READY]:
+        # Scan for a raised slot rather than one doorbell word. The slot is the request:
+        # its address encodes which layer and which batch size, which is what lets the
+        # engine raise it from a captured graph -- a replay writes a fixed address and
+        # cannot write a layer id into a shared word first.
+        raised = (ready != 0).nonzero()
+        if raised.numel() == 0:
             time.sleep(0)  # yield without leaving the run queue
             continue
-        bs = int(flags[_READY])  # the batch size doubles as the doorbell; 0 means idle
-        cache = library.cache_for(int(flags[_LAYER]), device)
+        slot = int(raised[0])
+        bs = int(slot_bs[slot])
+        ready[slot] = 0
+        cache = library.cache_for(int(slot_layer[slot]), device)
         x = io["x"].tensor[:bs].to(device, non_blocking=False)
         w = io["w"].tensor[:bs].to(device, non_blocking=False)
         # The ids stay on the host for one more moment: placement is decided here, and what
@@ -145,9 +154,8 @@ def main() -> int:
             io["y"].tensor[lo:hi].copy_(out)  # cross-device copy; syncs on this stream
         torch.cuda.synchronize(device)
 
-        flags[_HITS], flags[_MISSES] = library.stats()
-        flags[_READY] = 0
-        flags[_DONE] = bs
+        control[_HITS], control[_MISSES] = library.stats()
+        done[slot] = 1  # the engine's stream is waiting on exactly this word
 
 
 def _resolve_activation(name: str, backend: str):
