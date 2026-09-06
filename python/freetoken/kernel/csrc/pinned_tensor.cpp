@@ -112,6 +112,26 @@ int64_t driver_cuda_version() {
 
 } // namespace
 
+// A device tensor naming memory the allocator never handed out.
+//
+// Registered host memory has a device address, and on this platform it is the same address
+// the CPU uses -- so an accelerator can read those pages in place, with no copy and no
+// second residency. What it does not have is a tensor: every kernel here takes one, and
+// there is no way to build one over a bare address from Python. This is that way.
+//
+// The storage is not owned. Nothing is freed when the tensor dies, because the memory
+// belongs to whoever registered it -- the caller keeps it alive for as long as the tensor
+// is used, exactly as it already does for the mapping itself.
+static torch::Tensor tensor_from_device_ptr(uintptr_t addr, std::vector<int64_t> sizes,
+                                            py::object dtype, int64_t device_index) {
+  auto scalar_type = torch::python::detail::py_object_to_dtype(std::move(dtype));
+  auto options = torch::TensorOptions()
+                     .dtype(scalar_type)
+                     .device(torch::kCUDA, (c10::DeviceIndex)device_index);
+  return torch::from_blob(reinterpret_cast<void*>(addr), sizes, [](void*) {}, options);
+}
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("create_pinned_tensor_like", &create_pinned_tensor_like,
         "Create an exact-size CPU pinned tensor with input's size/stride/dtype");
@@ -121,6 +141,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "True if the GPU dereferences pinned host memory at its host VA (UVA identity)");
   m.def("host_device_ptr", &host_device_ptr,
         "Device-visible alias of a pinned+mapped host address");
+  m.def("tensor_from_device_ptr", &tensor_from_device_ptr,
+        "A device tensor over memory this extension did not allocate",
+        py::arg("addr"), py::arg("sizes"), py::arg("dtype"), py::arg("device_index"));
   m.def("host_register", &host_register,
         "hipHostRegister an existing host range as portable+mapped");
   m.def("driver_cuda_version", &driver_cuda_version,

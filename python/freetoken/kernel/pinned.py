@@ -66,3 +66,19 @@ def device_ptr(t: torch.Tensor) -> int:
     if t.is_cuda or _host_ptr_identity():
         return t.data_ptr()
     return _load_pinned_extension().host_device_ptr(t.data_ptr())
+
+
+def tensor_from_device_ptr(addr: int, shape, dtype: torch.dtype, device_index: int):
+    """A device tensor over memory the allocator never handed out.
+
+    The point of a registered host mapping is that an accelerator can read those pages
+    where they are -- no copy, no second copy resident. Every kernel here takes a tensor
+    though, and a bare address cannot be made into one from Python, which is why a
+    registered bank has always had to be copied onto the device before it could be used.
+
+    The storage is NOT owned: nothing is freed when the tensor dies, because the memory
+    belongs to whoever registered it. Keep that alive for as long as the tensor is used.
+    """
+    return _load_pinned_extension().tensor_from_device_ptr(
+        int(addr), [int(d) for d in shape], dtype, int(device_index)
+    )
