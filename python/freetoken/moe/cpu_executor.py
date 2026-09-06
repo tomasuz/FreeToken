@@ -48,7 +48,27 @@ logger = init_logger(__name__)
 # raise_if_unhealthy) instead of an indefinite stream stall.
 # Caveat: the coordinator busy-polls one core while decode traffic flows (idle backoff
 # otherwise); FREETOKEN_CPU_MOE_FLAG_SYNC=0 opts out entirely.
-_FLAG_SYNC = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC", "1") != "0"
+def _flag_sync_default() -> bool:
+    """Whether the flag handshake is on unless asked otherwise.
+
+    Off on HIP. Not because the memory operations are missing -- they work here, and a
+    long-standing bug hid that: the resolver only ever looked for the NVIDIA driver
+    library, so on every AMD machine the probe reported "not supported" and this path was
+    dead code. Fixing the lookup turned it on for the first time, and it does not pass:
+    tests/moe/test_cpu_moe.py goes from 5 failures to 8, the three new ones being the
+    graph-replay cases this handshake exists to enable.
+
+    So the lookup stays fixed -- other callers use those operations correctly -- and this
+    particular consumer stays off where it has never been shown to work. Set
+    FREETOKEN_CPU_MOE_FLAG_SYNC=1 to opt in and find out.
+    """
+    explicit = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC")
+    if explicit is not None:
+        return explicit != "0"
+    return getattr(torch.version, "hip", None) is None
+
+
+_FLAG_SYNC = _flag_sync_default()
 # Flag slots per MoE layer: covers this many distinct decode batch sizes (captured graph
 # sizes plus any eager padded sizes); more than that is unheard of, and the overflow
 # just keeps the host-func path for the extra combos.

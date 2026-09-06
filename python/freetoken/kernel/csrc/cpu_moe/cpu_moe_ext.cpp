@@ -578,7 +578,10 @@ float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float
 // vGPU, old drivers) falls back to the hipLaunchHostFunc path.
 #if defined(_WIN32)
 #include <windows.h>
-static void* cumemop_dlopen() { return (void*)::LoadLibraryA("nvcuda.dll"); }
+static void* cumemop_dlopen(bool* is_hip) {
+  *is_hip = false;  // no HIP driver library to look for on this platform
+  return (void*)::LoadLibraryA("nvcuda.dll");
+}
 static void* cumemop_dlsym(void* h, const char* n) {
   return (void*)::GetProcAddress((HMODULE)h, n);
 }
@@ -590,33 +593,71 @@ static void* cumemop_dlsym(void* h, const char* n) {
 #ifndef CUDART_CB
 #define CUDART_CB
 #endif
-static void* cumemop_dlopen() {
-  void* h = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
-  if (h == nullptr) h = dlopen("libcuda.so", RTLD_LAZY | RTLD_LOCAL);
-  return h;
+// The driver library holding the stream memory operations, found at run time rather than
+// chosen at build time. This file is host C++ and is compiled without the accelerator
+// toolchain's macros, so a compile-time choice here is a coin toss -- and getting it wrong
+// is indistinguishable from the feature being absent: dlopen returns null, no symbol
+// resolves, and the probe reports "not supported here" on a machine that supports it
+// perfectly well. That is what happened. Only libcuda was ever opened, so on every AMD
+// machine the flag handshake silently fell back to host callbacks, and the fallback is
+// exactly what makes a captured graph impossible.
+static void* cumemop_dlopen(bool* is_hip) {
+  static const char* kHip[] = {"libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6",
+                               "libamdhip64.so.5"};
+  static const char* kCuda[] = {"libcuda.so.1", "libcuda.so"};
+  for (const char* name : kHip) {
+    if (void* h = dlopen(name, RTLD_LAZY | RTLD_LOCAL)) { *is_hip = true; return h; }
+  }
+  for (const char* name : kCuda) {
+    if (void* h = dlopen(name, RTLD_LAZY | RTLD_LOCAL)) { *is_hip = false; return h; }
+  }
+  return nullptr;
 }
 static void* cumemop_dlsym(void* h, const char* n) { return dlsym(h, n); }
 #endif
 
 using cuMemOp64_fn = int (*)(void* stream, unsigned long long addr, unsigned long long value,
                              unsigned int flags);
+// The wait takes a mask on HIP and does not on CUDA, so the two cannot share a signature.
+// Calling the five-argument one through a four-argument type leaves the mask register
+// holding whatever happened to be in it: a wait against an arbitrary mask, which may pass,
+// may hang, and does not do the same thing twice.
+using cuMemOpWait64_fn = int (*)(void* stream, unsigned long long addr,
+                                 unsigned long long value, unsigned int flags,
+                                 unsigned long long mask);
 static cuMemOp64_fn g_cu_write64 = nullptr;
-static cuMemOp64_fn g_cu_wait64 = nullptr;
+static cuMemOp64_fn g_cu_wait64 = nullptr;          // CUDA: no mask
+static cuMemOpWait64_fn g_hip_wait64 = nullptr;     // HIP: mask
 static constexpr unsigned int kCuWaitValueGeq = 0x0;   // hipStreamWaitValueGte
 static constexpr unsigned int kCuWriteDefault = 0x0;   // CU_STREAM_WRITE_VALUE_DEFAULT
+static constexpr unsigned long long kWaitNoMask = ~0ULL;  // compare the whole value
+
+static inline int ft_wait64(void* s, unsigned long long addr, unsigned long long value,
+                            unsigned int flags) {
+  if (g_hip_wait64 != nullptr) return g_hip_wait64(s, addr, value, flags, kWaitNoMask);
+  return g_cu_wait64(s, addr, value, flags);
+}
 
 static bool cumemop_resolve() {
   static bool resolved = [] {
-    void* h = cumemop_dlopen();
+    bool is_hip = false;
+    void* h = cumemop_dlopen(&is_hip);
     if (h == nullptr) return false;
-    // 11.7+ made the v2 entry points the default; older drivers export only the v1
-    // names with the same signature.
-    g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "hipStreamWriteValue64"));
+    if (is_hip) {
+      g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(
+          cumemop_dlsym(h, "hipStreamWriteValue64"));
+      g_hip_wait64 = reinterpret_cast<cuMemOpWait64_fn>(
+          cumemop_dlsym(h, "hipStreamWaitValue64"));
+      return g_cu_write64 != nullptr && g_hip_wait64 != nullptr;
+    }
+    // 11.7+ made the v2 entry points the default; older drivers export only the v1 names
+    // with the same signature.
+    g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWriteValue64_v2"));
     if (g_cu_write64 == nullptr)
-      g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "hipStreamWriteValue64"));
-    g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "hipStreamWaitValue64"));
+      g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWriteValue64"));
+    g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWaitValue64_v2"));
     if (g_cu_wait64 == nullptr)
-      g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "hipStreamWaitValue64"));
+      g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWaitValue64"));
     return g_cu_write64 != nullptr && g_cu_wait64 != nullptr;
   }();
   return resolved;
@@ -628,7 +669,7 @@ static bool cumemops_probe(uintptr_t stream, uintptr_t scratch_addr) {
   if (!cumemop_resolve()) return false;
   auto* s = reinterpret_cast<void*>(stream);
   if (g_cu_write64(s, (unsigned long long)scratch_addr, 7ULL, kCuWriteDefault) != 0) return false;
-  if (g_cu_wait64(s, (unsigned long long)scratch_addr, 7ULL, kCuWaitValueGeq) != 0) return false;
+  if (ft_wait64(s, (unsigned long long)scratch_addr, 7ULL, kCuWaitValueGeq) != 0) return false;
   return hipStreamSynchronize(reinterpret_cast<hipStream_t>(stream)) == hipSuccess;
 }
 
@@ -663,11 +704,28 @@ static void cumemop_submit(uintptr_t stream, uintptr_t done_addr, uintptr_t read
                 "hipStreamWriteValue64(ready)");
 }
 
+// An asynchronous copy issued by address, for buffers the tensor library does not know
+// are page-locked. It reports memory it did not allocate as pageable -- registering a
+// mapping with the driver does not put it in the allocator's records -- and a copy to
+// memory believed pageable is synchronous, which a stream in the middle of a graph capture
+// refuses. The pages really are locked, so the copy really can be asynchronous; this says
+// so directly rather than through a check that cannot see it.
+static void hip_memcpy_async(uintptr_t stream, uintptr_t dst, uintptr_t src,
+                             int64_t nbytes) {
+  hipError_t rc = hipMemcpyAsync(reinterpret_cast<void*>(dst),
+                                 reinterpret_cast<const void*>(src), (size_t)nbytes,
+                                 hipMemcpyDefault, reinterpret_cast<hipStream_t>(stream));
+  if (rc != hipSuccess) {
+    throw std::runtime_error(std::string("hipMemcpyAsync failed: ") +
+                             hipGetErrorString(rc));
+  }
+}
+
 static void cumemop_sync(uintptr_t stream, uintptr_t done_addr, int64_t slot) {
-  cumemop_check(g_cu_wait64(reinterpret_cast<void*>(stream),
-                            (unsigned long long)(done_addr + (size_t)slot * 8), 1ULL,
-                            kCuWaitValueGeq),
-                "hipStreamWaitValue64(done)");
+  cumemop_check(ft_wait64(reinterpret_cast<void*>(stream),
+                          (unsigned long long)(done_addr + (size_t)slot * 8), 1ULL,
+                          kCuWaitValueGeq),
+                "stream wait value(done)");
 }
 
 struct DotChoice {
@@ -2153,6 +2211,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("value"))
       .def("isa_name", &CpuMoeExecutor::isa_name);
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));
+  m.def("memcpy_async", &hip_memcpy_async, py::arg("stream"), py::arg("dst"),
+        py::arg("src"), py::arg("nbytes"));
   m.def("memop_submit", &cumemop_submit, py::arg("stream"), py::arg("done_addr"),
         py::arg("ready_addr"), py::arg("slot"));
   m.def("memop_sync", &cumemop_sync, py::arg("stream"), py::arg("done_addr"),
