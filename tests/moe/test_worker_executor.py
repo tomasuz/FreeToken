@@ -25,6 +25,32 @@ def _q4_0_bank(*shape: int, blocks: int) -> torch.Tensor:
     return buf.reshape(*shape, blocks * 18)
 
 
+
+def _catalogue(tag: str, banks: dict, num_experts: int):
+    """Publish ``banks`` as shared files and describe them the way the loader does.
+
+    A worker is handed paths, not weights -- that is what lets one worker serve any layer.
+    Building the catalogue through the real shared-bank backing keeps these tests on the
+    path the engine uses rather than on a stand-in for it.
+    """
+    from freetoken.moe.host_banks import HostBank, shared_bank_name
+    from freetoken.moe.worker_executor import SharedBankCatalogue
+
+    live = []  # the mappings must outlive this call or the files go with them
+    for name, tensor in banks.items():
+        bank = HostBank(
+            tuple(tensor.shape),
+            tensor.dtype,
+            backing="shared",
+            shared_name=shared_bank_name(tag, name, 0),
+        )
+        bank.tensor.copy_(tensor)
+        live.append(bank)
+    catalogue = SharedBankCatalogue(tag, {n: [t] for n, t in banks.items()}, num_experts)
+    catalogue._keep_alive = live
+    return catalogue
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs an accelerator")
 def test_worker_matches_in_process_compute_bitwise():
     """A worker on the same device must be bit-identical to computing here.
@@ -55,14 +81,14 @@ def test_worker_matches_in_process_compute_bitwise():
 
     with WorkerMoeExecutor(
         torch.cuda.current_device(),
-        {"gate_up": gate_up, "down": down},
+        _catalogue("bitwise", {"gate_up": gate_up, "down": down}, E),
         ggml_type=GGML_Q4_0,
         activation="silu",
         max_batch=8,
         hidden_size=H,
         top_k=top_k,
     ) as worker:
-        there = worker.decode(x, topk_w, topk_ids.clone())
+        there = worker.decode(0, x, topk_w, topk_ids.clone())
 
     torch.testing.assert_close(there, here, rtol=0, atol=0)
 
@@ -80,7 +106,7 @@ def test_worker_reports_a_failed_start_instead_of_hanging():
     with pytest.raises((RuntimeError, TimeoutError)) as excinfo:
         WorkerMoeExecutor(
             999,  # no such device: the child must fail, and say so
-            banks,
+            _catalogue("nodevice", banks, E),
             ggml_type=GGML_Q4_0,
             max_batch=4,
             hidden_size=H,
@@ -104,11 +130,11 @@ def test_worker_rejects_a_batch_it_cannot_hold():
     }
     device = torch.device("cuda")
     with WorkerMoeExecutor(
-        torch.cuda.current_device(), banks, ggml_type=GGML_Q4_0,
+        torch.cuda.current_device(), _catalogue("toobig", banks, E), ggml_type=GGML_Q4_0,
         max_batch=2, hidden_size=H, top_k=top_k,
     ) as worker:
         big = torch.randn(4, H, dtype=torch.bfloat16, device=device)
         w = torch.rand(4, top_k, dtype=torch.float32, device=device)
         ids = torch.zeros(4, top_k, dtype=torch.int32, device=device)
         with pytest.raises(AssertionError, match="max_batch"):
-            worker.decode(big, w, ids)
+            worker.decode(0, big, w, ids)

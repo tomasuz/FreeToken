@@ -192,14 +192,12 @@ class MoELayer(BaseOP):
 def _submit(executor, layer_id: int, hidden_states, topk_weights, ids):
     """Start work on an executor without waiting, whatever kind of executor it is.
 
-    The CPU pool takes a layer id (one pool serves every layer); a worker process is bound
-    to one layer already and does not. Papering over that here keeps the split loop free of
-    a branch per executor kind, which is what lets a new kind be added without touching it.
+    Every executor now takes the layer id: one CPU pool and one worker per device each
+    serve all of them, so the identity of the layer is part of the request rather than of
+    the executor. That is what lets the placement move a layer's work between devices from
+    one step to the next.
     """
-    try:
-        return executor.decode_submit(layer_id, hidden_states, topk_weights, ids)
-    except TypeError:
-        return executor.decode_submit(hidden_states, topk_weights, ids)
+    return executor.decode_submit(layer_id, hidden_states, topk_weights, ids)
 
 
 def _sync(executor, handle):
@@ -468,18 +466,11 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
-        if cache.is_resident_layer(self.layer_id) or cache.is_worker_layer(self.layer_id):
+        if cache.is_resident_layer(self.layer_id):
             if self.layer_id == 0:
                 # begin_prefill normally rides on _wait_prefill_overlap's layer-0 call; a
                 # layer 0 that skips the movement path never gets there, so open it here.
                 cache.begin_prefill()
-            if cache.is_worker_layer(self.layer_id):
-                # The worker takes prefill on the same call as decode -- it is one grouped
-                # GEMV over however many rows arrive, and its buffers are sized for the
-                # engine's largest batch.
-                return cache.worker_executors[self.layer_id].decode(
-                    hidden_states, topk_weights, topk_ids
-                )
             return self._resident_expert_gemm(cache, hidden_states, topk_weights, topk_ids,
                                               is_prefill=True)
         if cache.prefill_overlap:

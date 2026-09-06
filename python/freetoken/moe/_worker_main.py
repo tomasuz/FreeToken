@@ -32,7 +32,7 @@ from freetoken.moe.worker_slots import WorkerSlotCache  # noqa: E402
 
 # Flag layout in the control buffer, one int64 each. Kept adjacent so the parent can hand
 # both addresses to a single stream memop pair.
-_READY, _DONE, _STOP, _HITS, _MISSES = 0, 1, 2, 3, 4
+_READY, _DONE, _STOP, _HITS, _MISSES, _LAYER = 0, 1, 2, 3, 4, 5
 
 _DTYPES = {
     "uint8": torch.uint8,
@@ -48,13 +48,59 @@ def _map(entry: dict):
     return open_shared(entry["path"], tuple(entry["shape"]), _DTYPES[entry["dtype"]])
 
 
+
+class _BankLibrary:
+    """Every layer this worker can serve, mapped lazily, with a slot cache each.
+
+    Mapping all of them up front would be wasteful only in address space, but opening
+    files this process may never read is still work, so a layer arrives the first time it
+    is asked for. Its cache arrives with it: a layer nothing routes to costs nothing on
+    this device, which is what lets the engine offer this worker every layer and decide per
+    step rather than at start-up.
+    """
+
+    def __init__(self, spec: dict, slots: int) -> None:
+        self._spec = spec
+        self._slots = slots
+        self._maps: dict[int, dict] = {}
+        self._caches: dict[int, WorkerSlotCache] = {}
+        any_name = next(iter(spec))
+        self.layers = sorted(int(k) for k in spec[any_name]["paths"])
+
+    def cache_for(self, layer_id: int, device) -> WorkerSlotCache:
+        cache = self._caches.get(layer_id)
+        if cache is not None:
+            return cache
+        tensors = {}
+        for name, entry in self._spec.items():
+            path = entry["paths"][str(layer_id)]
+            tensors[name] = open_shared(
+                path, tuple(entry["shape"]), _DTYPES[entry["dtype"]]
+            ).tensor
+        self._maps[layer_id] = tensors
+        cache = WorkerSlotCache(
+            tensors, slots=self._slots or tensors[next(iter(tensors))].shape[0], device=device
+        )
+        self._caches[layer_id] = cache
+        return cache
+
+    def stats(self) -> tuple[int, int]:
+        hits = sum(c.hits for c in self._caches.values())
+        misses = sum(c.misses for c in self._caches.values())
+        return hits, misses
+
+
 def main() -> int:
     device = torch.device("cuda", 0)  # the spec restricted visibility, so ours is index 0
     torch.cuda.set_device(device)
 
     ctl = _map(_SPEC["control"])
-    banks = {name: _map(e) for name, e in _SPEC["banks"].items()}
     io = {name: _map(e) for name, e in _SPEC["io"].items()}
+    # Every offloaded layer, mapped rather than copied. Mapping is address space until a
+    # page is touched, so holding all of them costs nothing for the layers this worker is
+    # never asked about -- and the ones it is asked about read the same pages the engine
+    # holds rather than a second copy of them.
+    library = _BankLibrary(_SPEC["banks"], int(_SPEC.get("slots") or 0))
 
     # The bank mappings are deliberately NOT registered with the runtime. Registering a
     # shared mapping that another process also holds is not something the runtime promises
@@ -69,19 +115,10 @@ def main() -> int:
     act_fn = _resolve_activation(activation, _SPEC.get("activation_backend", "auto"))
     flags = ctl.tensor
 
-    # Experts reach this device through a slot cache filled from the shared host bank, the
-    # same arrangement the engine's own device uses -- so a worker layer is subject to the
-    # same economics as every other layer instead of being a static assignment decided at
-    # startup. With slots equal to the expert count the cache never evicts and this is
-    # simply a residency plan, filled lazily rather than in one copy at startup.
-    cache = WorkerSlotCache(
-        {name: buf.tensor for name, buf in banks.items()},
-        slots=int(_SPEC.get("slots") or banks["gate_up"].tensor.shape[0]),
-        device=device,
-    )
     # Announce readiness only once the kernels are actually loaded: the first launch JIT
     # compiles, and a parent that started timing before that would blame the first token.
-    _warm(cache, io, device, activation, ggml_type, fused_experts_gguf, act_fn)
+    _warm(library.cache_for(library.layers[0], device), io, device, activation, ggml_type,
+          fused_experts_gguf, act_fn)
     flags[_DONE] = -1  # "worker is up"; the parent waits for this before its first submit
 
     while True:
@@ -91,6 +128,7 @@ def main() -> int:
             time.sleep(0)  # yield without leaving the run queue
             continue
         bs = int(flags[_READY])  # the batch size doubles as the doorbell; 0 means idle
+        cache = library.cache_for(int(flags[_LAYER]), device)
         x = io["x"].tensor[:bs].to(device, non_blocking=False)
         w = io["w"].tensor[:bs].to(device, non_blocking=False)
         # The ids stay on the host for one more moment: placement is decided here, and what
@@ -107,7 +145,7 @@ def main() -> int:
             io["y"].tensor[lo:hi].copy_(out)  # cross-device copy; syncs on this stream
         torch.cuda.synchronize(device)
 
-        flags[_HITS], flags[_MISSES] = cache.stats()
+        flags[_HITS], flags[_MISSES] = library.stats()
         flags[_READY] = 0
         flags[_DONE] = bs
 

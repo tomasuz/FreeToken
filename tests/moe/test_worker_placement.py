@@ -100,13 +100,18 @@ def test_a_worker_layer_is_shared_with_this_device_not_surrendered_to_the_worker
     assert not cache._skips_movement(1), "a worker layer's bank is still there to read"
 
 
-def test_a_worker_layer_is_still_kept_out_of_the_prefill_stream():
-    """Prefill is answered by the worker in one call, so streaming it fills a buffer
-    nobody releases -- which the overlap machinery asserts on."""
+def test_a_worker_layer_is_streamed_at_prefill_like_any_other():
+    """A worker takes a share of decode, not ownership, so prefill streams as it always did.
+
+    While a worker owned its layer outright, prefill for it was answered by the worker and
+    streaming it here would have filled a double buffer nobody released. Now the layer
+    belongs to no one in particular and prefill goes the ordinary way; only a resident
+    layer, whose bank was released, has nothing to stream.
+    """
     cache = _cache()
     cache.set_worker_executors({1: object()})
 
-    assert cache._skips_prefill_stream(1)
+    assert not cache._skips_prefill_stream(1)
     assert not cache._skips_prefill_stream(0)
 
 
@@ -124,17 +129,32 @@ def test_a_worker_layers_bank_is_validated_like_any_other():
         cache.set_bank_sources(sources)
 
 
-def test_a_layer_cannot_be_owned_twice():
+def test_a_layer_cannot_be_both_worker_served_and_cpu_decoded():
     cache = _cache()
     cache.cpu_layer_ids = frozenset({1})
+
     with pytest.raises(AssertionError, match="worker and CPU decode"):
         cache.set_worker_executors({1: object()})
 
-    cache2 = _cache()
-    resident = {n: {2: torch.zeros(8, 32, dtype=torch.uint8)} for n in ("gate_up", "down")}
-    cache2.set_resident_banks(resident, frozenset({2}))
-    with pytest.raises(AssertionError, match="worker-served and VRAM-resident"):
-        cache2.set_worker_executors({2: object()})
+
+def test_a_worker_is_only_offered_layers_it_can_actually_reach():
+    """A resident layer's bank was released, so no worker can have a file for it.
+
+    This used to be forbidden with an assertion. It cannot arise now -- the catalogue lists
+    a layer only if its shared bank exists -- so the check that matters is that a worker
+    which says it cannot serve a layer is not offered it.
+    """
+    class _Worker:
+        device_index = 1
+
+        def serves(self, layer_id):
+            return layer_id != 2  # 2 is resident: no shared bank to map
+
+    cache = _cache()
+    cache.set_worker_executors({1: _Worker(), 2: _Worker()})
+
+    assert "worker1" in cache.split_helpers(1)
+    assert cache.split_helpers(2) == {}
 
 
 def test_worker_layers_suppress_cuda_graph_capture():

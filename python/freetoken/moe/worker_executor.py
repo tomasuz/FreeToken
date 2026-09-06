@@ -39,8 +39,8 @@ from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
 
-_READY, _DONE, _STOP, _HITS, _MISSES = 0, 1, 2, 3, 4
-_CTL_SLOTS = 5
+_READY, _DONE, _STOP, _HITS, _MISSES, _LAYER = 0, 1, 2, 3, 4, 5
+_CTL_SLOTS = 6
 
 # A cold worker pays process start, torch import, and a JIT compile of the expert kernel
 # for its architecture. The compile is the long pole and happens once per machine.
@@ -59,6 +59,63 @@ _DTYPE_NAMES = {
 
 def _visibility_var() -> str:
     return "HIP_VISIBLE_DEVICES" if getattr(torch.version, "hip", None) else "CUDA_VISIBLE_DEVICES"
+
+
+class SharedBankCatalogue:
+    """Where every offloaded layer's expert weights live, by name and layer.
+
+    A worker used to be handed a copy of one layer, which is why it could only ever serve
+    that layer: it had no way to reach any other. The banks are named files now, so what a
+    worker needs is not weights but paths -- it maps the same pages the engine already
+    holds, for as many layers as it is asked about, and nothing is duplicated.
+
+    Paths are derived from the tag the loader shared its banks under rather than carried
+    out of the loader, because the names are deterministic and the objects are not: the
+    loader hands back tensors, and threading bank handles through it to reach a filename
+    would be a worse coupling than recomputing the filename.
+
+    A layer whose file is absent is simply not listed. That is the resident case -- its
+    bank was uploaded to VRAM and released -- and such a layer never misses, so there is
+    nothing for a worker to serve.
+    """
+
+    def __init__(
+        self,
+        tag: str,
+        sources: dict[str, list[torch.Tensor]],
+        num_experts: int,
+    ) -> None:
+        from freetoken.moe.host_banks import shared_bank_name
+
+        self.num_experts = num_experts
+        self._paths: dict[str, dict[int, str]] = {}
+        self._shapes: dict[str, list[int]] = {}
+        self._dtypes: dict[str, str] = {}
+        from freetoken.moe.shared_host import shm_dir
+
+        for name, per_layer in sources.items():
+            found = {}
+            for layer_id, tensor in enumerate(per_layer):
+                path = os.path.join(shm_dir(), shared_bank_name(tag, name, layer_id))
+                if os.path.exists(path):
+                    found[layer_id] = path
+            self._paths[name] = found
+            self._shapes[name] = list(per_layer[0].shape)
+            self._dtypes[name] = _DTYPE_NAMES[per_layer[0].dtype]
+        names = list(self._paths)
+        self.layers = sorted(
+            set.intersection(*(set(self._paths[n]) for n in names)) if names else set()
+        )
+
+    def spec(self) -> dict:
+        return {
+            name: {
+                "paths": {str(layer): self._paths[name][layer] for layer in self.layers},
+                "shape": self._shapes[name],
+                "dtype": self._dtypes[name],
+            }
+            for name in self._paths
+        }
 
 
 class WorkerMoeExecutor:
@@ -95,45 +152,34 @@ class WorkerMoeExecutor:
         self._log = None
         self._log_path = ""
 
-        gate_up = banks["gate_up"]
-        down = banks["down"]
-        h = hidden_size if hidden_size is not None else down.shape[1]
+        h = hidden_size
         k = top_k if top_k is not None else 1
         tag = uuid.uuid4().hex[:12]
 
-        def share(name: str, src: torch.Tensor | None, shape, dtype):
+        def share(name: str, shape, dtype):
             buf = create_shared(f"freetoken-{tag}-{name}", tuple(shape), dtype)
-            if src is not None:
-                buf.tensor.copy_(src)
             self._bufs.append(buf)
             return buf
 
-        self._ctl = share("ctl", None, (_CTL_SLOTS,), torch.int64)
+        self._ctl = share("ctl", (_CTL_SLOTS,), torch.int64)
         self._ctl.tensor.zero_()
-        bank_bufs = {
-            "gate_up": share("gate_up", gate_up, gate_up.shape, gate_up.dtype),
-            "down": share("down", down, down.shape, down.dtype),
-        }
         self._io = {
-            "x": share("x", None, (max_batch, h), torch.bfloat16),
-            "ids": share("ids", None, (max_batch, k), torch.int32),
-            "w": share("w", None, (max_batch, k), torch.float32),
-            "y": share("y", None, (max_batch, h), torch.bfloat16),
+            "x": share("x", (max_batch, h), torch.bfloat16),
+            "ids": share("ids", (max_batch, k), torch.int32),
+            "w": share("w", (max_batch, k), torch.float32),
+            "y": share("y", (max_batch, h), torch.bfloat16),
         }
-        num_experts = gate_up.shape[0]
+        num_experts = banks.num_experts
+        self.layers = sorted(banks.layers)
         # One token's experts are read by a single launch, so top_k is the floor. A wider
         # step is split into several launches by the worker's cache, which is what keeps
-        # this a memory choice rather than a cap on batch width. Unset holds the whole
-        # layer, which is what this did before there was a cache at all.
+        # this a memory choice rather than a cap on batch width. Unset holds a layer's whole
+        # expert count, which never evicts.
         self.slots = min(num_experts, max(k, int(slots or num_experts)))
-        # Not registered while the handoff is a plain copy: the pages are shared with a
-        # process driving a different device, and registering them here would be an
-        # optimisation whose only beneficiary is a stream-async copy this cut does not do.
-        # The stream-memop handshake will need it and can add it deliberately.
 
         spec = {
             "control": self._entry(self._ctl),
-            "banks": {n: self._entry(b) for n, b in bank_bufs.items()},
+            "banks": banks.spec(),
             "io": {n: self._entry(b) for n, b in self._io.items()},
             "slots": self.slots,
             "ggml_type": int(ggml_type),
@@ -259,6 +305,7 @@ class WorkerMoeExecutor:
 
     def decode(
         self,
+        layer_id: int,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
@@ -273,11 +320,12 @@ class WorkerMoeExecutor:
         assert bs <= self._io["x"].tensor.shape[0], (
             f"batch {bs} exceeds the worker's max_batch {self._io['x'].tensor.shape[0]}"
         )
-        pending = self.decode_submit(hidden_states, topk_weights, topk_ids)
+        pending = self.decode_submit(layer_id, hidden_states, topk_weights, topk_ids)
         return self.decode_sync(pending)
 
     def decode_submit(
         self,
+        layer_id: int,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
@@ -299,6 +347,7 @@ class WorkerMoeExecutor:
         self._io["w"].tensor[:bs].copy_(topk_weights.to(torch.float32))
 
         flags = self._ctl.tensor
+        flags[_LAYER] = int(layer_id)  # written before the doorbell it is read behind
         flags[_DONE] = 0
         flags[_READY] = bs  # doorbell
         return (bs, hidden_states.device)
@@ -308,6 +357,10 @@ class WorkerMoeExecutor:
         bs, device = pending
         self._await_flag(_DONE, bs, _STEP_TIMEOUT_S, "decode")
         return self._io["y"].tensor[:bs].to(device)
+
+    def serves(self, layer_id: int) -> bool:
+        """Whether this worker can reach ``layer_id``'s weights at all."""
+        return layer_id in self.layers
 
     def slot_stats(self) -> dict:
         """Hits and misses the worker's slot cache has seen, for the parent to report.

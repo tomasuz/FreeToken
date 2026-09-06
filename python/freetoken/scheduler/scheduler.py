@@ -147,6 +147,37 @@ class Scheduler(SchedulerIOMixin):
         self._log_moe_layer_stats()
         self.cache_manager.check_integrity()
 
+    def _log_executor_rates(self, cache) -> None:
+        """What each executor has been measured at, and the division it produces."""
+        tracker = getattr(cache, "rate_tracker", None)
+        if tracker is not None and tracker.describe():
+            logger.info_rank0(f"moe executor rates: {tracker.describe()}")
+            # Show the division those rates produce, since the rates alone do not say what
+            # the engine did with them.
+            for layer_id in sorted(getattr(cache, "worker_layer_ids", ()) or ()):
+                helpers = list(cache.split_helpers(layer_id))
+                if helpers:
+                    shares = cache.split_shares(layer_id, helpers)
+                    text = ", ".join(f"{n}={v * 100:.0f}%" for n, v in sorted(shares.items()))
+                    logger.info_rank0(f"moe split for layer {layer_id}: {text}")
+                    break  # one example is enough; the rates are shared across layers
+        # One worker now answers for every layer it can reach, so report it once per
+        # device rather than once per layer pointing at the same object.
+        seen = set()
+        for executor in getattr(cache, "worker_executors", {}).values():
+            stats = getattr(executor, "slot_stats", None)
+            if stats is None or id(executor) in seen:
+                continue
+            seen.add(id(executor))
+            st = stats()
+            if st["hits"] + st["misses"] == 0:
+                continue
+            logger.info_rank0(
+                f"moe worker on device {executor.device_index}: {st['slots']} slots per "
+                f"layer, hit rate {st['hit_rate'] * 100:.1f}% "
+                f"({st['hits']} hits, {st['misses']} misses, cumulative)"
+            )
+
     def _log_moe_layer_stats(self) -> None:
         """Dump the per-layer decode miss profile under --moe-collect-stats, then reset.
 
@@ -169,6 +200,7 @@ class Scheduler(SchedulerIOMixin):
         except Exception as exc:  # diagnostics must never take the scheduler down
             logger.info_rank0(f"moe layer stats unavailable: {exc}")
             return
+        self._log_executor_rates(cache)
         if not overall.get("layer_calls"):
             return  # nothing decoded since the last dump
         logger.info_rank0(
@@ -193,30 +225,6 @@ class Scheduler(SchedulerIOMixin):
             routing = cache.decode_routing_stats()
         except Exception:
             routing = {}
-        tracker = getattr(cache, "rate_tracker", None)
-        if tracker is not None and tracker.describe():
-            logger.info_rank0(f"moe executor rates: {tracker.describe()}")
-            # Show the division those rates produce, since the rates alone do not say what
-            # the engine did with them.
-            for layer_id in sorted(getattr(cache, "worker_layer_ids", ()) or ()):
-                helpers = list(cache.split_helpers(layer_id))
-                if helpers:
-                    shares = cache.split_shares(layer_id, helpers)
-                    text = ", ".join(f"{n}={v * 100:.0f}%" for n, v in sorted(shares.items()))
-                    logger.info_rank0(f"moe split for layer {layer_id}: {text}")
-                    break  # one example is enough; the rates are shared across layers
-        for layer_id, executor in sorted(getattr(cache, "worker_executors", {}).items()):
-            stats = getattr(executor, "slot_stats", None)
-            if stats is None:
-                continue
-            st = stats()
-            if st["hits"] + st["misses"] == 0:
-                continue
-            logger.info_rank0(
-                f"moe worker layer {layer_id}: {st['slots']} slots, "
-                f"hit rate {st['hit_rate'] * 100:.1f}% "
-                f"({st['hits']} hits, {st['misses']} misses, cumulative)"
-            )
         if routing:
             # oracle_hit is the ceiling any policy could reach on the observed routing, so
             # it separates "the cache is badly run" from "this model is not cacheable".

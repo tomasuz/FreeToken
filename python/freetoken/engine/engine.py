@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+import uuid
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -685,17 +686,27 @@ class Engine:
                     else HostResidency.PINNED.value
                     for i in range(config.model_config.num_moe_layers)
                 ]
-            banks = load_expert_banks(
-                config.model_path,
-                config.model_config,
-                device=self.device,
-                dtype=self.dtype,
-                dummy=config.use_dummy_weight,
-                parallel=expert_parallel,
-                decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
-                layer_residency=requested_residency,
-                resident_layers=resident_layer_ids,
+            # Banks become named, shareable files when a worker on another device may be
+            # asked to serve a layer -- which, now that the placement decides per step, is
+            # any offloaded layer. Without workers they stay private, which costs nothing
+            # and leaves nothing in a tmpfs for anyone to open.
+            from freetoken.moe.host_banks import shared_banks
+
+            self._shared_bank_tag = (
+                f"{os.getpid()}-{uuid.uuid4().hex[:8]}" if worker_layers else None
             )
+            with shared_banks(self._shared_bank_tag):
+                banks = load_expert_banks(
+                    config.model_path,
+                    config.model_config,
+                    device=self.device,
+                    dtype=self.dtype,
+                    dummy=config.use_dummy_weight,
+                    parallel=expert_parallel,
+                    decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
+                    layer_residency=requested_residency,
+                    resident_layers=resident_layer_ids,
+                )
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
                 object.__setattr__(config, "moe_cache_size", size)
@@ -838,45 +849,49 @@ class Engine:
         max_batch = max(1, int(config.max_extend_tokens or 1))
         model_config = config.model_config
         slots = _parse_worker_slots(config.moe_worker_slots, sorted(worker_layers))
+        from freetoken.moe.worker_executor import SharedBankCatalogue
+
+        # One worker per device, offered every layer whose bank it can reach -- not one per
+        # layer owning that layer. Which layers it actually computes is decided per step by
+        # the placement, from measured throughput; --moe-worker-layers now says which
+        # devices to bring, and its layer spec only bounds what they may be offered.
+        catalogue = SharedBankCatalogue(
+            self._shared_bank_tag,
+            {name: banks.sources[name] for name in cache.bank_schema},
+            model_config.num_experts,
+        )
         executors: dict[int, object] = {}
         for device, layer_ids in worker_layers.items():
-            for layer_id in sorted(layer_ids):
-                layer_banks = {
-                    name: banks.sources[name][layer_id] for name in cache.bank_schema
-                }
-                executors[layer_id] = WorkerMoeExecutor(
-                    device,
-                    layer_banks,
-                    ggml_type=GGUF_EXPERT_FORMATS[cache.quant_format],
-                    activation=getattr(model_config, "hidden_act", "silu"),
-                    max_batch=max_batch,
-                    hidden_size=model_config.hidden_size,
-                    top_k=model_config.num_experts_per_tok,
-                    env=envs.get(device, {}),
-                    slots=slots.get(device),
-                )
-        held = sum(
-            banks.sources[name][layer_id].numel() * banks.sources[name][layer_id].element_size()
-            for layer_id in executors
-            for name in cache.bank_schema
-        )
+            worker = WorkerMoeExecutor(
+                device,
+                catalogue,
+                ggml_type=GGUF_EXPERT_FORMATS[cache.quant_format],
+                activation=getattr(model_config, "hidden_act", "silu"),
+                max_batch=max_batch,
+                hidden_size=model_config.hidden_size,
+                top_k=model_config.num_experts_per_tok,
+                env=envs.get(device, {}),
+                slots=slots.get(device),
+            )
+            for layer_id in catalogue.layers:
+                executors[layer_id] = worker
         logger.info_rank0(
-            f"--moe-worker-layers: {len(executors)} layers served by workers on devices "
-            f"{sorted(worker_layers)}; {held / 2**30:.2f} GiB still held twice (host bank "
-            f"not yet released -- see _init_worker_executors)"
+            f"--moe-worker-layers: devices {sorted(worker_layers)} can serve any of "
+            f"{len(catalogue.layers)} offloaded layers, reading the engine's own banks -- "
+            f"nothing is held twice, and which layers they actually compute is decided per "
+            f"step from measured throughput"
         )
-        for device, layer_ids in sorted(worker_layers.items()):
-            any_layer = sorted(layer_ids)[0]
-            ex = executors[any_layer]
-            n_slots, n_experts = ex.slots, model_config.num_experts
+        for device in sorted(worker_layers):
+            worker = next(w for w in executors.values() if w.device_index == device)
+            n_slots, n_experts = worker.slots, model_config.num_experts
             how = (
                 "holds every expert, so it never evicts"
                 if n_slots >= n_experts
-                else f"fills on demand from the host bank, evicting least-recently-used"
+                else "fills on demand from the shared host bank, evicting least-recently-used"
             )
             logger.info_rank0(
                 f"--moe-worker-slots: device {device} keeps {n_slots}/{n_experts} experts "
-                f"per layer on device and {how}"
+                f"per layer and {how}"
             )
         return executors
 

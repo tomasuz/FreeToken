@@ -17,6 +17,7 @@ The mmaps are held for the process lifetime (the banks live as long as the offlo
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import ctypes
 import math
@@ -120,6 +121,55 @@ def _open_spill_file(size: int):
     return f
 
 
+
+_SHARED_PATHS: list[str] = []
+
+
+def _unlink_shared_banks() -> None:
+    """Remove the named bank files this process created.
+
+    They cannot be unlinked at creation the way the spill file is -- a peer opens them by
+    name, so the name has to outlive the call. Registered at exit instead, and best-effort:
+    a crashed process leaving files in a tmpfs is untidy, not dangerous, and they go with
+    the next reboot.
+    """
+    while _SHARED_PATHS:
+        try:
+            os.unlink(_SHARED_PATHS.pop())
+        except OSError:
+            pass
+
+
+atexit.register(_unlink_shared_banks)
+
+
+def _shared_path(name: str | None) -> str:
+    """Where a named, shareable bank lives. Same directory the worker buffers use."""
+    from freetoken.moe.shared_host import shm_dir
+
+    assert name, "a shared bank needs a name for its peers to open"
+    return os.path.join(shm_dir(), name)
+
+
+def _open_shared_file(name: str | None, size: int):
+    """A sparse, named file another process can open by path.
+
+    Unlike the spill file this is NOT unlinked at creation: the name is the whole point,
+    since a peer has nothing else to find it by. It is removed when the bank is dropped.
+    """
+    path = _shared_path(name)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    f = os.fdopen(fd, "r+b")
+    try:
+        os.ftruncate(f.fileno(), size)  # sparse: no blocks until written
+    except OSError:
+        f.close()
+        os.unlink(path)
+        raise
+    _SHARED_PATHS.append(path)
+    return f
+
+
 def _punch_hole(fd: int, size: int) -> None:
     """Best-effort ``fallocate(FALLOC_FL_PUNCH_HOLE)`` over the whole spill file.
 
@@ -155,13 +205,15 @@ class HostBank:
 
     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC`` / ``FREETOKEN_BANK_SPILL_DIR``."""
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_spill")
+    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_spill",
+                 "shared_path")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
-                 *, backing: str | None = None):
+                 *, backing: str | None = None, shared_name: str | None = None):
         if backing is None:
             backing = bank_backing_default()
-        assert backing in ("mmap", "cuda", "file"), backing
+        assert backing in ("mmap", "cuda", "file", "shared"), backing
+        self.shared_path = None  # set only by the shared backing
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
         asize = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
@@ -178,6 +230,24 @@ class HostBank:
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
             self._spill = None
+        elif backing == "shared":
+            # Named, file-backed and shared, so another process can map the same pages
+            # instead of being handed a copy of them. That is what lets an executor on a
+            # second device serve a layer it was not given at start-up -- and with the
+            # pages shared rather than duplicated, serving every layer costs the worker
+            # address space rather than memory.
+            #
+            # Shared mappings were the cause of a silent leak once: an anonymous one is
+            # tmpfs-backed, its pages count as Shmem, and MADV_DONTNEED does not return
+            # them, so release() freed nothing. A named file has the answer the anonymous
+            # one lacked -- punching a hole drops the blocks for real -- which is why this
+            # is a file rather than MAP_SHARED|MAP_ANONYMOUS.
+            self._spill = _open_shared_file(shared_name, asize)
+            self._buf = mmap.mmap(self._spill.fileno(), asize)
+            _LIVE_BUFFERS.append(self._buf)
+            self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
+            self._pinned = False
+            self.shared_path = _shared_path(shared_name)
         elif backing == "file":
             # Sparse spill file, unlinked immediately: the mapping keeps it alive, so it
             # never outlives the process and no cleanup path can leak it. Pages are still
@@ -329,7 +399,9 @@ def _layer_backing(layer_id: int) -> str | None:
     """
     uploader = _resident_uploader
     if uploader is not None and uploader.claims(layer_id):
-        return "mmap"
+        return "mmap"  # staging only: uploaded and released, never shared with anyone
+    if _shared_bank_tag is not None:
+        return "shared"  # another process may be asked to serve this layer
     plan = _requested_residency
     if plan is None:
         return "mmap"  # no plan means every layer pins (see pin_banks) -> unevictable
@@ -338,6 +410,43 @@ def _layer_backing(layer_id: int) -> str | None:
     if plan.labels[layer_id] != HostResidency.PAGEABLE.value:
         return "mmap"
     return None  # PAGEABLE: take the ambient default, i.e. spill when a dir is configured
+
+
+
+def _check_shared_capacity(specs: dict, num_layers: int) -> None:
+    """Refuse up front if the shared directory cannot hold the banks about to go in it.
+
+    A shared bank is a sparse file: it is created instantly and costs nothing until its
+    pages are written, so a directory too small to hold it gives no error at allocation.
+    The failure arrives later, on the write, as SIGBUS -- the process dies during load with
+    no message and no traceback, which is exactly what happened the first time this ran.
+    Checking here turns that into a sentence naming the shortfall and the way out.
+    """
+    from freetoken.moe.shared_host import shm_dir
+
+    per_layer = sum(
+        math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        for shape, dtype in specs.values()
+    )
+    needed = per_layer * num_layers  # only the layers that will actually be shared
+    d = shm_dir()
+    try:
+        stat = os.statvfs(d)
+    except OSError:
+        return  # cannot tell; let the allocation itself be the judge
+    free = stat.f_bavail * stat.f_frsize
+    if needed <= free:
+        return
+    raise RuntimeError(
+        f"shared expert banks need {needed / 2**30:.2f} GiB but {d} has "
+        f"{free / 2**30:.2f} GiB free. They are shared so an executor in another process "
+        f"can read the engine's own banks rather than a copy. Either give that directory "
+        f"more room (it is usually a tmpfs sized at half of RAM: "
+        f"mount -o remount,size=... {d}), point FREETOKEN_SHM_DIR at somewhere larger, "
+        f"make more layers resident so fewer banks stay on the host "
+        f"(--moe-resident-layers), or drop --moe-worker-layers, which is what makes the "
+        f"banks shared in the first place."
+    )
 
 
 def alloc_layer_banks(
@@ -349,6 +458,9 @@ def alloc_layer_banks(
 
     Backing is decided per layer (see :func:`_layer_backing`), so a spill dir only reaches
     the layers that can actually benefit from it."""
+    shared_layers = [l for l in range(num_layers) if _layer_backing(l) == "shared"]
+    if shared_layers:
+        _check_shared_capacity(specs, len(shared_layers))
     if bank_spill_dir() is not None:
         spilled = [l for l in range(num_layers) if _layer_backing(l) is None]
         if not spilled:
@@ -360,7 +472,15 @@ def alloc_layer_banks(
             logger.info_rank0(f"--moe-bank-spill-dir: spilling {len(spilled)} pageable layers")
     return {
         name: [
-            HostBank(shape, dtype, backing=_layer_backing(layer_id))
+            HostBank(
+                shape,
+                dtype,
+                backing=_layer_backing(layer_id),
+                shared_name=(
+                    shared_bank_name(_shared_bank_tag, name, layer_id)
+                    if _layer_backing(layer_id) == "shared" else None
+                ),
+            )
             for layer_id in range(num_layers)
         ]
         for name, (shape, dtype) in specs.items()
@@ -391,6 +511,28 @@ class _ResidencyPlan:
 
 
 _requested_residency: _ResidencyPlan | None = None
+
+# Ambient tag for shareable banks. Set when the engine has executors in other processes:
+# their banks are named files so those processes can map the same pages instead of being
+# handed copies. Unset -- the ordinary single-process case -- leaves banks private, which
+# costs nothing and cannot be opened by anyone.
+_shared_bank_tag: str | None = None
+
+
+@contextlib.contextmanager
+def shared_banks(tag: str | None):
+    """Make this load's offloaded banks shareable under ``tag``, or leave them private."""
+    global _shared_bank_tag
+    prev, _shared_bank_tag = _shared_bank_tag, tag
+    try:
+        yield tag
+    finally:
+        _shared_bank_tag = prev
+
+
+def shared_bank_name(tag: str, name: str, layer_id: int) -> str:
+    """The file name a peer opens to map ``name``'s bank for ``layer_id``."""
+    return f"freetoken-bank-{tag}-{name}-L{layer_id}"
 
 # Ambient resident-expert uploader for the enclosed bank load, installed by
 # ``load_expert_banks``. Same trick as ``_requested_residency``: the settle points consult
@@ -688,6 +830,8 @@ __all__ = [
     "PinPipeline",
     "alloc_banks",
     "alloc_layer_banks",
+    "shared_bank_name",
+    "shared_banks",
     "born_pinned_default",
     "pin_banks",
     "read_file_into",

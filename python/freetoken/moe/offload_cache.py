@@ -286,6 +286,7 @@ class OffloadMoeCache:
 
         self.rate_tracker = RateTracker()
         self._gpu_busy_seconds = 0.0
+        self._hybrid_ensure_ran = False
         self._pending_timings: list = []
         self._fetched_staging: list = []
         self._timing_slot = 0
@@ -650,10 +651,9 @@ class OffloadMoeCache:
         assert not overlap, (
             f"layers {sorted(overlap)} are assigned to both a worker and CPU decode"
         )
-        overlap = frozenset(executors) & self.resident_layer_ids
-        assert not overlap, (
-            f"layers {sorted(overlap)} are both worker-served and VRAM-resident"
-        )
+        # No resident check: a resident layer's bank was released, so it has no shared file
+        # and a worker cannot list it. The catalogue drops those layers rather than this
+        # having to forbid them.
         self.worker_executors = dict(executors)
         self.worker_layer_ids = frozenset(executors)
 
@@ -694,7 +694,7 @@ class OffloadMoeCache:
         if self.decode_target == "hybrid" and self.cpu_executor is not None:
             helpers["cpu"] = self.cpu_executor
         worker = self.worker_executors.get(layer_id)
-        if worker is not None:
+        if worker is not None and worker.serves(layer_id):
             helpers[f"worker{getattr(worker, 'device_index', '?')}"] = worker
         return helpers
 
@@ -787,12 +787,11 @@ class OffloadMoeCache:
     def _skips_prefill_stream(self, layer_id: int) -> bool:
         """Layers the prefill double buffer must not stream.
 
-        Wider than :meth:`_skips_movement`, and for a different reason. A resident layer
-        has nothing to stream; a worker layer has something, but prefill for it is answered
-        by the worker in one grouped call, so streaming it here would fill a buffer nobody
-        releases -- and the overlap machinery asserts on exactly that.
+        Only resident layers: their bank was uploaded and released, so there is nothing to
+        stream. A layer a worker can serve is streamed like any other -- the worker takes a
+        share of decode, not ownership of the layer, and prefill goes the ordinary way.
         """
-        return layer_id in self.resident_layer_ids or layer_id in self.worker_layer_ids
+        return layer_id in self.resident_layer_ids
 
     def resident_views(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """This layer's VRAM expert banks in registration order; row == expert id."""
@@ -1106,6 +1105,7 @@ class OffloadMoeCache:
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
+        self._hybrid_ensure_ran = True
         ensure_experts_hybrid(
             self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
         )
@@ -1162,8 +1162,18 @@ class OffloadMoeCache:
         self.stat_active_layer[layer_id] += active
         self.stat_steps_layer[layer_id] += 1
 
+    def _counted_by_hybrid_kernel(self) -> bool:
+        """Which set of counters holds this run's numbers.
+
+        The capped-fetch kernel writes its own, and it now runs on any layer whose misses
+        are shared with another executor -- which is decided per layer, not by the backend
+        name. Reading the wrong set reports zero steps and silently hides everything
+        downstream of it, which is how this first went unnoticed.
+        """
+        return self.decode_target == "hybrid" or self._hybrid_ensure_ran
+
     def decode_miss_stats(self) -> dict:
-        if self.decode_target == "hybrid":
+        if self._counted_by_hybrid_kernel():
             active = int(self.stat_active.item())
             missing = int(self.stat_missing.item())
             calls = int(self.stat_calls.item())
@@ -1192,7 +1202,7 @@ class OffloadMoeCache:
         lists indexed by MoE-layer id: missing/active experts per step and the realized
         miss_rate (missing/active) -- i.e. how cacheable each layer's routing actually was
         under the running LRU. Reads device tensors once (no per-step host sync)."""
-        if self.decode_target == "hybrid":
+        if self._counted_by_hybrid_kernel():
             steps = self.stat_steps_layer.tolist()
             missing = self.stat_missing_layer.tolist()
             active = self.stat_active_layer.tolist()

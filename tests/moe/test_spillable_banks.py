@@ -175,3 +175,118 @@ def test_anonymous_banks_do_not_land_in_shmem():
     grew = _meminfo("Shmem:") - before
     bank.release()
     assert grew < 64, f"anonymous bank added {grew:.0f} MiB of Shmem; it should add none"
+
+
+# ---------------------------------------------------------------------------
+# banks another process can map
+# ---------------------------------------------------------------------------
+
+
+def test_a_shared_bank_is_a_file_a_peer_can_open_by_name():
+    """A worker on another device can only serve a layer it can reach the weights for."""
+    import os
+
+    from freetoken.moe.host_banks import HostBank
+
+    bank = HostBank((4, 16), torch.uint8, backing="shared", shared_name="freetoken-test-open")
+    bank.tensor.fill_(9)
+
+    assert bank.shared_path and os.path.exists(bank.shared_path)
+    with open(bank.shared_path, "rb") as fh:
+        assert fh.read(4) == b"\x09\x09\x09\x09"
+
+    os.unlink(bank.shared_path)
+
+
+def test_two_mappings_of_a_shared_bank_see_the_same_bytes():
+    """The point is one copy of the weights, not one copy per consumer."""
+    import mmap
+    import os
+
+    from freetoken.moe.host_banks import HostBank
+
+    bank = HostBank((4, 16), torch.uint8, backing="shared", shared_name="freetoken-test-share")
+    bank.tensor.fill_(1)
+
+    with open(bank.shared_path, "r+b") as fh:
+        peer = mmap.mmap(fh.fileno(), 0)
+        assert peer[0] == 1
+        bank.tensor[0, 0] = 7  # a write through one mapping
+        assert peer[0] == 7  # is visible through the other
+        peer.close()
+
+    os.unlink(bank.shared_path)
+
+
+def test_a_shared_bank_still_releases_its_pages():
+    """The reason banks were made private in the first place must not come back.
+
+    An anonymous shared mapping counts as Shmem and ignores MADV_DONTNEED, so release()
+    freed nothing. A named file has the answer that one lacked: punching a hole returns the
+    blocks. Shareable and releasable are not a trade here.
+    """
+    import ctypes
+    import os
+
+    from freetoken.moe.host_banks import HostBank
+
+    bank = HostBank((256, 4096), torch.uint8, backing="shared", shared_name="freetoken-test-rel")
+    bank.tensor.fill_(3)
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    pages = (len(bank._buf) + 4095) // 4096
+    vec = (ctypes.c_ubyte * pages)()
+    libc.mincore(ctypes.c_void_p(bank.addr), ctypes.c_size_t(len(bank._buf)), vec)
+    assert sum(v & 1 for v in vec) > 0, "the fill should have made it resident"
+
+    bank.release()
+
+    vec = (ctypes.c_ubyte * pages)()
+    libc.mincore(ctypes.c_void_p(bank.addr), ctypes.c_size_t(len(bank._buf)), vec)
+    assert sum(v & 1 for v in vec) == 0, "release must return a shared bank's pages too"
+
+    os.unlink(bank.shared_path)
+
+
+def test_shared_banks_are_opt_in():
+    """A single-process run should not be leaving files in a tmpfs for nobody."""
+    from freetoken.moe.host_banks import _layer_backing, shared_banks
+
+    assert _layer_backing(0) in (None, "mmap")
+    with shared_banks("tag"):
+        assert _layer_backing(0) == "shared"
+    assert _layer_backing(0) in (None, "mmap")
+
+
+def test_shared_banks_refuse_a_directory_too_small_to_hold_them(monkeypatch, tmp_path):
+    """A sparse file in a full tmpfs fails on the write, as SIGBUS, with no message.
+
+    That is how this first failed: the backend died during load with no traceback and no
+    clue. The size is knowable before a byte is written, so it has to be checked there.
+    """
+    from freetoken.moe import host_banks
+
+    monkeypatch.setattr("freetoken.moe.shared_host.shm_dir", lambda: str(tmp_path))
+    fake = os.statvfs_result((4096, 4096, 100, 10, 10, 0, 0, 0, 0, 255))  # ~40 KiB free
+    monkeypatch.setattr(host_banks.os, "statvfs", lambda _d: fake)
+
+    specs = {"gate_up": ((64, 4096), torch.uint8)}
+    with host_banks.shared_banks("tag"):
+        with pytest.raises(RuntimeError, match="shared expert banks need"):
+            host_banks.alloc_layer_banks(specs, 8)
+
+
+def test_the_shortfall_message_names_ways_out_that_exist(monkeypatch, tmp_path):
+    from freetoken.moe import host_banks
+
+    monkeypatch.setattr("freetoken.moe.shared_host.shm_dir", lambda: str(tmp_path))
+    fake = os.statvfs_result((4096, 4096, 100, 10, 10, 0, 0, 0, 0, 255))
+    monkeypatch.setattr(host_banks.os, "statvfs", lambda _d: fake)
+
+    with host_banks.shared_banks("tag"):
+        with pytest.raises(RuntimeError) as caught:
+            host_banks.alloc_layer_banks({"gate_up": ((64, 4096), torch.uint8)}, 8)
+
+    text = str(caught.value)
+    for way_out in ("FREETOKEN_SHM_DIR", "--moe-resident-layers", "--moe-worker-layers"):
+        assert way_out in text
