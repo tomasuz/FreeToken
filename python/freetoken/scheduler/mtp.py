@@ -62,21 +62,27 @@ class MTPDecodeMixin:
     # ------------------------------------------------------------------ gating
     def _mtp_configured(self) -> bool:
         if getattr(self, "_mtp_disabled", False):
+            logger.info_rank0("[mtp-check] _mtp_disabled is True")
             return False
         try:
             cfg = self.engine.config
             model = self.engine.model
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            logger.info_rank0(f"[mtp-check] exc: {e}")
             return False
         if not (getattr(cfg, "mtp", False) and getattr(model, "mtp", None) is not None):
+            logger.info_rank0(f"[mtp-check] cfg.mtp={getattr(cfg, 'mtp', False)}, model.mtp={getattr(model, 'mtp', None) is not None}")
             return False
         # Env gate: enabled by default when --mtp is passed, unless explicitly disabled with FREETOKEN_MTP_SPEC=0
         if os.environ.get(ENV_SPEC, "1") in ("0", "false", "off", "no"):
+            logger.info_rank0("[mtp-check] disabled via env")
             return False
         if self.cache_manager.page_size != 1:
+            logger.info_rank0(f"[mtp-check] page_size={self.cache_manager.page_size} != 1")
             return False
         # verify needs argmax logits at BOTH new positions -> plain bf16 lm_head weight or GGUF qweight
         if not self._mtp_can_compute_logits():
+            logger.info_rank0("[mtp-check] cannot compute logits")
             return False
         return True
 
@@ -119,16 +125,22 @@ class MTPDecodeMixin:
         if not self._mtp_configured():
             return None
         if self.prefill_manager.runnable or self._pending_rebuild is not None:
+            logger.info_rank0(f"[mtp-target] prefill runnable={self.prefill_manager.runnable} rebuild={self._pending_rebuild is not None}")
             return None
         running = self.decode_manager.running_reqs
         if len(running) != 1:
+            if len(running) > 1:
+                logger.info_rank0(f"[mtp-target] running_reqs count={len(running)} > 1")
             return None
         req = next(iter(running))
         if not getattr(req.sampling_params, "is_greedy", False):
+            logger.info_rank0(f"[mtp-target] req not greedy: temp={req.sampling_params.temperature} top_k={req.sampling_params.top_k} top_p={req.sampling_params.top_p}")
             return None
         if req.aborted or req in self.finished_reqs or not req.can_decode:
+            logger.info_rank0(f"[mtp-target] aborted={req.aborted} finished={req in self.finished_reqs} can_decode={req.can_decode}")
             return None
         if req.linear_slot_idx is None:
+            logger.info_rank0(f"[mtp-target] req.linear_slot_idx is None (uid={req.uid})")
             return None
         return req
 
