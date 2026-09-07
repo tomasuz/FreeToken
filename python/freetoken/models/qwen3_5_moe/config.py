@@ -44,7 +44,12 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
     num_kv_heads = getattr(text, "num_key_value_heads", text.num_attention_heads)
 
-    rope_params = getattr(text, "rope_parameters", None) or {}
+    rope_params = (
+        getattr(text, "rope_parameters", None)
+        or getattr(text, "rope_scaling", None)
+        or getattr(hf_config, "rope_scaling", None)
+        or {}
+    )
     rope_theta = rope_params.get("rope_theta", getattr(text, "rope_theta", None))
     partial = (
         rope_params.get("partial_rotary_factor")
@@ -56,12 +61,40 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # For text-only with the default rope type, partial NeoX rope needs no scaling dict
     # (the mRoPE params reduce to standard partial rope for text). Avoid carrying the
     # unhashable ``mrope_section`` list into get_rope's cache key.
-    rope_type = rope_params.get("rope_type", "default")
-    rope_scaling = (
-        None
-        if rope_type in (None, "default")
-        else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
+    import os
+    env_factor = os.environ.get("FREETOKEN_ROPE_FACTOR")
+    env_type = os.environ.get("FREETOKEN_ROPE_TYPE")
+    env_orig = os.environ.get("FREETOKEN_ROPE_ORIG_CTX")
+
+    rope_type = (
+        env_type
+        if env_factor is not None and env_type
+        else rope_params.get("rope_type") or rope_params.get("type") or "default"
     )
+    if env_factor is not None and float(env_factor) > 1.0:
+        factor = float(env_factor)
+        orig_ctx = int(env_orig) if env_orig else text.max_position_embeddings
+        rope_scaling = {
+            "rope_type": str(rope_type).lower(),
+            "factor": factor,
+            "original_max_position_embeddings": orig_ctx,
+        }
+        if os.environ.get("FREETOKEN_ROPE_ATTN_FACTOR"):
+            rope_scaling["attention_factor"] = float(os.environ["FREETOKEN_ROPE_ATTN_FACTOR"])
+        if os.environ.get("FREETOKEN_ROPE_BETA_FAST"):
+            rope_scaling["beta_fast"] = float(os.environ["FREETOKEN_ROPE_BETA_FAST"])
+        if os.environ.get("FREETOKEN_ROPE_BETA_SLOW"):
+            rope_scaling["beta_slow"] = float(os.environ["FREETOKEN_ROPE_BETA_SLOW"])
+        max_position = int(orig_ctx * factor)
+    elif rope_type in (None, "default"):
+        rope_scaling = None
+        max_position = text.max_position_embeddings
+    else:
+        rope_scaling = {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
+        rope_scaling["rope_type"] = str(rope_type).lower()
+        factor = float(rope_scaling.get("factor", 1.0))
+        orig_pos = int(rope_scaling.get("original_max_position_embeddings", text.max_position_embeddings))
+        max_position = int(orig_pos * factor) if factor > 1.0 else text.max_position_embeddings
 
     expert_quant, weight_block_size = _expert_quant(hf_config, text)
 
@@ -77,7 +110,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
     full_rotary = RotaryConfig(
         head_dim=head_dim,
         rotary_dim=rotary_dim,
-        max_position=text.max_position_embeddings,
+        max_position=max_position,
         base=rope_theta,
         scaling=rope_scaling,
     )
