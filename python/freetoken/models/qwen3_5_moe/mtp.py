@@ -69,7 +69,14 @@ class Qwen3_5MTPLayer(BaseOP):
         # fused-backend config copy so make_moe_layer allocates a resident MoELayer regardless
         # of the engine's --moe-backend. Their packed tensors ride the dense state dict.
         if config.moe_enabled:
-            self.mlp = Qwen3_5MoE(replace(config, moe_backend="fused"), layer_id)
+            mtp_config = replace(
+                config,
+                moe_backend="fused",
+                expert_quant="none",
+                gguf_expert_types=None,
+                dense_quant="none",
+            )
+            self.mlp = Qwen3_5MoE(mtp_config, layer_id)
         else:
             self.mlp = Qwen3_5DenseMLP(config)
 
