@@ -70,14 +70,41 @@ class MTPDecodeMixin:
             return False
         if not (getattr(cfg, "mtp", False) and getattr(model, "mtp", None) is not None):
             return False
-        if os.environ.get(ENV_SPEC) != "1":
+        # Env gate: enabled by default when --mtp is passed, unless explicitly disabled with FREETOKEN_MTP_SPEC=0
+        if os.environ.get(ENV_SPEC, "1") in ("0", "false", "off", "no"):
             return False
         if self.cache_manager.page_size != 1:
             return False
-        # verify needs argmax logits at BOTH new positions -> plain bf16 lm_head weight
-        if self._mtp_lmhead_weight() is None:
+        # verify needs argmax logits at BOTH new positions -> plain bf16 lm_head weight or GGUF qweight
+        if not self._mtp_can_compute_logits():
             return False
         return True
+
+    def _mtp_can_compute_logits(self) -> bool:
+        """Check whether we can compute lm_head logits (bf16 dense or quantized GGUF)."""
+        lm = getattr(self.engine.model, "lm_head", None)
+        if lm is None:
+            return False
+        if getattr(getattr(lm, "tied_embedding", None) or lm, "weight", None) is not None:
+            return True
+        if hasattr(lm, "qweight") and lm.qweight is not None and getattr(lm, "_quant_type", None) is not None:
+            return True
+        return False
+
+    def _mtp_compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Compute lm_head vocab logits from hidden states. Works for both dense
+        bf16/fp16 weights and quantized GGUF output heads."""
+        lm = getattr(self.engine.model, "lm_head", None)
+        assert lm is not None, "engine model has no lm_head"
+        weight = getattr(getattr(lm, "tied_embedding", None) or lm, "weight", None)
+        if weight is not None:
+            return F.linear(hidden, weight)
+        if hasattr(lm, "qweight") and lm.qweight is not None:
+            from freetoken.layers.gguf import fused_mul_mat_gguf
+
+            assert getattr(lm, "_quant_type", None) is not None, "GGUF lm_head missing _quant_type"
+            return fused_mul_mat_gguf(hidden, lm.qweight, lm._quant_type)
+        raise RuntimeError(f"Unsupported lm_head type for MTP logits: {type(lm)}")
 
     def _mtp_lmhead_weight(self):
         """Shared vocab matrix of the lm_head (tied-aware). None for quantized heads
@@ -389,8 +416,7 @@ class MTPDecodeMixin:
         hidden = self._mtp_run_extend(req, [u])  # [1, H]
         if hidden is None:
             return 0
-        weight = self._mtp_lmhead_weight()
-        logits = F.linear(hidden, weight)  # [1, vocab]
+        logits = self._mtp_compute_logits(hidden)  # [1, vocab]
         real = int(torch.argmax(logits, dim=-1).item())
         committed = self._mtp_emit(req, [real], kept_processed=C + 1)
         if req in self.finished_reqs:
@@ -417,8 +443,7 @@ class MTPDecodeMixin:
         spare = pool.alloc(1)[0]
         try:
             hidden = self._mtp_run_extend(req, [u, draft], boundary_slot=spare)  # [2, H]
-            weight = self._mtp_lmhead_weight()
-            logits = F.linear(hidden, weight)  # [2, vocab]
+            logits = self._mtp_compute_logits(hidden)  # [2, vocab]
             real = int(torch.argmax(logits[0:1], dim=-1).item())
             if real == draft:
                 c = int(torch.argmax(logits[1:2], dim=-1).item())
