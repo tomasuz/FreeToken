@@ -447,7 +447,6 @@ class MTPDecodeMixin:
             real = int(torch.argmax(logits[0:1], dim=-1).item())
             if real == draft:
                 c = int(torch.argmax(logits[1:2], dim=-1).item())
-                logger.info_rank0(f"[mtp-step] ACCEPT C={C} u={u} draft={draft} real={real} c={c} (draft==c: {draft == c})")
                 committed = self._mtp_emit(req, [draft, c], kept_processed=C + 2)
                 if req in self.finished_reqs:
                     st["draft"] = None
@@ -456,7 +455,6 @@ class MTPDecodeMixin:
                 st["draft"] = self._mtp_head_draft(req, hidden[1:2])
                 return committed, True
             else:
-                logger.info_rank0(f"[mtp-step] REJECT C={C} u={u} draft={draft} real={real}")
                 committed = self._mtp_emit(req, [real], kept_processed=C + 1)
                 if req in self.finished_reqs:
                     st["draft"] = None
