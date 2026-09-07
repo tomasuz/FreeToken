@@ -142,6 +142,8 @@ class ModelCard(BaseModel):
     # (not []) when the model has no effort knob or the probe could not run.
     supported_reasoning_efforts: list[str] | None = None
     default_reasoning_effort: str | None = None
+    mtp_model: str | None = None
+    mtp_draft: int | None = None
 
 
 class ModelList(BaseModel):

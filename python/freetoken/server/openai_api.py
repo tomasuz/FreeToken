@@ -134,6 +134,9 @@ def register_openai_routes(
         model_id = _served_model_name(state)
         ctx = _model_context_length(state)
         efforts, default_effort = await _effort_fields(state)
+        has_mtp = getattr(getattr(state.config, "model_config", None), "has_mtp", False)
+        mtp_model = getattr(state.config, "mtp_model_path", None) if has_mtp else None
+        mtp_draft = getattr(state.config.model_config, "mtp_draft", None) if has_mtp else None
         return ModelList(data=[ModelCard(
             id=model_id,
             root=state.config.model_path,
@@ -141,6 +144,8 @@ def register_openai_routes(
             context_length=ctx,
             supported_reasoning_efforts=efforts,
             default_reasoning_effort=default_effort,
+            mtp_model=mtp_model,
+            mtp_draft=mtp_draft,
         )])
 
 
