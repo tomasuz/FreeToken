@@ -151,13 +151,16 @@ def _module():
     )
 
 
-def _build_directory(archs: list[str]) -> str | None:
-    """A build directory per set of target architectures.
+def _build_directory(archs: list[str], name: str = "freetoken_gguf_kernels") -> str | None:
+    """A build directory per extension per set of target architectures.
 
     torch keys the JIT cache by extension name alone, so two processes on the same machine
     that target different devices -- which is the whole point of deriving the targets from
     what is visible -- share one directory and overwrite each other's build. The loser
     loads code compiled for a device it is not running on, and faults.
+
+    ``name`` is the extension's own, so a second extension reusing this policy does not
+    file its objects under the first one's directory.
 
     ``None`` (no archs to key on) keeps torch's own choice.
     """
@@ -167,7 +170,7 @@ def _build_directory(archs: list[str]) -> str | None:
         from torch.utils.cpp_extension import _get_build_directory
     except ImportError:  # private helper; if it moves, torch's default is still correct
         return None
-    base = _get_build_directory("freetoken_gguf_kernels", verbose=False)
+    base = _get_build_directory(name, verbose=False)
     path = f"{base}-{'-'.join(archs)}"
     os.makedirs(path, exist_ok=True)
     return path

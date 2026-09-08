@@ -47,7 +47,7 @@ def _module():
         sources=[str(_CSRC / "nvfp4_moe_kernel.cu")],
         extra_include_paths=[str(_CSRC)],
         extra_cuda_cflags=extra_cuda_cflags,
-        build_directory=_build_directory(archs),
+        build_directory=_build_directory(archs, "freetoken_nvfp4_moe"),
         verbose=True,
     )
 
@@ -67,9 +67,12 @@ def nvfp4_moe_vec(
     ``topk_ids`` is read flat, one entry per route, and names a row of the stacked
     weight banks (a cache slot, not an expert id, wherever the caller keeps a cache).
     """
+    # The wave width is the device's, and asking torch for it here keeps the kernel free
+    # of the ATen context header, which hipifies to one that pulls in hipsparse.
+    warp = torch.cuda.get_device_properties(a.device).warp_size
     return _module().nvfp4_moe_vec(
         a, packed, scale, global_, topk_ids.reshape(-1).to(torch.int32), int(top_k),
-        int(row), int(tokens),
+        int(row), int(tokens), int(warp),
     )
 
 

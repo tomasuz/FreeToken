@@ -20,7 +20,6 @@
 // fused_experts_gguf so the two expert paths compose the same way.
 
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
 namespace {
@@ -31,6 +30,14 @@ __device__ __constant__ float kE2M1[16] = {
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
 };
 
+// 2^(e-7) for each e4m3 exponent field; e == 0 is subnormal and takes the other branch.
+// A table rather than a libm call: the device namespace has no ldexpf under these flags,
+// and sixteen exact constants need no function at all.
+__device__ __constant__ float kE4M3Pow2[16] = {
+    0.0f,        0.015625f, 0.03125f, 0.0625f, 0.125f, 0.25f, 0.5f,  1.0f,
+    2.0f,        4.0f,      8.0f,     16.0f,   32.0f,  64.0f, 128.0f, 256.0f,
+};
+
 // fp8-e4m3 (bias 7, 3 mantissa bits) straight to float, subnormals included. Decoded
 // arithmetically rather than through a half bitcast: this has to compile for targets with
 // no half arithmetic at all, and the exponent arithmetic is exact on any of them.
@@ -39,34 +46,15 @@ __device__ __forceinline__ float e4m3_to_float(unsigned char v) {
   const int exp = (v >> 3) & 0xF;
   const float mag = (exp == 0)
       ? static_cast<float>(mant) * 0.001953125f          // 2^-9, the subnormal step
-      : ldexpf(1.0f + static_cast<float>(mant) * 0.125f, exp - 7);
+      : (1.0f + static_cast<float>(mant) * 0.125f) * kE4M3Pow2[exp];
   return (v & 0x80) ? -mag : mag;
 }
 
-// Activations reach the kernel in the model's compute dtype. Both conversions are bit
-// manipulation so that no half/bfloat16 instruction is required of the device.
-__device__ __forceinline__ float to_float(const at::BFloat16 &x) {
-  unsigned int bits = static_cast<unsigned int>(*reinterpret_cast<const unsigned short *>(&x)) << 16;
-  float out;
-  memcpy(&out, &bits, sizeof(out));
-  return out;
-}
-__device__ __forceinline__ float to_float(const at::Half &x) { return __half2float(*reinterpret_cast<const __half *>(&x)); }
-__device__ __forceinline__ float to_float(const float &x) { return x; }
-
-__device__ __forceinline__ void from_float(float v, at::BFloat16 *out) {
-  unsigned int bits;
-  memcpy(&bits, &v, sizeof(bits));
-  // round-to-nearest-even on the truncated 16 bits
-  const unsigned int rounded = bits + 0x7FFFu + ((bits >> 16) & 1u);
-  const unsigned short hi = static_cast<unsigned short>(rounded >> 16);
-  memcpy(out, &hi, sizeof(hi));
-}
-__device__ __forceinline__ void from_float(float v, at::Half *out) {
-  const __half h = __float2half(v);
-  memcpy(out, &h, sizeof(h));
-}
-__device__ __forceinline__ void from_float(float v, float *out) { *out = v; }
+// Activations reach the kernel in the model's compute dtype. c10's own conversions are
+// used rather than hand-rolled bit math: they carry software fallbacks for devices with
+// no half instructions, and they are what the rest of the tree already trusts.
+template <typename T>
+__device__ __forceinline__ float to_float(const T &x) { return static_cast<float>(x); }
 
 // One wave per output row: lanes stride the K axis by whole bytes, so consecutive lanes
 // read consecutive bytes of the same weight row and the packed bank is read coalesced.
@@ -76,7 +64,7 @@ __global__ void nvfp4_moe_vec_kernel(
     const scalar_t *__restrict__ a,        // [rows_a, K]
     const unsigned char *__restrict__ packed,  // [S, N, K/2]
     const unsigned char *__restrict__ scale,   // [S, N, K/16]
-    const at::Half *__restrict__ global_,      // [S, N]
+    const at::Half *__restrict__ global_,      // [S, N]  (per-output-row global scale)
     const int *__restrict__ topk_ids,          // [routes]
     scalar_t *__restrict__ out,                // [routes, N]
     const int routes, const int N, const int K, const int top_k) {
@@ -118,16 +106,18 @@ __global__ void nvfp4_moe_vec_kernel(
   }
 
   if (lane == 0) {
-    acc *= __half2float(*reinterpret_cast<const __half *>(&global_[w_row]));
-    from_float(acc, &out[static_cast<long>(route) * N + n]);
+    acc *= static_cast<float>(global_[w_row]);
+    out[static_cast<long>(route) * N + n] = static_cast<scalar_t>(acc);
   }
 }
 
 }  // namespace
 
+static constexpr int threads_per_block = 256;
+
 torch::Tensor nvfp4_moe_vec(torch::Tensor a, torch::Tensor packed, torch::Tensor scale,
                             torch::Tensor global_, torch::Tensor topk_ids, int64_t top_k,
-                            int64_t row, int64_t tokens) {
+                            int64_t row, int64_t tokens, int64_t warp) {
   TORCH_CHECK(a.is_cuda() && packed.is_cuda() && scale.is_cuda() && global_.is_cuda());
   TORCH_CHECK(a.dim() == 2, "activations must be [rows, K]");
   TORCH_CHECK(packed.dim() == 3 && scale.dim() == 3 && global_.dim() == 2);
@@ -135,22 +125,24 @@ torch::Tensor nvfp4_moe_vec(torch::Tensor a, torch::Tensor packed, torch::Tensor
               "packed codes and e4m3 block scales are read as raw bytes");
   TORCH_CHECK(global_.scalar_type() == at::kHalf, "per-row globals are fp16");
   TORCH_CHECK(topk_ids.scalar_type() == at::kInt, "expert/slot ids must be int32");
+  const int threads = threads_per_block;
   const int K = static_cast<int>(a.size(1));
   TORCH_CHECK(K % 16 == 0, "K must be a whole number of 16-wide scale blocks, got ", K);
   TORCH_CHECK(packed.size(2) == K / 2 && scale.size(2) == K / 16,
               "weight banks disagree with the activation's K");
   TORCH_CHECK(packed.size(1) == row && global_.size(1) == row);
 
+  TORCH_CHECK(warp > 0 && threads_per_block % warp == 0,
+              "block size must be a whole number of waves, got warp ", warp);
   const at::cuda::CUDAGuard guard(a.device());
   const int64_t routes = tokens * top_k;
   auto out = torch::empty({routes, row}, a.options());
   if (routes == 0) return out;
 
-  const int threads = 256;
   auto stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_SWITCH(a.scalar_type(), "nvfp4_moe_vec",
       AT_DISPATCH_CASE(at::kBFloat16, [&] {
-        const int waves = threads / at::cuda::warp_size();
+        const int waves = threads / static_cast<int>(warp);
         dim3 grid(routes, (row + waves - 1) / waves);
         nvfp4_moe_vec_kernel<at::BFloat16><<<grid, threads, 0, stream>>>(
             a.data_ptr<at::BFloat16>(), packed.data_ptr<unsigned char>(),
@@ -159,7 +151,7 @@ torch::Tensor nvfp4_moe_vec(torch::Tensor a, torch::Tensor packed, torch::Tensor
             static_cast<int>(routes), static_cast<int>(row), K, static_cast<int>(top_k));
       })
       AT_DISPATCH_CASE(at::kHalf, [&] {
-        const int waves = threads / at::cuda::warp_size();
+        const int waves = threads / static_cast<int>(warp);
         dim3 grid(routes, (row + waves - 1) / waves);
         nvfp4_moe_vec_kernel<at::Half><<<grid, threads, 0, stream>>>(
             a.data_ptr<at::Half>(), packed.data_ptr<unsigned char>(),
@@ -168,7 +160,7 @@ torch::Tensor nvfp4_moe_vec(torch::Tensor a, torch::Tensor packed, torch::Tensor
             static_cast<int>(routes), static_cast<int>(row), K, static_cast<int>(top_k));
       })
       AT_DISPATCH_CASE(at::kFloat, [&] {
-        const int waves = threads / at::cuda::warp_size();
+        const int waves = threads / static_cast<int>(warp);
         dim3 grid(routes, (row + waves - 1) / waves);
         nvfp4_moe_vec_kernel<float><<<grid, threads, 0, stream>>>(
             a.data_ptr<float>(), packed.data_ptr<unsigned char>(),
