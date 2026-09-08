@@ -30,6 +30,10 @@ class EngineConfig:
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
     # low-memory reclaimable read; "parallel" forces the fast read.
     expert_load: str = "auto"
+    # Paged K/V storage width (--kv-cache-dtype): "auto" follows --dtype, "fp8_e4m3"
+    # stores e4m3 and decodes on read, halving the cache so the same VRAM buys either a
+    # longer context or more expert slots. Paged-MHA + triton only (checked at startup).
+    kv_cache_dtype: str = "auto"
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False

@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .e4m3_compat import e4m3_u8_to_f32
+
 
 _MAX_KV_SPLITS = 8
 _MIN_BLOCK_KV = 32
@@ -43,6 +45,22 @@ def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[i
 
 
 @triton.jit
+def _load_kv(ptrs, mask, OUT_DTYPE: tl.constexpr, KV_FP8: tl.constexpr):
+    """One tile of K or V out of the paged cache, already in the dtype the caller
+    computes in.
+
+    An fp8 cache is addressed through its uint8 view on EVERY target, native fp8 or
+    not: the decode below is a few ALU ops against a load that just halved its memory
+    traffic, and one path is worth more here than a marginally cheaper cast on the
+    hardware that could take fp8 pointers directly. Widening is lossless -- every e4m3
+    value, subnormals included, is exact in bf16/fp16/fp32; the precision was spent on
+    the store, not here."""
+    if KV_FP8:
+        return e4m3_u8_to_f32(tl.load(ptrs, mask=mask, other=0)).to(OUT_DTYPE)
+    return tl.load(ptrs, mask=mask, other=0.0).to(OUT_DTYPE)
+
+
+@triton.jit
 def _paged_attention_kernel(
     q_ptr,
     k_ptr,
@@ -68,6 +86,7 @@ def _paged_attention_kernel(
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    KV_FP8: tl.constexpr,
 ):
     q_tok = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -107,14 +126,15 @@ def _paged_attention_kernel(
         skip_tile = tl.max(mask_n.to(tl.int32), axis=0) == 0
         if not skip_tile:
             slots = tl.load(indices_ptr + kv_start + offs_n, mask=offs_n < kv_len, other=0)
-            k = tl.load(
+            k = _load_kv(
                 k_ptr
                 + slots[:, None] * stride_ks
                 + kv_head * stride_kh
                 + offs_d[None, :],
-                mask=(offs_n[:, None] < kv_len) & mask_d[None, :],
-                other=0.0,
-            ).to(tl.float32)
+                (offs_n[:, None] < kv_len) & mask_d[None, :],
+                tl.float32,
+                KV_FP8,
+            )
             scores = tl.sum(q[None, :] * k, axis=1) * sm_scale
             scores = tl.where(mask_n, scores, -float("inf"))
 
@@ -124,14 +144,15 @@ def _paged_attention_kernel(
             alpha = tl.exp(m_i - m_new)
             p = tl.exp(scores - m_new)
 
-            v = tl.load(
+            v = _load_kv(
                 v_ptr
                 + slots[:, None] * stride_vs
                 + kv_head * stride_vh
                 + offs_d[None, :],
-                mask=(offs_n[:, None] < kv_len) & mask_d[None, :],
-                other=0.0,
-            ).to(tl.float32)
+                (offs_n[:, None] < kv_len) & mask_d[None, :],
+                tl.float32,
+                KV_FP8,
+            )
             acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
             l_i = l_i * alpha + tl.sum(p, axis=0)
             m_i = m_new
@@ -179,6 +200,7 @@ def _decode_grouped_stage1_kernel(
     D: tl.constexpr,
     DV: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
+    KV_FP8: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     head_block_id = tl.program_id(1)
@@ -224,7 +246,8 @@ def _decode_grouped_stage1_kernel(
 
     if split_end > split_start:
         q = tl.load(q_ptr + q_offsets, mask=mask_h[:, None] & mask_d[None, :], other=0.0)
-        q = q.to(k_ptr.dtype.element_ty)
+        if not KV_FP8:
+            q = q.to(k_ptr.dtype.element_ty)
 
         for rel_start in tl.range(split_start, split_end, BLOCK_N):
             rel_offs = rel_start + tl.arange(0, BLOCK_N)
@@ -232,18 +255,20 @@ def _decode_grouped_stage1_kernel(
             logical_offs = effective_start + rel_offs
             slots = tl.load(indices_ptr + kv_start + logical_offs, mask=mask_n, other=0)
 
-            k = tl.load(
+            k = _load_kv(
                 k_ptr + slots[None, :] * stride_ks + k_base_offsets,
-                mask=mask_n[None, :] & mask_d[:, None],
-                other=0.0,
+                mask_n[None, :] & mask_d[:, None],
+                q_ptr.dtype.element_ty,
+                KV_FP8,
             )
             scores = tl.dot(q, k) * sm_scale
             scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
 
-            v = tl.load(
+            v = _load_kv(
                 v_ptr + slots[:, None] * stride_vs + v_base_offsets,
-                mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
+                mask_n[:, None] & mask_dv[None, :],
+                q_ptr.dtype.element_ty,
+                KV_FP8,
             )
 
             m_new = tl.maximum(tl.max(scores, axis=1), m_i)
@@ -397,6 +422,10 @@ def decode_paged_attention(
     valid_block_h = min(16, group)
     block_h = triton.next_power_of_2(valid_block_h)
     block_d = triton.next_power_of_2(head_dim)
+    # An fp8 KV pool reaches the kernels as its raw bytes -- see _load_kv for why the
+    # uint8 view is used even where the target could type an fp8 pointer.
+    kv_fp8 = k_cache.dtype == torch.uint8
+    assert v_cache.dtype == k_cache.dtype
     block_dv = triton.next_power_of_2(head_dim)
 
     _decode_grouped_stage1_kernel[
@@ -435,6 +464,7 @@ def decode_paged_attention(
         D=head_dim,
         DV=head_dim,
         SLIDING_WINDOW=sliding_window or 0,
+        KV_FP8=kv_fp8,
         num_warps=4,
         num_stages=2,
     )
@@ -494,6 +524,7 @@ def _extend_attention_kernel(
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    KV_FP8: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -545,13 +576,14 @@ def _extend_attention_kernel(
         skip_tile = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
         if not skip_tile:
             slots = tl.load(kv_indices_ptr + kv_start + kv_offsets, mask=mask_n, other=0)
-            k = tl.load(
+            k = _load_kv(
                 k_ptr
                 + slots[None, :] * stride_ks
                 + kv_head * stride_kh
                 + offs_d[:, None],
-                mask=mask_n[None, :] & mask_d[:, None],
-                other=0.0,
+                mask_n[None, :] & mask_d[:, None],
+                q_ptr.dtype.element_ty,
+                KV_FP8,
             )
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
@@ -562,13 +594,14 @@ def _extend_attention_kernel(
             alpha = tl.exp(m_i - m_new)
             p = tl.exp(scores - m_new[:, None])
 
-            v = tl.load(
+            v = _load_kv(
                 v_ptr
                 + slots[:, None] * stride_vs
                 + kv_head * stride_vh
                 + offs_dv[None, :],
-                mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
+                mask_n[:, None] & mask_dv[None, :],
+                q_ptr.dtype.element_ty,
+                KV_FP8,
             )
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
@@ -619,6 +652,7 @@ def _extend_attention_split_kernel(
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    KV_FP8: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -672,13 +706,14 @@ def _extend_attention_split_kernel(
 
         if not skip_tile:
             slots = tl.load(kv_indices_ptr + kv_start + kv_offsets, mask=mask_n, other=0)
-            k = tl.load(
+            k = _load_kv(
                 k_cache_ptr
                 + slots[None, :] * stride_kcs
                 + kv_head * stride_kch
                 + offs_d[:, None],
-                mask=mask_n[None, :] & mask_d[:, None],
-                other=0.0,
+                mask_n[None, :] & mask_d[:, None],
+                q_ptr.dtype.element_ty,
+                KV_FP8,
             )
             scores = tl.dot(q.to(k.dtype), k) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
@@ -689,13 +724,14 @@ def _extend_attention_split_kernel(
             alpha = tl.exp(m_i - m_new)
             p = tl.exp(scores - m_new[:, None])
 
-            v = tl.load(
+            v = _load_kv(
                 v_cache_ptr
                 + slots[:, None] * stride_vcs
                 + kv_head * stride_vch
                 + offs_dv[None, :],
-                mask=mask_n[:, None] & mask_dv[None, :],
-                other=0.0,
+                mask_n[:, None] & mask_dv[None, :],
+                q_ptr.dtype.element_ty,
+                KV_FP8,
             )
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             l_i = l_i * alpha + tl.sum(p, axis=1)
@@ -791,6 +827,10 @@ def extend_paged_attention(
         assert sinks.numel() >= num_q_heads
         sinks = sinks.contiguous()
 
+    # An fp8 KV pool reaches the kernels as its raw bytes -- see _load_kv for why the
+    # uint8 view is used even where the target could type an fp8 pointer.
+    kv_fp8 = k_cache.dtype == torch.uint8
+    assert v_cache.dtype == k_cache.dtype
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
     block_d = triton.next_power_of_2(head_dim)
@@ -841,6 +881,7 @@ def extend_paged_attention(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             SLIDING_WINDOW=sliding_window or 0,
+            KV_FP8=kv_fp8,
             HAS_SINKS=sinks is not None,
             num_warps=8,
             num_stages=1,
@@ -873,6 +914,7 @@ def extend_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         SLIDING_WINDOW=sliding_window or 0,
+        KV_FP8=kv_fp8,
         HAS_SINKS=sinks is not None,
         num_warps=8,
         num_stages=1,
@@ -914,6 +956,10 @@ def paged_attention(
         assert sinks.numel() >= num_q_heads
         sinks = sinks.contiguous()
 
+    # An fp8 KV pool reaches the kernels as its raw bytes -- see _load_kv for why the
+    # uint8 view is used even where the target could type an fp8 pointer.
+    kv_fp8 = k_cache.dtype == torch.uint8
+    assert v_cache.dtype == k_cache.dtype
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
     block_d = triton.next_power_of_2(head_dim)
@@ -942,6 +988,7 @@ def paged_attention(
         BLOCK_D=block_d,
         BLOCK_N=block_n,
         SLIDING_WINDOW=sliding_window or 0,
+        KV_FP8=kv_fp8,
         HAS_SINKS=sinks is not None,
         num_warps=8 if head_dim >= 256 else 4,
         num_stages=2,

@@ -111,11 +111,25 @@ class MHAKVCache(BaseKVCachePool):
             raise KeyError(f"layer {layer_id} has no paged KV storage")
         return dense
 
+    @property
+    def _fp8(self) -> bool:
+        """Whether the slabs hold e4m3 rather than activations (--kv-cache-dtype)."""
+        return self._kv_buffer.dtype == torch.float8_e4m3fn
+
+    def _kernel_view(self, slab: torch.Tensor) -> torch.Tensor:
+        """A slab as the attention kernels take it.
+
+        fp8 storage goes out as its uint8 view: triton rejects an fp8 pointer argument
+        on any target below sm_89, and the kernels decode the bits themselves anyway so
+        that one path serves every GPU. The triton backend is the only consumer wired
+        for this -- the engine refuses an fp8 pool for the others at config time."""
+        return slab.view(torch.uint8) if self._fp8 else slab
+
     def k_cache(self, index: int) -> torch.Tensor:
-        return self._k_buffer[self._dense(index)]
+        return self._kernel_view(self._k_buffer[self._dense(index)])
 
     def v_cache(self, index: int) -> torch.Tensor:
-        return self._v_buffer[self._dense(index)]
+        return self._kernel_view(self._v_buffer[self._dense(index)])
 
     def store_kv(
         self,
@@ -127,9 +141,19 @@ class MHAKVCache(BaseKVCachePool):
         from freetoken.kernel import store_cache
 
         dense = self._dense(layer_id)
+        k_cache = self._k_buffer[dense].view(self._storage_shape)
+        v_cache = self._v_buffer[dense].view(self._storage_shape)
+        if self._fp8:
+            # store_cache is a width-templated byte copy, not a converting store, so the
+            # rounding has to happen here and both sides go in as bytes of equal width.
+            from freetoken.kernel.triton.e4m3_compat import quantize_e4m3
+
+            k, v = quantize_e4m3(k), quantize_e4m3(v)
+            k_cache = k_cache.view(torch.uint8)
+            v_cache = v_cache.view(torch.uint8)
         store_cache(
-            k_cache=self._k_buffer[dense].view(self._storage_shape),
-            v_cache=self._v_buffer[dense].view(self._storage_shape),
+            k_cache=k_cache,
+            v_cache=v_cache,
             indices=out_loc,
             k=k,
             v=v,

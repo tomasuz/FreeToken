@@ -16,6 +16,33 @@ class CacheRebuildRejected(Exception):
     this is recoverable, unlike a failure after the free."""
 
 
+# KV storage widths that are NOT the activation width. Deliberately short: a name only
+# belongs here once the store path quantizes into it and every attention kernel reading
+# that pool decodes it back (fp8: MHAKVCache.store_kv and triton attention's _load_kv).
+KV_CACHE_DTYPES: dict[str, "torch.dtype"] = {
+    "fp8_e4m3": torch.float8_e4m3fn,
+}
+
+
+def kv_storage_dtype(config) -> torch.dtype:
+    """Element type of the paged K/V slabs, which need not be the model's own.
+
+    ``auto`` follows the activation dtype -- the only choice every pool family and
+    attention backend can serve. Anything else is an explicit request the engine has
+    already checked against the resolved pool/backend pair; this stays the single place
+    the name turns into a dtype, so sizing and allocation cannot disagree about it."""
+    name = getattr(config, "kv_cache_dtype", "auto") or "auto"
+    if name == "auto":
+        return config.dtype
+    try:
+        return KV_CACHE_DTYPES[name]
+    except KeyError:
+        raise ValueError(
+            f"unknown kv_cache_dtype {name!r}; expected "
+            + "|".join(["auto", *KV_CACHE_DTYPES])
+        ) from None
+
+
 def spec_kv_bytes_per_token(spec, config) -> int:
     """One paged-KV group's bytes per token: (1|2 slabs) x head_dim x local kv heads x dtype
     x layers, plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
@@ -29,7 +56,7 @@ def spec_kv_bytes_per_token(spec, config) -> int:
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim
         * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * config.dtype.itemsize
+        * kv_storage_dtype(config).itemsize
         * spec.num_layers
     )
     return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio

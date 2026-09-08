@@ -386,6 +386,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        default=ServerArgs.kv_cache_dtype,
+        choices=["auto", "fp8_e4m3"],
+        help="Width of the paged K/V cache. 'auto' follows --dtype; 'fp8_e4m3' stores "
+        "e4m3 and decodes on read, halving KV bytes (~3%% relative error per element) so "
+        "the freed VRAM can go to context length or MoE expert slots. Paged-MHA models on "
+        "the triton attention backend only.",
+    )
+
+    parser.add_argument(
         "--cache-type",
         type=str,
         default=ServerArgs.cache_type,

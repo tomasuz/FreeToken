@@ -92,6 +92,18 @@ def e4m3_native_cx():
     return not FORCE_EMU and target_info.cuda_capability_geq(8, 9)
 
 
+E4M3_MAX = 448.0
+
+
+def quantize_e4m3(t: torch.Tensor) -> torch.Tensor:
+    """Round a tensor onto the e4m3 grid and hand back the raw bytes.
+
+    The clamp is not cosmetic. torch's cast is the non-saturating ``fn`` variant, so a
+    magnitude past 448 becomes the NaN code rather than the largest finite value, and a
+    single NaN key takes a whole attention row with it through the softmax."""
+    return t.clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn).view(torch.uint8)
+
+
 @jit
 def e4m3_u8_to_f32(v):
     """Decode e4m3 bits (uint8) to fp32: place exp+mantissa in the fp16 field

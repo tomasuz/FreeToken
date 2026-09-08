@@ -23,6 +23,7 @@ from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
+from freetoken.kvcache.base import KV_CACHE_DTYPES, kv_storage_dtype
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
@@ -354,7 +355,7 @@ class Engine:
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=self.device, dtype=self.dtype
+            config, self.num_pages, device=self.device, dtype=kv_storage_dtype(config)
         )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
@@ -1717,6 +1718,28 @@ def _adjust_config(config: EngineConfig):
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)
+
+    kv_dtype_name = getattr(config, "kv_cache_dtype", "auto") or "auto"
+    if kv_dtype_name != "auto":
+        # A narrow KV pool is not a property of the cache alone: something has to quantize
+        # on the way in and decode on every read. Only the paged-MHA pool and the triton
+        # kernels carry both halves, so an unsupported pair is rejected here rather than
+        # silently allocating a slab whose bytes the kernels would read as activations.
+        from freetoken.kvcache.mha_pool import MHAKVCache
+
+        if kv_dtype_name not in KV_CACHE_DTYPES:
+            raise ValueError(
+                f"--kv-cache-dtype {kv_dtype_name!r}: expected "
+                + "|".join(["auto", *KV_CACHE_DTYPES])
+            )
+        pool_cls = resolve_pool_class(model_config)
+        if pool_cls is not MHAKVCache or config.attention_backend != "triton":
+            raise ValueError(
+                f"--kv-cache-dtype {kv_dtype_name!r} is implemented for the paged MHA pool "
+                f"on the triton attention backend only; this model resolved to "
+                f"{pool_cls.__name__} on {config.attention_backend!r}. Drop the flag to "
+                "keep the cache at the activation width."
+            )
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts
