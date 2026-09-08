@@ -18,6 +18,7 @@ environment before spawn; by the time this module imports torch, they are simply
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 
@@ -67,6 +68,7 @@ class _BankLibrary:
         self._slots = slots
         self._in_place = in_place
         self._in_place_warned = False
+        self._in_place_noted = False
         self._maps: dict[int, dict] = {}
         self._caches: dict[int, WorkerSlotCache] = {}
         any_name = next(iter(spec))
@@ -89,12 +91,17 @@ class _BankLibrary:
             # bank where it lies. Costs no device memory, so every layer can have one.
             try:
                 cache = WorkerInPlaceBanks(tensors, device=device)
+                if self._in_place_noted is False:
+                    print("worker: reading banks in place (GTT, no device copy)",
+                          file=sys.stderr, flush=True)
+                    self._in_place_noted = True
             except Exception as exc:
                 # Reading in place is an optimisation, not a requirement. A runtime that
                 # will not map these pages for this device is a reason to copy them, not a
                 # reason for the engine to stop -- say so once and take the other path.
                 if self._in_place_warned is False:
-                    print(f"worker: cannot read banks in place ({exc}); copying instead",
+                    print(f"worker: cannot read banks in place on layer {layer_id} "
+                          f"({type(exc).__name__}: {exc}); copying instead",
                           file=sys.stderr, flush=True)
                     self._in_place_warned = True
                 self._in_place = False
@@ -133,15 +140,17 @@ def main() -> int:
     # zero-copy read this would be a prerequisite for is a separate piece of work, and can
     # bring its own registration when it is written.
 
-    from freetoken.moe.fused_q4_0 import fused_experts_gguf
-
-    ggml_type = int(_SPEC["ggml_type"])
+    expert_call = _expert_call(_SPEC.get("quant_format", "q4_0"), _SPEC.get("ggml_type"))
     activation = _SPEC["activation"]
-    act_fn = _resolve_activation(activation, _SPEC.get("activation_backend", "auto"))
+    act_fn = _resolve_activation(
+        activation,
+        os.environ.get("FREETOKEN_WORKER_ACTIVATION")
+        or _SPEC.get("activation_backend", "auto"),
+    )
     # Announce readiness only once the kernels are actually loaded: the first launch JIT
     # compiles, and a parent that started timing before that would blame the first token.
-    _warm(library.cache_for(library.layers[0], device), io, device, activation, ggml_type,
-          fused_experts_gguf, act_fn)
+    _warm(library.cache_for(library.layers[0], device), io, device, activation,
+          expert_call, act_fn)
     ctl.tensor[_UP] = 1  # the parent waits for this before its first submit
 
     ready, done = flags["ready"].tensor, flags["done"].tensor
@@ -171,10 +180,7 @@ def main() -> int:
         host_ids = io["ids"].tensor[:bs]
         for lo, hi in cache.partition(host_ids):
             ids = cache.ensure(host_ids[lo:hi])
-            out = fused_experts_gguf(
-                x[lo:hi], cache.dev["gate_up"], cache.dev["down"], w[lo:hi],
-                ids, activation, ggml_type, act_fn,
-            )
+            out = expert_call(x[lo:hi], cache.dev, w[lo:hi], ids, activation, act_fn)
             io["y"].tensor[lo:hi].copy_(out)  # cross-device copy; syncs on this stream
         torch.cuda.synchronize(device)
 
@@ -210,11 +216,19 @@ def _resolve_activation(name: str, backend: str):
     from freetoken.moe.fused_q4_0 import _ACT
 
     kernel_fn = _ACT.get(name)
-    if kernel_fn is None or torch_fn is None:
+    if torch_fn is None:
+        return None
+    # A name this table does not carry is still served by a compiled activation inside
+    # fused_experts_gguf, so "not listed here" is not "not compiled" -- returning None on
+    # that basis is how an uncompilable device used to reach the kernel anyway. Probe with
+    # whatever compiled activation is reachable instead: the failure being guarded against
+    # ("unsupported target") is a property of the device, not of one kernel.
+    probe_fn = kernel_fn or next(iter(_ACT.values()), None)
+    if probe_fn is None:
         return None
     probe = torch.zeros(1, 2, dtype=torch.bfloat16, device="cuda")
     try:
-        kernel_fn(probe)
+        probe_fn(probe)
         torch.cuda.synchronize()
     except Exception as exc:
         print(
@@ -226,7 +240,40 @@ def _resolve_activation(name: str, backend: str):
     return None
 
 
-def _warm(cache, io, device, activation, ggml_type, fn, act_fn=None) -> None:
+def _expert_call(quant_format: str, ggml_type):
+    """Bind this checkpoint's expert kernel to the worker's one calling shape.
+
+    Returns ``f(x, banks, w, ids, activation, act_fn)``. The bank names a format needs are
+    known only to the format, so they are named here and nowhere else in the worker: the
+    decode loop and the warm-up both stay format-agnostic, and adding a format is adding a
+    branch here rather than threading a second set of arguments through both.
+    """
+    if quant_format == "nvfp4":
+        from freetoken.moe.fused_nvfp4_vec import fused_experts_nvfp4_vec
+
+        names = ("gate_up_packed", "gate_up_scale", "gate_up_global",
+                 "down_packed", "down_scale", "down_global")
+
+        def call(x, banks, w, ids, activation, act_fn):
+            return fused_experts_nvfp4_vec(
+                x, *(banks[n] for n in names), w, ids, activation, act_fn
+            )
+
+        return call
+
+    from freetoken.moe.fused_q4_0 import fused_experts_gguf
+
+    qt = int(ggml_type)
+
+    def call(x, banks, w, ids, activation, act_fn):
+        return fused_experts_gguf(
+            x, banks["gate_up"], banks["down"], w, ids, activation, qt, act_fn
+        )
+
+    return call
+
+
+def _warm(cache, io, device, activation, fn, act_fn=None) -> None:
     """One throwaway launch so the JIT compile lands before the parent starts timing."""
     # Built here rather than sliced from the shared buffers: a warm-up wants representative
     # shapes, not whatever those pages happen to hold, and routing ids that are merely
@@ -237,7 +284,7 @@ def _warm(cache, io, device, activation, ggml_type, fn, act_fn=None) -> None:
     # first real step and its own failures surface here rather than mid-request.
     ids = cache.ensure(torch.zeros(1, io["ids"].tensor.shape[1], dtype=torch.int32))
     try:
-        fn(x, cache.dev["gate_up"], cache.dev["down"], w, ids, activation, ggml_type, act_fn)
+        fn(x, cache.dev, w, ids, activation, act_fn)
         torch.cuda.synchronize(device)
     except Exception as exc:  # a warm-up failure is the parent's problem, not a crash here
         print(f"worker warmup failed: {exc}", file=sys.stderr, flush=True)

@@ -144,7 +144,8 @@ class WorkerMoeExecutor:
         device_index: int,
         banks: dict[str, torch.Tensor],
         *,
-        ggml_type: int,
+        quant_format: str,
+        ggml_type: int | None = None,
         activation: str = "silu",
         max_batch: int = 64,
         hidden_size: int | None = None,
@@ -221,7 +222,10 @@ class WorkerMoeExecutor:
             "flags": {n: self._entry(b) for n, b in self._flags.items()},
             "slots": self.slots,
             "read_in_place": self.reads_in_place,
-            "ggml_type": int(ggml_type),
+            # The format picks the kernel in the worker; ggml_type further picks the
+            # block layout within the GGUF family and is meaningless outside it.
+            "quant_format": quant_format,
+            "ggml_type": None if ggml_type is None else int(ggml_type),
             "activation": activation,
             # "auto" lets the worker fall back to torch where the compiled activation has
             # no backend for its device; "kernel"/"torch" force one.

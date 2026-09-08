@@ -15,6 +15,11 @@ from freetoken.utils import init_logger
 class ServerArgs(SchedulerConfig):
     server_host: str = "127.0.0.1"
     server_port: int = 1919
+    # Port for the engine's own torch.distributed rendezvous (loopback only; never the
+    # HTTP surface). None derives it as server_port + 1, which is fine on an empty host
+    # and wrong the moment something else already holds that number -- the engine then
+    # dies on EADDRINUSE from a port nobody asked for. Set it when the neighbour matters.
+    distributed_port: int | None = None
     num_tokenizer: int = 0
     silent_output: bool = False
     # The terminal shell is attached to this server (ft shell --model / ft serve --shell-mode).
@@ -74,7 +79,8 @@ class ServerArgs(SchedulerConfig):
 
     @property
     def distributed_addr(self) -> str:
-        return f"tcp://127.0.0.1:{self.server_port + 1}"
+        port = self.distributed_port or self.server_port + 1
+        return f"tcp://127.0.0.1:{port}"
 
 
 def parse_args(
@@ -383,6 +389,15 @@ def parse_args(
         default="huggingface",
         choices=["huggingface", "modelscope"],
         help="The source to download model from. Either 'huggingface' or 'modelscope'.",
+    )
+
+    parser.add_argument(
+        "--distributed-port",
+        type=int,
+        default=ServerArgs.distributed_port,
+        help="Loopback port for the engine's internal torch.distributed rendezvous. "
+        "Defaults to --port + 1; pass one explicitly when that number is already taken "
+        "by something else on the host.",
     )
 
     parser.add_argument(

@@ -842,10 +842,14 @@ class Engine:
         from freetoken.gguf_quant import GGUF_EXPERT_FORMATS
         from freetoken.moe.worker_executor import WorkerMoeExecutor
 
-        if cache.quant_format not in GGUF_EXPERT_FORMATS:
+        # Formats a worker has a kernel for. NVFP4 is served by a hipcc/nvcc build of the
+        # same arithmetic Triton does (kernel/csrc/nvfp4_moe), which is what lets a device
+        # Triton has no backend for take a share; the GGUF family is served by the
+        # borrowed ggml kernels. Anything else has no worker path yet.
+        if cache.quant_format not in GGUF_EXPERT_FORMATS and cache.quant_format != "nvfp4":
             raise NotImplementedError(
-                f"--moe-worker-layers serves native GGUF experts; this checkpoint's "
-                f"expert format is {cache.quant_format!r}"
+                f"--moe-worker-layers serves native GGUF or NVFP4 experts; this "
+                f"checkpoint's expert format is {cache.quant_format!r}"
             )
         # A worker is a second process with its own accelerator runtime, and it starts at
         # the point where this one is holding every expert bank it has not yet given away.
@@ -880,7 +884,8 @@ class Engine:
             worker = WorkerMoeExecutor(
                 device,
                 catalogue,
-                ggml_type=GGUF_EXPERT_FORMATS[cache.quant_format],
+                quant_format=cache.quant_format,
+                ggml_type=GGUF_EXPERT_FORMATS.get(cache.quant_format),
                 activation=getattr(model_config, "hidden_act", "silu"),
                 max_batch=max_batch,
                 hidden_size=model_config.hidden_size,
