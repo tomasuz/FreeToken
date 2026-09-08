@@ -45,19 +45,30 @@ def alloc_pinned_tensor(*shape: int, dtype: torch.dtype) -> torch.Tensor:
     return _load_pinned_extension().alloc_pinned_tensor(list(shape), dtype)
 
 
-def host_register(addr: int, nbytes: int) -> None:
-    """cudaHostRegister ``nbytes`` at ``addr`` as portable+mapped (pin-after-fill).
+_PAGE = 4096  # registration granularity for both runtimes
 
-    A rejection here says only "invalid argument", which fits several very different
-    causes, so the numbers that would separate them travel with it: the runtime wants a
-    page-aligned address, and the caller usually believes it has one.
+
+def host_register(addr: int, nbytes: int) -> None:
+    """cudaHostRegister the pages covering ``[addr, addr+nbytes)`` as portable+mapped.
+
+    The range is widened to page boundaries before it is handed over, because page
+    granularity is what the runtime actually registers in and an unaligned start is
+    refused outright. A tensor is page-aligned only by luck -- a view into a larger
+    buffer, or a bank packed behind another one in the same mapping, generally is not --
+    and the refusal reads "invalid argument", the same words used for genuinely different
+    mistakes, so the cause is not apparent from the message. Widening is safe: mappings
+    and heap allocations are made of whole pages, so a page holding any byte of the range
+    is mapped for all of it.
     """
+    start = addr - (addr % _PAGE)
+    end = addr + nbytes
+    end += -end % _PAGE
     try:
-        _load_pinned_extension().host_register(addr, nbytes)
+        _load_pinned_extension().host_register(start, end - start)
     except RuntimeError as exc:
         raise RuntimeError(
-            f"{exc} (addr=0x{addr:x}, page offset {addr % 4096}, "
-            f"{nbytes} bytes, {nbytes % 4096} over a page)"
+            f"{exc} (addr=0x{addr:x} widened to 0x{start:x}, "
+            f"{nbytes} bytes widened to {end - start})"
         ) from None
 
 
