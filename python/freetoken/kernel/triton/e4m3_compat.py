@@ -60,10 +60,14 @@ def e4m3_native() -> bool:
         if FORCE_EMU:
             _native = False
         else:
-            from freetoken.gpu_select import assigned_visible_gpu
-
-            # one process runs on one GPU, so its convention is that GPU's; None (-> the current device) only before the process binds
-            _native = torch.cuda.get_device_capability(assigned_visible_gpu()) >= (8, 9)
+            # Ask the same source the kernel asks. A compute-capability number is not a
+            # valid test for native fp8 outside CUDA: on ROCm the tensor library reports a
+            # fabricated capability for AMD parts -- gfx1200 comes back as (12, 0), which
+            # passes >= (8, 9) while the compiler target has no such notion and builds the
+            # emulation branch instead. The two then disagree, the host hands the kernel an
+            # fp8 tensor the emulation path cannot type, and compilation dies on a cast
+            # error naming neither the device nor the detector. One fact, one detector.
+            _native = target_info.cuda_capability_geq(8, 9)
     return _native
 
 
