@@ -176,7 +176,7 @@ def main() -> int:
         cache = library.cache_for(int(slot_layer[slot]), device)
         x = io["x"].tensor[:bs].to(device, non_blocking=False)
         w = io["w"].tensor[:bs].to(device, non_blocking=False)
-        if _TRACE and _traced < 12:
+        if _TRACE and _traced < 400:
             print(f"worker: step {_traced} layer {int(slot_layer[slot])} "
                   f"|x|={float(x.float().abs().sum()):.4f} "
                   f"|w|={float(w.float().abs().sum()):.4f} "
@@ -192,6 +192,9 @@ def main() -> int:
             ids = cache.ensure(host_ids[lo:hi])
             out = expert_call(x[lo:hi], cache.dev, w[lo:hi], ids, activation, act_fn)
             io["y"].tensor[lo:hi].copy_(out)  # cross-device copy; syncs on this stream
+            if _TRACE and _traced <= 400:
+                print(f"worker:   -> |y|={float(out.float().abs().sum()):.4f} "
+                      f"rows={lo}:{hi}", file=sys.stderr, flush=True)
         torch.cuda.synchronize(device)
 
         control[_HITS], control[_MISSES] = library.stats()

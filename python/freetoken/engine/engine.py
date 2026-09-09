@@ -895,6 +895,7 @@ class Engine:
                 top_k=model_config.num_experts_per_tok,
                 env=envs.get(device, {}),
                 slots=slots.get(device),
+                serves_layers=worker_layers.get(device),
             )
             for layer_id in catalogue.layers:
                 executors[layer_id] = worker

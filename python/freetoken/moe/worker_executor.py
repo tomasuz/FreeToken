@@ -156,6 +156,7 @@ class WorkerMoeExecutor:
         env: dict[str, str] | None = None,
         activation_backend: str = "auto",
         slots: int | None = None,
+        serves_layers: frozenset[int] | None = None,
     ) -> None:
         self.device_index = device_index
         # Copy sources a captured graph's nodes point at; see decode_submit.
@@ -214,6 +215,15 @@ class WorkerMoeExecutor:
         self.reads_in_place = os.getenv("FREETOKEN_WORKER_READ_IN_PLACE", "0") == "1"
         num_experts = banks.num_experts
         self.layers = sorted(banks.layers)
+        # Which of those it is actually offered. Mapping every layer costs nothing and is
+        # why the catalogue holds them all, but being *offered* one is not free under a
+        # captured decode: there is no way to ask the device whether a layer's share came
+        # out empty -- that answer would have to reach the host -- so the doorbell is rung
+        # for every offered layer whether or not there is work in it, and each ring is a
+        # round trip to another process. Restricting the offer to what --moe-worker-layers
+        # asked for is therefore the difference between paying for four of those per token
+        # and paying for forty.
+        self._offered = None if serves_layers is None else frozenset(serves_layers)
         # One token's experts are read by a single launch, so top_k is the floor. A wider
         # step is split into several launches by the worker's cache, which is what keeps
         # this a memory choice rather than a cap on batch width. Unset holds a layer's whole
@@ -390,16 +400,8 @@ class WorkerMoeExecutor:
         self.stream_handshake = False
         if not torch.cuda.is_available():
             return
-        if os.getenv("FREETOKEN_WORKER_STREAM_HANDSHAKE", "0") != "1":
-            # Off until the last fault below it is found. The doorbell and the wait are
-            # correct now -- each is checked by capturing and replaying it, and the wait is
-            # checked to BLOCK with the flag clear, not merely to let go once it is set --
-            # and with them a captured replay really does drive the worker. What is still
-            # wrong is what comes back: with this path on, the first worker layer returns
-            # something that makes every later layer NaN, eagerly as well as under replay,
-            # while the polled path with the same kernels and the same banks is correct.
-            # So the fault is in this handoff, not in the worker's arithmetic.
-            return
+        if os.getenv("FREETOKEN_WORKER_STREAM_HANDSHAKE", "1") != "1":
+            return  # escape hatch: forces the polled path, and with it eager decode
         try:
             from freetoken.kernel import _cpu_moe
         except Exception as exc:  # the extension is optional; the polled path still works
@@ -554,7 +556,10 @@ class WorkerMoeExecutor:
             time.sleep(0)
 
     def serves(self, layer_id: int) -> bool:
-        """Whether this worker can reach ``layer_id``'s weights at all."""
+        """Whether this worker should be offered ``layer_id``: its weights are reachable
+        and it was asked for that layer."""
+        if self._offered is not None and layer_id not in self._offered:
+            return False
         return layer_id in self.layers
 
     def slot_stats(self) -> dict:

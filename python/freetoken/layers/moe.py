@@ -1,3 +1,4 @@
+import os
 import time
 from typing import TYPE_CHECKING, Tuple
 
@@ -8,6 +9,11 @@ from freetoken.moe import is_offload_moe_backend
 from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl, fused_topk
 from freetoken.gguf_quant import GGUF_EXPERT_FORMATS
 from freetoken.moe.offload_cache import OffloadMoeCache
+
+# Compare what a worker produced against what came back: the same number if the handoff
+# is sound, and the place the two diverge if it is not.
+_TRACE_HANDOFF = os.environ.get("FREETOKEN_WORKER_TRACE") == "1"
+
 from freetoken.utils import div_even
 
 from .base import BaseOP
@@ -418,7 +424,17 @@ class OffloadMoELayer(MoELayer):
         shares = cache.split_shares(self.layer_id, names)
 
         # The kernel fetches this fraction of the misses; the rest overflow to the helpers.
-        cache.hybrid_fetch_fraction = float(shares.get("gpu", 1.0))
+        # Under capture this device fetches every miss, and the helpers are left with
+        # nothing. Not a preference: the capped fetch is not capture-safe. Its cap reaches
+        # the kernel as a host-computed scalar, which a capture bakes into the node, while
+        # the routing it caps is recomputed on every replay -- and the result is wrong
+        # answers, reproducibly (correct with the cap lifted, garbage with it in place, on
+        # the same graph and the same worker). A helper that idles costs a doorbell; a
+        # helper fed by a frozen cap costs the answer.
+        capturing_now = torch.cuda.is_current_stream_capturing()
+        cache.hybrid_fetch_fraction = (
+            1.0 if capturing_now else float(shares.get("gpu", 1.0))
+        )
         cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
         if cache.collect_stats:
             cache.record_decode_stats_hybrid(self.layer_id)
@@ -467,9 +483,14 @@ class OffloadMoELayer(MoELayer):
         )
         cache.note_step_timing(fetch_start, fetch_end, cache.record_event())
 
-        capturing = torch.cuda.is_current_stream_capturing()
+        capturing = capturing_now
         for name, handle in pending.items():
-            out = out + _sync(helpers[name], handle)
+            part = _sync(helpers[name], handle)
+            if _TRACE_HANDOFF and not capturing:
+                print(f"engine: layer {self.layer_id} <- {name} "
+                      f"|y|={float(part.float().abs().sum()):.4f} "
+                      f"routes={int(assignment[name].sum())}", flush=True)
+            out = out + part
             if capturing:
                 # A capture traces this once and replays the nodes; the Python around them
                 # never runs again. A sample taken here would therefore describe the
