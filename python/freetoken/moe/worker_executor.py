@@ -62,6 +62,9 @@ _DTYPE_NAMES = {
     torch.bfloat16: "bfloat16",
     torch.float16: "float16",
     torch.int64: "int64",
+    # NVFP4 block scales are stored in their own type, not as raw bytes; the worker
+    # reopens them as this and takes a byte view only where a kernel needs one.
+    torch.float8_e4m3fn: "float8_e4m3fn",
 }
 
 
@@ -155,6 +158,8 @@ class WorkerMoeExecutor:
         slots: int | None = None,
     ) -> None:
         self.device_index = device_index
+        # Copy sources a captured graph's nodes point at; see decode_submit.
+        self._retained: dict[int, tuple] = {}
         self._proc: subprocess.Popen | None = None
         self._bufs: list = []
         self._keep_spec = False
@@ -386,13 +391,14 @@ class WorkerMoeExecutor:
         if not torch.cuda.is_available():
             return
         if os.getenv("FREETOKEN_WORKER_STREAM_HANDSHAKE", "0") != "1":
-            # Off by default, and deliberately. The handshake below is the thing that makes
-            # a captured decode possible, and it does capture -- but the worker's own
-            # contribution is not yet right under replay, so capture is disabled anyway and
-            # this path buys nothing while it lasts. It also carries a fault of its own:
-            # exercised here, the address-issued copies produce an illegal access that
-            # surfaces asynchronously a step later. Both are the same piece of unfinished
-            # work; whoever picks it up can turn this on and see them.
+            # Off until the last fault below it is found. The doorbell and the wait are
+            # correct now -- each is checked by capturing and replaying it, and the wait is
+            # checked to BLOCK with the flag clear, not merely to let go once it is set --
+            # and with them a captured replay really does drive the worker. What is still
+            # wrong is what comes back: with this path on, the first worker layer returns
+            # something that makes every later layer NaN, eagerly as well as under replay,
+            # while the polled path with the same kernels and the same banks is correct.
+            # So the fault is in this handoff, not in the worker's arithmetic.
             return
         try:
             from freetoken.kernel import _cpu_moe
@@ -403,19 +409,20 @@ class WorkerMoeExecutor:
                 f"captured into CUDA graphs"
             )
             return
-        from freetoken.kernel.pinned import alloc_pinned_tensor
+        # Ask a capture, not the runtime. Stream memory operations -- the natural way to
+        # write this, and what stood here first -- answer yes to every check available
+        # outside a capture and then record nothing inside one: torch reports an empty
+        # graph and a replay performs neither half. The kernels below are ordinary graph
+        # nodes, and this asks the only question that cannot be wrong about them.
+        from freetoken.kernel import handshake
 
-        probe = alloc_pinned_tensor(1, dtype=torch.int64)
-        probe.zero_()
-        if not _cpu_moe.memops_probe(
-            torch.cuda.current_stream().cuda_stream, probe.data_ptr()
-        ):
+        if not handshake.replays_correctly():
             logger.info_rank0(
-                f"worker on device {self.device_index}: CUDA stream memory operations are "
-                f"not supported here, using the polled handshake -- decode will not be "
-                f"captured into CUDA graphs"
+                f"worker on device {self.device_index}: the handshake does not survive "
+                f"graph capture here, using the polled one -- decode will stay eager"
             )
             return
+        self._handshake = handshake
         for buf in list(self._flags.values()) + list(self._io.values()):
             buf.pin()
         self._memops = _cpu_moe
@@ -469,8 +476,17 @@ class WorkerMoeExecutor:
             # did not allocate is not in it -- so an ordinary copy here is treated as a
             # pageable one, which is synchronous, which a capture rejects.
             stream = torch.cuda.current_stream().cuda_stream
+            x_src = hidden_states.contiguous()
+            # Hold the sources. A capture turns each copy into a node reading a FIXED
+            # address, but these are locals: the allocator reclaims them the moment this
+            # returns and then hands that memory to something later in the same graph, so
+            # a replay copies whatever now lives there. That is why a worker given correct
+            # activations eagerly received rubbish under replay -- and why the fault looked
+            # like it lived in the worker rather than in what reached it. One set per slot,
+            # so this is bounded by the number of shapes, not by the number of steps.
+            self._retained[slot] = (x_src, ids32, w32)
             for buf, src in (
-                (self._io["x"], hidden_states.contiguous()),
+                (self._io["x"], x_src),
                 (self._io["ids"], ids32),
                 (self._io["w"], w32),
             ):
@@ -492,8 +508,7 @@ class WorkerMoeExecutor:
 
         # Both halves go on the stream, so a capture records them and a replay drives the
         # worker for real instead of reading whatever the buffer held last.
-        self._memops.memop_submit(
-            torch.cuda.current_stream().cuda_stream,
+        self._handshake.doorbell(
             self._flags["done"].tensor.data_ptr(),
             self._flags["ready"].tensor.data_ptr(),
             slot,
@@ -509,7 +524,7 @@ class WorkerMoeExecutor:
         # A front-end wait: this stream's later nodes do not run until the worker reports
         # done, and the wait itself is a node like any other.
         stream = torch.cuda.current_stream().cuda_stream
-        self._memops.memop_sync(stream, self._flags["done"].tensor.data_ptr(), slot)
+        self._handshake.wait(self._flags["done"].tensor.data_ptr(), slot)
         out = torch.empty(
             (bs, self._io["y"].tensor.shape[1]), dtype=self._io["y"].tensor.dtype,
             device=device,

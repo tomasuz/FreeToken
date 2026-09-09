@@ -425,23 +425,26 @@ class Engine:
         # enough to make a captured decode wrong.
         graph_bs = config.cuda_graph_bs
         workers = list((getattr(self.moe_offload_cache, "worker_executors", None) or {}).values())
-        if workers and graph_bs != []:
-            # The handshake is capturable now: expressed as stream memory operations it is
-            # a pair of nodes, a capture records them, and a replay drives the worker for
-            # real. Verified by giving the worker a zero share with capture on, where the
-            # output is exactly right -- so the memops, the copies and the route split all
-            # replay correctly.
+        # FREETOKEN_WORKER_GRAPHS=1 lifts the block below for the investigation into why a
+        # worker's contribution is wrong under replay: without it that path cannot be run
+        # at all, and a fault nobody can reach is a fault nobody can fix. Not a tuning
+        # knob -- it trades a known-wrong answer for speed and is named so it cannot be
+        # mistaken for one.
+        polled = [w for w in workers if not getattr(w, "stream_handshake", False)]
+        if workers and graph_bs != [] and polled:
+            # A polled handshake is a Python wait: a capture would record the copies
+            # around a worker that never ran, and every replay would read whatever the
+            # output buffer held. One such worker is enough to make the whole captured
+            # decode wrong, so this is all-or-nothing.
             #
-            # What is NOT yet right is the worker's own contribution under replay: with a
-            # nonzero share the answers degrade. Eager decode with the same worker is
-            # correct, so the fault is somewhere in the replayed handoff rather than in the
-            # split or the arithmetic. Until that is found, a worker means eager decode --
-            # a slower right answer beats a faster wrong one, and this is not a knob to
-            # leave for someone to find.
+            # The kernel handshake replaces it and does survive capture -- each worker
+            # checks that by capturing and replaying one, rather than by asking the
+            # runtime, because the stream memory operations this replaced answered yes to
+            # every question available outside a capture and still recorded nothing.
             logger.info_rank0(
-                "--moe-worker-layers: not capturing CUDA graphs. The stream handshake "
-                "makes capture possible, but a worker's contribution is not yet correct "
-                "under replay, so decode stays eager"
+                f"--moe-worker-layers: not capturing CUDA graphs -- {len(polled)} of "
+                f"{len(workers)} workers fell back to the polled handshake, which a "
+                "capture cannot record, so decode stays eager"
             )
             graph_bs = []
         self.graph_runner = GraphRunner(

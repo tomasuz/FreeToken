@@ -467,14 +467,22 @@ class OffloadMoELayer(MoELayer):
         )
         cache.note_step_timing(fetch_start, fetch_end, cache.record_event())
 
+        capturing = torch.cuda.is_current_stream_capturing()
         for name, handle in pending.items():
             out = out + _sync(helpers[name], handle)
+            if capturing:
+                # A capture traces this once and replays the nodes; the Python around them
+                # never runs again. A sample taken here would therefore describe the
+                # tracing pass and then stand forever, which is worse than no sample --
+                # and reading the count is a device-to-host read, which ends the capture
+                # outright. The rates learned from the eager steps before capture stand.
+                continue
             # Count the routes this executor actually received. Reading a device tensor
-            # costs a synchronisation, which is why this cannot stand if decode is ever
-            # captured -- but the alternative tried first, charging it the share it was
-            # given, measures a different quantity from the one the main device is measured
-            # in, and the two are then not comparable. That put a 1400 GB/s reading on the
-            # slower device and sent it 99% of the work.
+            # costs a synchronisation, which is why this cannot stand under capture -- but
+            # the alternative tried first, charging it the share it was given, measures a
+            # different quantity from the one the main device is measured in, and the two
+            # are then not comparable. That put a 1400 GB/s reading on the slower device
+            # and sent it 99% of the work.
             cache.rate_tracker.observe(
                 name, int(assignment[name].sum()), time.perf_counter() - started[name],
                 cache.bytes_per_expert,

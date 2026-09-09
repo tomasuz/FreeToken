@@ -45,6 +45,7 @@ _DTYPES = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
     "int64": torch.int64,
+    "float8_e4m3fn": torch.float8_e4m3fn,
 }
 
 
@@ -153,6 +154,8 @@ def main() -> int:
           expert_call, act_fn)
     ctl.tensor[_UP] = 1  # the parent waits for this before its first submit
 
+    _TRACE = os.environ.get("FREETOKEN_WORKER_TRACE") == "1"
+    _traced = 0
     ready, done = flags["ready"].tensor, flags["done"].tensor
     slot_layer, slot_bs = flags["slot_layer"].tensor, flags["slot_bs"].tensor
     control = ctl.tensor
@@ -173,6 +176,13 @@ def main() -> int:
         cache = library.cache_for(int(slot_layer[slot]), device)
         x = io["x"].tensor[:bs].to(device, non_blocking=False)
         w = io["w"].tensor[:bs].to(device, non_blocking=False)
+        if _TRACE and _traced < 12:
+            print(f"worker: step {_traced} layer {int(slot_layer[slot])} "
+                  f"|x|={float(x.float().abs().sum()):.4f} "
+                  f"|w|={float(w.float().abs().sum()):.4f} "
+                  f"ids={io['ids'].tensor[:bs].reshape(-1)[:6].tolist()}",
+                  file=sys.stderr, flush=True)
+            _traced += 1
         # The ids stay on the host for one more moment: placement is decided here, and what
         # the kernel receives is slot numbers, not expert ids. A step wider than the cache
         # becomes several launches -- one range at a time, each refilled before it runs, so
