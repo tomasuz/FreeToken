@@ -662,10 +662,24 @@ class Engine:
         # split residency: where pinning is quota-capped (_pin_budget_bytes), pin only the GPU layers' banks and mlock the CPU layers'
         # uncapped hosts keep every bank pinned (CPU decode reads them the same; overlap prefill stays on)
         # not applied to plain --moe-backend cpu; all-locked under a cap = --moe-backend offload --moe-cpu-layers 1.0
-        split_residency = (
-            bool(cpu_layer_ids)
-            and config.moe_backend in ("offload", "hybrid")
-            and _pin_budget_bytes(self._host_tables_bytes) is not None
+        # A layer an in-place worker serves gets registered twice over: once here, for
+        # this device's copies, and again inside the worker so its own device can read the
+        # same pages. Pinning is capped near the size of RAM and the cap is shared across
+        # processes, so the second registration is refused partway in and the worker falls
+        # back to copying -- the one thing reading in place exists to avoid. Measured on
+        # this host: 16 GiB pinned here leaves 12.5 for the worker, against 20 when it has
+        # the machine to itself. Those layers move no bytes from here, so lock them
+        # instead: resident, but without a device address this process would never use.
+        inplace_layers: set[int] = set()
+        if worker_layers and os.getenv("FREETOKEN_WORKER_READ_IN_PLACE", "0") == "1":
+            for ids in worker_layers.values():
+                inplace_layers |= set(ids)
+        split_residency = config.moe_backend in ("offload", "hybrid") and (
+            bool(inplace_layers)
+            or (
+                bool(cpu_layer_ids)
+                and _pin_budget_bytes(self._host_tables_bytes) is not None
+            )
         )
         if config.moe_backend == "cpu" and not split_residency:
             # cpu mode pins every bank for the prefill double buffer; over the pin cap that dies in cudaHostRegister, so lock everything instead
@@ -700,10 +714,18 @@ class Engine:
                 from freetoken.moe.host_banks import HostResidency
 
                 requested_residency = [
-                    HostResidency.LOCKED.value if i in cpu_layer_ids
+                    HostResidency.LOCKED.value
+                    if i in cpu_layer_ids or i in inplace_layers
                     else HostResidency.PINNED.value
                     for i in range(config.model_config.num_moe_layers)
                 ]
+                if inplace_layers:
+                    logger.info_rank0(
+                        f"--moe-worker-layers: locking rather than pinning layers "
+                        f"{sorted(inplace_layers)} -- their worker reads them in place, so "
+                        f"this device needs no address for them and the registration "
+                        f"budget is not spent twice on the same pages"
+                    )
             # Banks become named, shareable files when a worker on another device may be
             # asked to serve a layer -- which, now that the placement decides per step, is
             # any offloaded layer. Without workers they stay private, which costs nothing
@@ -757,8 +779,9 @@ class Engine:
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
             )
-            # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
+            # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on these sets
             cache.cpu_layer_ids = cpu_layer_ids
+            cache.inplace_layer_ids = frozenset(inplace_layers)
             # also before set_bank_sources: resident layers' host sources are released mmaps,
             # so the copy plan must know to skip them rather than take their device alias
             cache.set_resident_banks(banks.resident, banks.resident_layers)

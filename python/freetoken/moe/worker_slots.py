@@ -222,8 +222,27 @@ class WorkerInPlaceBanks:
         self.device = device
         self.host = host_banks  # keeps the mappings the device tensors point into alive
         self.dev = {}
+        registered_bytes = 0
+        registered = 0
         for name, tensor in host_banks.items():
-            host_register(tensor.data_ptr(), tensor.numel() * tensor.element_size())
+            nbytes = tensor.numel() * tensor.element_size()
+            try:
+                host_register(tensor.data_ptr(), nbytes)
+            except Exception as exc:
+                # Say which bank, how far in, and what it looked like. "invalid argument"
+                # covers several unrelated causes and the numbers are what separate them;
+                # without them the same message appears for an unaligned address, a size
+                # the runtime will not take, and a limit reached several banks earlier.
+                raise RuntimeError(
+                    f"{exc}\n  bank {name!r} shape={tuple(tensor.shape)} "
+                    f"dtype={tensor.dtype} {nbytes} bytes "
+                    f"(page offset {tensor.data_ptr() % 4096}, "
+                    f"{nbytes / 4096:.2f} pages); "
+                    f"{registered} banks / {registered_bytes / 2**20:.0f} MiB already "
+                    f"registered on this device by this process"
+                ) from None
+            registered += 1
+            registered_bytes += nbytes
             self.dev[name] = tensor_from_device_ptr(
                 device_ptr(tensor), tensor.shape, tensor.dtype, device.index or 0
             )

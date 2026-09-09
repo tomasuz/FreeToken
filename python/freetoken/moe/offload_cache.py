@@ -181,6 +181,9 @@ class OffloadMoeCache:
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-backend cpu case).
         self.cpu_layer_ids: frozenset = frozenset()
+        # Layers a worker reads where they lie. Like the CPU layers, these need no device
+        # address from this process -- the difference is only which executor computes them.
+        self.inplace_layer_ids: frozenset = frozenset()
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size)
         assert not self.prefill_overlap or self.cache_size >= 2 * self.num_experts, (
@@ -350,7 +353,7 @@ class OffloadMoeCache:
         -- the cache machinery is layout-agnostic and just moves rows.
 
         ``layer_residency`` labels each layer with a ``HostResidency`` value (default: all pinned).
-        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch -- which is why prefill overlap is incompatible with them.
+        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to an executor that does not need one -- the CPU (``cpu_layer_ids``) or a worker reading the bank in place (``inplace_layer_ids``), either set BEFORE this call. The copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch -- which is why prefill overlap is incompatible with them.
         """
         from freetoken.moe.host_banks import HostResidency
 
@@ -364,11 +367,14 @@ class OffloadMoeCache:
             i for i, r in enumerate(residency) if r != HostResidency.PINNED.value
         )
         if unpinned:
-            if not unpinned <= self.cpu_layer_ids:
+            addressless_ok = self.cpu_layer_ids | self.inplace_layer_ids
+            if not unpinned <= addressless_ok:
                 raise ValueError(
-                    f"non-pinned layers {sorted(unpinned - self.cpu_layer_ids)} are not in "
-                    f"cpu_layer_ids: a layer without a device address can only decode on "
-                    f"the CPU executor (set cache.cpu_layer_ids before set_bank_sources)"
+                    f"non-pinned layers {sorted(unpinned - addressless_ok)} are in neither "
+                    f"cpu_layer_ids nor inplace_layer_ids: a layer without a device address "
+                    f"can only be computed by an executor that does not need one -- the CPU, "
+                    f"or a worker reading the bank where it lies (set either before "
+                    f"set_bank_sources)"
                 )
             if self.prefill_overlap:
                 raise ValueError(
@@ -600,6 +606,15 @@ class OffloadMoeCache:
     def is_cpu_layer(self, layer_id: int) -> bool:
         """Whether ``layer_id`` decodes on the CPU executor (vs the GPU offload path)."""
         return layer_id in self.cpu_layer_ids
+
+    def is_inplace_layer(self, layer_id: int) -> bool:
+        """Whether ``layer_id`` is computed wholly by a worker reading the bank in place.
+
+        Such a layer is not pinned here and so has no device address: this process can
+        neither fetch its experts nor give it a slot, which is the point -- the bytes are
+        already where the worker's device can read them.
+        """
+        return layer_id in self.inplace_layer_ids
 
     def set_resident_banks(
         self, resident: dict[str, dict[int, torch.Tensor]], layers: frozenset
