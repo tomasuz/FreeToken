@@ -1,16 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.distributed import DistributedInfo
-from freetoken.models.register import _load_attr, get_model_spec
-from freetoken.utils import cached_load_hf_config
+from freetoken.layers.quantization import set_quant_config
+from freetoken.models.register import _load_attr, checkpoint_quant_config, get_model_spec
+from freetoken.utils import cached_load_hf_config, init_logger
 
 if TYPE_CHECKING:
     from freetoken.models import ModelConfig
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -20,9 +23,11 @@ class EngineConfig:
     dtype: torch.dtype
     max_running_req: int = 4
     attention_backend: str = "auto"
-    moe_backend: str = "auto"
-    # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
-    nvfp4_backend: str = "triton"
+    moe_strategy: str = "auto"
+    # old name of moe_strategy; __post_init__ folds it in
+    moe_backend: str | None = field(default=None, repr=False)
+    # --quant-backend: layer[.kind]=kernel entries, comma separated
+    quant_backend: str | None = None
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
@@ -45,16 +50,16 @@ class EngineConfig:
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
-    # CPU MoE backend (--moe-backend cpu): number of CPU worker threads computing
+    # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0
-    # Hybrid CPU/GPU decode (--moe-backend offload only): which MoE layers decode on
+    # Hybrid CPU/GPU decode (--moe-strategy offload only): which MoE layers decode on
     # the CPU executor instead of the GPU offload/PCIe path. Spec is an explicit id
     # list ("3,7,11"), a count ("8" -> 8 layers evenly strided across depth), or a
-    # fraction ("0.5"). None/"" = all layers on GPU (plain offload). --moe-backend cpu
+    # fraction ("0.5"). None/"" = all layers on GPU (plain offload). --moe-strategy cpu
     # already means all layers on CPU and ignores this.
     moe_cpu_layers: str | None = None
-    # Resident MoE tier (--moe-backend offload/hybrid): which MoE layers keep their experts
+    # Resident MoE tier (--moe-strategy offload/hybrid): which MoE layers keep their experts
     # in VRAM ONLY -- uploaded during the bank load, host banks released immediately, never
     # given a slot in the offload cache. This is what stops a layer's weights from existing
     # in RAM and VRAM at once: host RAM only has to hold the layers that stay offloaded.
@@ -85,7 +90,7 @@ class EngineConfig:
     # either only adds writeback. Must be real storage -- a tmpfs (/dev/shm) spill file is
     # unevictable and buys nothing. None = anonymous mmap (the default).
     moe_bank_spill_dir: str | None = None
-    # Hybrid MoE backend (--moe-backend hybrid): max experts fetched over PCIe per
+    # Hybrid MoE backend (--moe-strategy hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
     # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's
     # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
@@ -118,6 +123,15 @@ class EngineConfig:
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
 
+    def __post_init__(self):
+        if self.moe_backend is None:
+            return
+        if self.moe_strategy != "auto":
+            raise ValueError("moe_backend is the old name of moe_strategy; pass only moe_strategy")
+        logger.warning("EngineConfig.moe_backend is deprecated; use moe_strategy")
+        object.__setattr__(self, "moe_strategy", self.moe_backend)
+        object.__setattr__(self, "moe_backend", None)
+
     @cached_property
     def hf_config(self):
         return cached_load_hf_config(self.model_path)
@@ -125,8 +139,10 @@ class EngineConfig:
     @cached_property
     def model_config(self) -> ModelConfig:
         spec = get_model_spec(self.hf_config.architectures[0])
+        quant = checkpoint_quant_config(self.model_path, self.hf_config, spec)
+        set_quant_config(quant)
         parse_config = _load_attr(spec.module, spec.parse_config)
-        return parse_config(self.hf_config)
+        return replace(parse_config(self.hf_config), quant=quant)
 
     @property
     def max_seq_len(self) -> int:

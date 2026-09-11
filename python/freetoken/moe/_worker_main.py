@@ -264,12 +264,17 @@ def _expert_call(quant_format: str, ggml_type):
     if quant_format == "nvfp4":
         from freetoken.moe.fused_nvfp4_vec import fused_experts_nvfp4_vec
 
-        names = ("gate_up_packed", "gate_up_scale", "gate_up_global",
-                 "down_packed", "down_scale", "down_global")
+        # The kernel's layout names its banks by role (gate_up, gate_up_scale, ...); FTW
+        # files and the older per-format schema call the packed ones gate_up_packed and
+        # down_packed. Take whichever this checkpoint's banks were published under.
+        roles = (("gate_up", "gate_up_packed"), ("gate_up_scale", "gate_up_scale"),
+                 ("gate_up_global", "gate_up_global"), ("down", "down_packed"),
+                 ("down_scale", "down_scale"), ("down_global", "down_global"))
 
         def call(x, banks, w, ids, activation, act_fn):
             return fused_experts_nvfp4_vec(
-                x, *(banks[n] for n in names), w, ids, activation, act_fn
+                x, *(banks[r] if r in banks else banks[legacy] for r, legacy in roles),
+                w, ids, activation, act_fn,
             )
 
         return call

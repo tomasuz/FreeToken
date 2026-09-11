@@ -55,4 +55,21 @@ def fused_experts_gguf(
     return out.sum(dim=1)
 
 
-__all__ = ["fused_experts_gguf"]
+def fused_experts_gguf_q4_0(
+    hidden_states: torch.Tensor,
+    gate_up_q: torch.Tensor,
+    down_q: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str,
+) -> torch.Tensor:
+    """Upstream's Q4_0-only entry point: the general GGUF path pinned to Q4_0."""
+    from freetoken.gguf_quant import GGUF_EXPERT_FORMATS
+
+    return fused_experts_gguf(
+        hidden_states, gate_up_q, down_q, topk_weights, topk_ids, activation,
+        GGUF_EXPERT_FORMATS["q4_0"],
+    )
+
+
+__all__ = ["fused_experts_gguf", "fused_experts_gguf_q4_0"]

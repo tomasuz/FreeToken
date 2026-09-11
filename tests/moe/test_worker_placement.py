@@ -19,7 +19,7 @@ from freetoken.engine.engine import (
 
 
 class _Cfg:
-    moe_backend = "offload"
+    moe_strategy = "offload"
 
     def __init__(self, layers=None, env=None):
         self.moe_worker_layers = layers
@@ -72,7 +72,7 @@ def test_overlapping_explicit_ids_are_refused():
 
 def test_worker_layers_are_offload_only():
     cfg = _Cfg("1:4")
-    cfg.moe_backend = "fused"
+    cfg.moe_strategy = "fused"
     assert _resolve_worker_layers(cfg, 30) == {}
 
 

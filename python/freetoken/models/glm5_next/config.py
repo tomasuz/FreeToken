@@ -17,15 +17,7 @@ scaling 2.5) with 288 routed experts and a clamped SwiGLU
 (``swiglu_limit=10``). Everything model-specific beyond ``ModelConfig`` rides in
 ``glm5_args`` (``Glm5NextArgs``).
 
-Resident-weight quantization (attn/dense/lm_head fp8-at-load, the GLM-5.2
-bandwidth trick) is OFF by default: the NVFP4 exports deliberately quantize only
-the routed experts (attention / shared expert / lm_head ship bf16 behind the
-quantization_config ignore list), and a serving engine must not override the
-checkpoint author's precision decision silently -- the checkpoint is served
-as-is, like vLLM/sglang. FREETOKEN_GLM5_ATTN_FP8=1 / FREETOKEN_GLM5_MLP_FP8=1
-opt into the W8A16 requantization (measured decode 36 -> 45.5 tok/s on the
-hybrid reference setup; the win needs CUDA graphs -- launch-bound eager decode
-gets slower).
+The checkpoint is served in the precision its quantization_config declares.
 """
 
 from __future__ import annotations
@@ -43,12 +35,6 @@ from freetoken.models.config import (
 
 from .args import load_args
 
-# Load-time W8A16 fp8 for resident weights: default OFF, env opt-in (see module
-# docstring for the rationale and measured numbers). attn covers the KDA
-# in_proj_qkv/o_proj + DSA projections (the precision-sensitive b|f_a|g_a gate
-# slice stays bf16, see kda.py); mlp covers dense MLPs, shared expert, lm_head.
-_ATTN_FP8 = os.getenv("FREETOKEN_GLM5_ATTN_FP8", "0") != "0"
-_MLP_FP8 = os.getenv("FREETOKEN_GLM5_MLP_FP8", "0") != "0"
 
 
 def _dsa_on(args, dsa_layer_ids) -> bool:
@@ -60,6 +46,34 @@ def _dsa_on(args, dsa_layer_ids) -> bool:
         and args.index_head_dim > 0
         and os.getenv("FREETOKEN_GLM5_DSA", "1") != "0"
     )
+
+
+def _quant_accessor(hf_config: Any):
+    """A ``get(key, default=None)`` accessor over the HF ``quantization_config`` (dict or
+    object), or ``None`` when the model has no quant config."""
+    quant = getattr(hf_config, "quantization_config", None)
+    if quant is None:
+        return None
+    return quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+
+
+def _fp8_block_quant(hf_config: Any) -> tuple[str, tuple[int, int] | None]:
+    """Detect DeepSeek-V3-style 128x128 block-fp8 from HF ``quantization_config``.
+
+    Returns ``("fp8_block", (block_n, block_k))`` for a block-fp8 checkpoint (weights
+    fp8-e4m3 + per-block ``weight_scale_inv``, dynamic activation), else ``("none", None)``.
+    The quantization_config sits on the top-level hf_config (not ``text_config``).
+    """
+    get = _quant_accessor(hf_config)
+    if get is None:
+        return "none", None
+    method = str(get("quant_method") or get("quant_algo") or "").lower()
+    block = get("weight_block_size")
+    if method == "fp8" and block:
+        bs = tuple(int(x) for x in block)
+        assert bs == (128, 128), f"only 128x128 block-fp8 is supported, got {bs}"
+        return "fp8_block", bs
+    return "none", None
 
 
 def parse_config(hf_config: Any) -> ModelConfig:
@@ -142,6 +156,9 @@ def parse_config(hf_config: Any) -> ModelConfig:
         t == "sparse" for t in mlp_types[first_dense:]
     ), f"mlp_layer_types is not a dense-prefix layout: {mlp_types}"
 
+    expert_quant, weight_block_size = _fp8_block_quant(hf_config)
+    if expert_quant == "none":
+        expert_quant = detect_expert_quant(hf_config)
     return ModelConfig(
         num_layers=num_layers,
         num_qo_heads=args.num_heads,
@@ -177,7 +194,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
             hf_config, "architectures", ["Glm5NextForConditionalGeneration"]
         ),
         moe_enabled=True,
-        expert_quant=detect_expert_quant(hf_config),
+        expert_quant=expert_quant,
+        weight_block_size=weight_block_size,
         first_k_dense_replace=first_dense,
         n_shared_experts=int(getattr(text, "n_shared_experts", 0) or 0),
         routed_scaling_factor=float(getattr(text, "routed_scaling_factor", 1.0)),
@@ -186,9 +204,6 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attn_sm_scale=args.qk_head_dim**-0.5,
         has_attn_bias=bool(getattr(text, "attention_bias", False)),
         swiglu_limit=args.swiglu_limit,
-        attn_quant="fp8_pertensor" if _ATTN_FP8 else "none",
-        dense_quant="fp8_pertensor" if _MLP_FP8 else "none",
-        lm_head_quant="fp8_pertensor" if _MLP_FP8 else "none",
         vision_config=None,  # text-only milestone; model.visual.* weights are dropped
         image_token_id=getattr(hf_config, "image_token_id", None),
         glm5_args=args,

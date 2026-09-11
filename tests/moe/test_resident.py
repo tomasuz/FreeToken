@@ -184,7 +184,7 @@ def test_copy_plan_nulls_resident_sources():
 
 
 class _Cfg:
-    moe_backend = "offload"
+    moe_strategy = "offload"
 
     def __init__(self, spec):
         self.moe_resident_layers = spec
@@ -205,7 +205,7 @@ def test_resolve_resident_layers_spec_forms():
 
 def test_resolve_resident_layers_is_offload_only():
     cfg = _Cfg("8")
-    cfg.moe_backend = "fused"
+    cfg.moe_strategy = "fused"
     from freetoken.engine.engine import _resolve_resident_layers
 
     assert _resolve_resident_layers(cfg, 30) == frozenset()
