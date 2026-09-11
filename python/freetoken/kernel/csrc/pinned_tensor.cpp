@@ -102,6 +102,15 @@ void host_register(int64_t addr, int64_t nbytes) {
               "hipHostRegister failed: ", hipGetErrorString(err));
 }
 
+// Give a registration back. The pages stay where they are and stay readable by everyone;
+// what is released is this process's device mapping of them and its claim on the
+// machine-wide registration budget -- which is the whole point, because that budget is
+// what stops a second process from mapping the same pages for its own device.
+void host_unregister(int64_t addr) {
+  hipError_t err = hipHostUnregister(reinterpret_cast<void *>(addr));
+  TORCH_CHECK(err == hipSuccess, "hipHostUnregister failed: ", hipGetErrorString(err));
+}
+
 int64_t driver_cuda_version() {
   int version = 0;  // stays 0 when no driver is installed
   const hipError_t err = hipDriverGetVersion(&version);
@@ -144,6 +153,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("tensor_from_device_ptr", &tensor_from_device_ptr,
         "A device tensor over memory this extension did not allocate",
         py::arg("addr"), py::arg("sizes"), py::arg("dtype"), py::arg("device_index"));
+  m.def("host_unregister", &host_unregister,
+        "hipHostUnregister a range registered by host_register");
   m.def("host_register", &host_register,
         "hipHostRegister an existing host range as portable+mapped");
   m.def("driver_cuda_version", &driver_cuda_version,

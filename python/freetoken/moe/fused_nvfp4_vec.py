@@ -42,6 +42,14 @@ def fused_experts_nvfp4_vec(
     if act_fn is None:
         raise ValueError(f"unsupported MoE activation {activation!r}")
 
+    # The block-scale banks carry their own fp8 type; the kernel reads them as bytes and
+    # decodes the bits itself, which is the one path that works on every target (no
+    # compilation target below sm_89 can type an fp8 pointer at all).
+    if gate_up_scale.dtype != torch.uint8:
+        gate_up_scale = gate_up_scale.view(torch.uint8)
+    if down_scale.dtype != torch.uint8:
+        down_scale = down_scale.view(torch.uint8)
+
     num_tokens = hidden_states.shape[0]
     n2 = gate_up_packed.shape[1]  # 2 * intermediate
     h = down_packed.shape[1]  # hidden

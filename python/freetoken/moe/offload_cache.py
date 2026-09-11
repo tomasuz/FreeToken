@@ -1310,6 +1310,11 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        if layer_id in self.inplace_layer_ids:
+            # Nothing is ever staged for one of these: its fetch fraction is held at zero
+            # because a miss goes to the worker that reads the bank in place. Reaching here
+            # with nothing to copy is the normal case, not an error.
+            return
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 raise RuntimeError(

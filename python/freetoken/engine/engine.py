@@ -670,8 +670,16 @@ class Engine:
         # this host: 16 GiB pinned here leaves 12.5 for the worker, against 20 when it has
         # the machine to itself. Those layers move no bytes from here, so lock them
         # instead: resident, but without a device address this process would never use.
+        # FREETOKEN_INPLACE_LOCK=0 keeps those layers pinned as well, so both
+        # registrations are attempted on the same pages -- which is what the split needs
+        # (this device serves the hits, the worker the misses) and what the budget may not
+        # allow. The measurement the log line below reports is what decides that.
         inplace_layers: set[int] = set()
-        if worker_layers and os.getenv("FREETOKEN_WORKER_READ_IN_PLACE", "0") == "1":
+        if (
+            worker_layers
+            and os.getenv("FREETOKEN_WORKER_READ_IN_PLACE", "0") == "1"
+            and os.getenv("FREETOKEN_INPLACE_LOCK", "1") == "1"
+        ):
             for ids in worker_layers.values():
                 inplace_layers |= set(ids)
         split_residency = config.moe_backend in ("offload", "hybrid") and (
@@ -881,9 +889,13 @@ class Engine:
         # the point where this one is holding every expert bank it has not yet given away.
         # On a host that is already tight, the runtime does not report the shortage -- it
         # faults -- so record what was left before blaming the worker for dying.
+        from freetoken.kernel.pinned import registered_bytes
+
         logger.info_rank0(
             f"--moe-worker-layers: host has {_mem_available_gib():.2f} GiB available and "
-            f"{_swap_free_gib():.2f} GiB of swap free before starting workers"
+            f"{_swap_free_gib():.2f} GiB of swap free before starting workers; this process "
+            f"has host-registered {registered_bytes() / 2**30:.2f} GiB, which comes out of "
+            f"the same machine-wide budget the worker will draw on"
         )
         envs = {
             dev: dict(

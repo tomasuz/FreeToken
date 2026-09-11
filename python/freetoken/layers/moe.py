@@ -377,20 +377,6 @@ class OffloadMoELayer(MoELayer):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
-        if cache.is_inplace_layer(self.layer_id):
-            # Its worker reads this layer's bank where it lies, so this device holds no
-            # address for it: there is nothing to fetch, no slot to remap, and nothing to
-            # split. The worker computes the whole layer, exactly as a CPU layer's
-            # executor does -- and for the same reason, which is that the alternative
-            # would be to copy bytes that are already reachable.
-            worker = cache.worker_executors.get(self.layer_id)
-            assert worker is not None, (
-                f"layer {self.layer_id} was locked for an in-place worker that is not here"
-            )
-            return _sync(
-                worker,
-                _submit(worker, self.layer_id, hidden_states, topk_weights, topk_ids),
-            )
         helpers = cache.split_helpers(self.layer_id)
         if helpers:
             return self._decode_split(

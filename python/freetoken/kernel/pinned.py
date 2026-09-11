@@ -47,6 +47,16 @@ def alloc_pinned_tensor(*shape: int, dtype: torch.dtype) -> torch.Tensor:
 
 _PAGE = 4096  # registration granularity for both runtimes
 
+# What this process has registered so far. The budget is shared with every other process
+# on the machine and is not reported anywhere, so the only way to reason about a refusal
+# is to know how much of it this process had already spent.
+_registered_bytes = 0
+
+
+def registered_bytes() -> int:
+    """Bytes this process has successfully host-registered."""
+    return _registered_bytes
+
 
 def host_register(addr: int, nbytes: int) -> None:
     """cudaHostRegister the pages covering ``[addr, addr+nbytes)`` as portable+mapped.
@@ -60,16 +70,34 @@ def host_register(addr: int, nbytes: int) -> None:
     and heap allocations are made of whole pages, so a page holding any byte of the range
     is mapped for all of it.
     """
+    global _registered_bytes
     start = addr - (addr % _PAGE)
     end = addr + nbytes
     end += -end % _PAGE
     try:
         _load_pinned_extension().host_register(start, end - start)
+        _registered_bytes += end - start
     except RuntimeError as exc:
         raise RuntimeError(
             f"{exc} (addr=0x{addr:x} widened to 0x{start:x}, "
             f"{nbytes} bytes widened to {end - start})"
         ) from None
+
+
+def host_unregister(addr: int) -> None:
+    """Release a registration made by :func:`host_register`.
+
+    The pages are untouched and stay readable by every process and device that can see
+    them -- weights are static and shared, and nothing here was ever exclusive. What is
+    given back is this process's device mapping of them and its share of the machine-wide
+    registration budget, which is the only thing that was scarce.
+
+    ``addr`` must be the address passed to :func:`host_register`; the widening it applied
+    is repeated here so the two describe the same range.
+    """
+    global _registered_bytes
+    start = addr - (addr % _PAGE)
+    _load_pinned_extension().host_unregister(start)
 
 
 @lru_cache(maxsize=1)
