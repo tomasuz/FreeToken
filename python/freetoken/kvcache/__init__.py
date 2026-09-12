@@ -249,7 +249,9 @@ def create_kvcache_pool(
     # MTP head: its appended full-attention layer has global id == num_layers, so the layer
     # map must span num_layers + 1 entries (the map's extra slot points at the head's dense
     # slab; see ModelConfig.kv_cache_group_specs). Non-MTP models are unchanged.
-    pool_num_layers = model_config.num_layers + (1 if model_config.has_mtp else 0)
+    # getattr: create_kv_pool also takes lightweight config stand-ins (tests, cost model)
+    # that carry only the geometry fields, not the MTP flags.
+    pool_num_layers = model_config.num_layers + (1 if getattr(model_config, "has_mtp", False) else 0)
     return MHAKVCache(
         num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
         num_pages=num_pages,
