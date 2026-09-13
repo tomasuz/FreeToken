@@ -588,3 +588,34 @@ def test_scheme_for_agrees_with_the_stored_tensors(ckpt: Path):
             mismatches.append(f"{module}: config says {kind}, tensors {sorted(suffixes)} say {sorted(k.value for k in expected)}")
     assert checked > 0
     assert not mismatches, f"{len(mismatches)}/{checked} modules disagree:\n  " + "\n  ".join(mismatches[:40])
+
+
+def test_weight_only_modelopt_export_does_not_require_input_scale():
+    """A ModelOpt NVFP4 export whose config_groups quantize weights only ships no
+    ``*.input_scale``; the scheme must not ask for that role, or every quantized Linear
+    stays forever incomplete and the load ends in "checkpoint is missing tensors".
+
+    Seen on shisa-ai/Ornith-1.5-35B-A3B-NVFP4, whose config.json carries both the ModelOpt
+    keys and a compressed-tensors ``config_groups`` block with ``weights`` and no
+    ``input_activations``."""
+    weight_only = {
+        "quant_method": "modelopt",
+        "quant_algo": "NVFP4",
+        "config_groups": {"group_0": {"weights": {"num_bits": 4, "type": "float", "group_size": 16}, "targets": ["Linear"]}},
+    }
+    scheme = ModelOptConfig(weight_only).scheme_for("model.layers.0.self_attn.q_proj")
+    assert scheme is not None
+    assert "input_scale" not in scheme.roles
+
+    with_activations = dict(weight_only)
+    with_activations["config_groups"] = {
+        "group_0": {
+            "weights": {"num_bits": 4, "type": "float", "group_size": 16},
+            "input_activations": {"num_bits": 4, "type": "float"},
+            "targets": ["Linear"],
+        }
+    }
+    assert "input_scale" in ModelOptConfig(with_activations).scheme_for("model.layers.0.self_attn.q_proj").roles
+
+    # no config_groups at all: the historical default (activations quantized) stands
+    assert "input_scale" in ModelOptConfig({"quant_method": "modelopt", "quant_algo": "NVFP4"}).scheme_for("x").roles

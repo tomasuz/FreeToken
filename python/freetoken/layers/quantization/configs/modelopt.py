@@ -9,6 +9,23 @@ from ..scheme import fp8_block_scheme, fp8_tensor_scheme, mxfp8_scheme, nvfp4_sc
 from .base import QuantConfig, Stored
 
 
+
+def _declares_input_activations(q: dict[str, Any]) -> bool:
+    """Whether the export quantizes activations as well as weights.
+
+    ModelOpt's own key for this is ``with_input_scale``. Exports that also carry a
+    compressed-tensors ``config_groups`` block say the same thing by listing
+    ``input_activations`` in a group, and a weight-only export lists only ``weights`` --
+    it then ships no ``*.input_scale`` tensor at all, so requiring that role would leave
+    every quantized Linear forever incomplete. With neither key present the historical
+    default (activations quantized) stands.
+    """
+    groups = q.get("config_groups")
+    if isinstance(groups, dict) and groups:
+        return any(isinstance(g, dict) and g.get("input_activations") for g in groups.values())
+    return True
+
+
 @register_dialect
 class ModelOptConfig(QuantConfig):
     """NVIDIA ModelOpt exports: one ``quant_algo`` for every Linear minus ``ignore``, or
@@ -42,7 +59,7 @@ class ModelOptConfig(QuantConfig):
         self.ignore = name_set(tuple(q.get("ignore") or q.get("exclude_modules") or ()))
         layers = q.get("quantized_layers") or {}
         self.quantized_layers = {k: str((v or {}).get("quant_algo") or "").upper() for k, v in layers.items()} if isinstance(layers, dict) else {}
-        self.with_input_scale = bool(q.get("with_input_scale", True))
+        self.with_input_scale = bool(q.get("with_input_scale", _declares_input_activations(q)))
         if self.algo == "MIXED_PRECISION" and not self.quantized_layers:
             raise NotImplementedError("ModelOpt MIXED_PRECISION without quantized_layers in quantization_config")
         if self.algo != "MIXED_PRECISION":
