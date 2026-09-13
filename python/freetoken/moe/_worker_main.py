@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections import OrderedDict
 import time
 
 # Set before torch is imported: the accelerator runtime latches its view of the environment
@@ -71,13 +72,19 @@ class _BankLibrary:
         self._in_place_warned = False
         self._in_place_noted = False
         self._maps: dict[int, dict] = {}
-        self._caches: dict[int, WorkerSlotCache] = {}
+        # Ordered by last use: a slot cache costs device memory per layer, and a worker
+        # offered every layer would otherwise hold one for each. The oldest are dropped to
+        # make room (see cache_for), so the footprint follows this device's memory rather
+        # than the number of layers the engine may route here.
+        self._caches: "OrderedDict[int, WorkerSlotCache]" = OrderedDict()
+        self._evicted = [0, 0]  # hits, misses of caches already dropped
         any_name = next(iter(spec))
         self.layers = sorted(int(k) for k in spec[any_name]["paths"])
 
     def cache_for(self, layer_id: int, device) -> WorkerSlotCache:
         cache = self._caches.get(layer_id)
         if cache is not None:
+            self._caches.move_to_end(layer_id)
             return cache
         tensors = {}
         for name, entry in self._spec.items():
@@ -90,33 +97,89 @@ class _BankLibrary:
         if self._in_place:
             # Nothing is copied and nothing is evicted: the device reads the engine's own
             # bank where it lies. Costs no device memory, so every layer can have one.
-            try:
-                cache = WorkerInPlaceBanks(tensors, device=device)
-                if self._in_place_noted is False:
-                    print("worker: reading banks in place (GTT, no device copy)",
-                          file=sys.stderr, flush=True)
-                    self._in_place_noted = True
-            except Exception as exc:
-                # Reading in place is an optimisation, not a requirement. A runtime that
-                # will not map these pages for this device is a reason to copy them, not a
-                # reason for the engine to stop -- say so once and take the other path.
-                if self._in_place_warned is False:
-                    print(f"worker: cannot read banks in place on layer {layer_id} "
-                          f"({type(exc).__name__}: {exc}); copying instead",
-                          file=sys.stderr, flush=True)
-                    self._in_place_warned = True
-                self._in_place = False
+            cache = self._new_in_place(tensors, device, layer_id)
+            if cache is not None and self._in_place_noted is False:
+                print("worker: reading banks in place (GTT, no device copy)",
+                      file=sys.stderr, flush=True)
+                self._in_place_noted = True
         if cache is None:
-            cache = WorkerSlotCache(
-                tensors, slots=self._slots or tensors[next(iter(tensors))].shape[0],
-                device=device,
-            )
+            cache = self._new_slot_cache(tensors, device, layer_id)
         self._caches[layer_id] = cache
         return cache
 
+    def _new_in_place(self, tensors: dict, device, layer_id: int):
+        """An in-place reader for one layer, giving back other layers' host registrations to fit.
+
+        Registering host pages for a device is itself a bounded resource -- on this iGPU it
+        runs out around the thirteenth layer, well before any memory does, because nothing
+        here allocates memory at all. Treating that limit as "this device cannot read in
+        place" was the wrong reading: it is "not all of them at once". So the layer used
+        longest ago hands its registrations back and the new one takes them, exactly as the
+        slot path recycles memory. Nothing is copied either way; a layer that returns
+        re-registers pages it never stopped sharing.
+
+        Only a failure with no registration left to reclaim means the device truly will not
+        do this, and then the caller falls back to copying.
+        """
+        while True:
+            try:
+                return WorkerInPlaceBanks(tensors, device=device)
+            except Exception as exc:
+                victim = next(
+                    (lid for lid, c in self._caches.items() if isinstance(c, WorkerInPlaceBanks)),
+                    None,
+                )
+                if victim is None:
+                    if self._in_place_warned is False:
+                        print(f"worker: cannot read banks in place on layer {layer_id} "
+                              f"({type(exc).__name__}: {exc}); copying instead",
+                              file=sys.stderr, flush=True)
+                        self._in_place_warned = True
+                    self._in_place = False
+                    return None
+                old = self._caches.pop(victim)
+                self._evicted[0] += old.hits
+                self._evicted[1] += old.misses
+                old.release()
+                print(f"worker: released layer {victim}'s host registration to map layer "
+                      f"{layer_id} ({len(self._caches)} layers mapped)",
+                      file=sys.stderr, flush=True)
+
+    def _new_slot_cache(self, tensors: dict, device, layer_id: int) -> WorkerSlotCache:
+        """A slot cache for one layer, dropping the least recently used ones to fit.
+
+        --moe-worker-slots is a per-layer count, and the engine may offer this worker every
+        offloaded layer; holding a cache for each is that count times the layer count, which
+        on an iGPU sharing 16 GiB with the host runs out around layer thirty. What the device
+        can hold is not a number this side can compute -- the banks, the engine's own
+        allocations and the runtime all move -- so it is discovered: allocate, and on OOM give
+        back the layer used longest ago and try again. A layer that comes back rebuilds its
+        cache from the shared bank, which is a refill, not a reload.
+        """
+        slots = self._slots or tensors[next(iter(tensors))].shape[0]
+        while True:
+            try:
+                return WorkerSlotCache(tensors, slots=slots, device=device)
+            except torch.OutOfMemoryError:
+                if not self._caches:
+                    raise
+                old_id, old = self._caches.popitem(last=False)
+                self._evicted[0] += old.hits
+                self._evicted[1] += old.misses
+                del old
+                torch.cuda.empty_cache()
+                print(f"worker: dropped layer {old_id}'s slot cache to fit layer "
+                      f"{layer_id} ({len(self._caches)} layers resident)",
+                      file=sys.stderr, flush=True)
+
+    @property
+    def in_place_ok(self) -> bool:
+        """Whether the last cache_for stayed on the no-copy path."""
+        return self._in_place
+
     def stats(self) -> tuple[int, int]:
-        hits = sum(c.hits for c in self._caches.values())
-        misses = sum(c.misses for c in self._caches.values())
+        hits = self._evicted[0] + sum(c.hits for c in self._caches.values())
+        misses = self._evicted[1] + sum(c.misses for c in self._caches.values())
         return hits, misses
 
 
@@ -152,6 +215,30 @@ def main() -> int:
     # compiles, and a parent that started timing before that would blame the first token.
     _warm(library.cache_for(library.layers[0], device), io, device, activation,
           expert_call, act_fn)
+
+    # Map what fits, and say so. Reading in place needs the runtime to register the bank's
+    # pages for this device, and that budget is bounded and one-way -- freeing a
+    # registration does not give it back. Finding the line here, once, is what keeps a step
+    # from discovering it: a layer the engine is told about is one this worker can answer
+    # for, and the ones past the line are divided between the main device and the CPU by
+    # the same placement that divides everything else. Nothing is pinned by hand either
+    # way; the device's own limit picks how many, and demand picks which.
+    servable = flags["servable"].tensor
+    servable.zero_()
+    mapped = 0
+    for layer_id in library.layers:
+        try:
+            library.cache_for(layer_id, device)
+        except Exception as exc:
+            print(f"worker: stopping at layer {layer_id}: {type(exc).__name__}: "
+                  f"{str(exc)[:120]}", file=sys.stderr, flush=True)
+            break
+        if not library.in_place_ok:
+            break  # fell out of in place: past this point it would copy, which is not ours
+        servable[layer_id] = 1
+        mapped += 1
+    print(f"worker: can serve {mapped} of {len(library.layers)} layers in place",
+          file=sys.stderr, flush=True)
     ctl.tensor[_UP] = 1  # the parent waits for this before its first submit
 
     _TRACE = os.environ.get("FREETOKEN_WORKER_TRACE") == "1"

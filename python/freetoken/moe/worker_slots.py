@@ -206,7 +206,8 @@ class WorkerInPlaceBanks:
     at must outlive them; ``host_banks`` is held for exactly that reason.
     """
 
-    __slots__ = ("device", "num_experts", "slots", "host", "dev", "hits", "misses", "fills")
+    __slots__ = ("device", "num_experts", "slots", "host", "dev", "hits", "misses", "fills",
+                 "_registered")
 
     def __init__(self, host_banks: dict[str, torch.Tensor], *, device: torch.device) -> None:
         from freetoken.kernel.pinned import (
@@ -222,6 +223,11 @@ class WorkerInPlaceBanks:
         self.device = device
         self.host = host_banks  # keeps the mappings the device tensors point into alive
         self.dev = {}
+        # Addresses this instance registered, so release() can hand them back. The device
+        # can hold only so many host registrations at once (an iGPU runs out around a dozen
+        # layers), and the worker is offered every layer -- so they are a resource with a
+        # capacity, and a capacity has to be returnable.
+        self._registered: list[int] = []
         registered_bytes = 0
         registered = 0
         for name, tensor in host_banks.items():
@@ -233,6 +239,7 @@ class WorkerInPlaceBanks:
                 # covers several unrelated causes and the numbers are what separate them;
                 # without them the same message appears for an unaligned address, a size
                 # the runtime will not take, and a limit reached several banks earlier.
+                self.release()
                 raise RuntimeError(
                     f"{exc}\n  bank {name!r} shape={tuple(tensor.shape)} "
                     f"dtype={tensor.dtype} {nbytes} bytes "
@@ -241,6 +248,7 @@ class WorkerInPlaceBanks:
                     f"{registered} banks / {registered_bytes / 2**20:.0f} MiB already "
                     f"registered on this device by this process"
                 ) from None
+            self._registered.append(tensor.data_ptr())
             registered += 1
             registered_bytes += nbytes
             self.dev[name] = tensor_from_device_ptr(
@@ -250,6 +258,23 @@ class WorkerInPlaceBanks:
         self.hits = 0
         self.misses = 0
         self.fills = 0
+
+    def release(self) -> None:
+        """Give the host registrations back, leaving the shared mapping itself alone.
+
+        Only the registration is scarce; the mapping is address space and the engine's bank
+        is not ours to unmap. After this the instance is spent -- the caller drops it and
+        builds a new one when that layer comes back, which costs a registration and no copy.
+        """
+        from freetoken.kernel.pinned import host_unregister
+
+        for addr in self._registered:
+            try:
+                host_unregister(addr)
+            except Exception:
+                pass  # already gone, or the runtime is tearing down: nothing left to free
+        self._registered.clear()
+        self.dev.clear()
 
     @property
     def holds_everything(self) -> bool:

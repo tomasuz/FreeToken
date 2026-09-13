@@ -187,6 +187,13 @@ class WorkerMoeExecutor:
             "done": share("done", (self._capacity,), torch.int64),
             "slot_layer": share("slot_layer", (self._capacity,), torch.int64),
             "slot_bs": share("slot_bs", (self._capacity,), torch.int64),
+            # What the worker found it can actually serve, written before it reports up.
+            # Reading a host bank in place needs the runtime to register those pages for the
+            # device, and that registration is a bounded, one-way budget (~6 GiB on gfx90c,
+            # not returned by hipHostUnregister). So "every layer" is an offer, not a
+            # promise: the worker maps what fits and says which, and the placement divides
+            # each step among whoever can actually take it.
+            "servable": share("servable", (num_layers,), torch.int64),
         }
         for buf in self._flags.values():
             buf.tensor.zero_()
@@ -313,6 +320,7 @@ class WorkerMoeExecutor:
             )
             self._keep_spec = True
             raise
+        self._narrow_to_servable()
         logger.info_rank0(f"MoE worker up on device {self.device_index}")
         self._enable_stream_handshake()
 
@@ -567,6 +575,30 @@ class WorkerMoeExecutor:
                     f"{timeout:.0f}s"
                 )
             time.sleep(0)
+
+    def _narrow_to_servable(self) -> None:
+        """Keep only the layers the worker reported it can actually serve.
+
+        Offering a layer and being able to take it are different things: reading a bank in
+        place needs its pages registered with the runtime for this device, and that budget
+        runs out (~6 GiB on gfx90c) long before the layers do. The worker discovers where
+        that line falls -- it is a property of the device and the bank sizes, not something
+        this side can compute -- and writes it here before reporting up. Nothing is pinned
+        by this: the placement still divides every step among the executors that can take
+        it, and a layer this worker cannot map is simply not one of them.
+        """
+        servable = self._flags["servable"].tensor
+        can = {int(i) for i in torch.nonzero(servable).flatten().tolist()}
+        if not can:
+            return  # worker said nothing; leave the offer as it was
+        before = set(self.layers) if self._offered is None else set(self._offered)
+        self._offered = frozenset(before & can) if before else frozenset(can)
+        if len(can) < len(self.layers):
+            logger.info_rank0(
+                f"MoE worker on device {self.device_index} can read {len(can)} of "
+                f"{len(self.layers)} layers in place (host-registration budget); the rest "
+                f"stay with this device and the CPU"
+            )
 
     def serves(self, layer_id: int) -> bool:
         """Whether this worker should be offered ``layer_id``: its weights are reachable
