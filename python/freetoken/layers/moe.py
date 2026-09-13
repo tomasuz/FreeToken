@@ -398,9 +398,12 @@ class OffloadMoELayer(MoELayer):
         # the same graph and the same worker). A helper that idles costs a doorbell; a
         # helper fed by a frozen cap costs the answer.
         capturing_now = torch.cuda.is_current_stream_capturing()
-        cache.hybrid_fetch_fraction = (
-            1.0 if capturing_now else float(shares.get("gpu", 1.0))
-        )
+        # Under capture the fraction written here would describe the tracing pass and then
+        # stand for every replay, so capture leaves the vector alone: what a replay reads is
+        # what OffloadMoeCache.refresh_placement wrote for that step, off the stream. An
+        # eager step writes its own, and the two paths then agree on where the split lives.
+        if not capturing_now:
+            cache.set_fetch_fraction(self.layer_id, float(shares.get("gpu", 1.0)))
         cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
         if cache.collect_stats:
             cache.record_decode_stats_hybrid(self.layer_id)

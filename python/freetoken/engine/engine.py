@@ -849,7 +849,7 @@ class Engine:
             )
             return
         cache.hybrid_max_fetch = cache.num_experts  # inert: the fraction is the cap
-        cache.hybrid_fetch_fraction = fraction
+        cache.seed_fetch_fraction(fraction)
         logger.info_rank0(
             f"--moe-hybrid-max-fetch auto: fetching {fraction:.1%} of each decode step's "
             "expert misses over PCIe (benched PCIe/CPU bandwidth ratio), the rest on the CPU"

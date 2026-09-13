@@ -41,7 +41,7 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
 
 
 def ensure_experts_hybrid(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction=0.0
 ) -> None:
     """Capped-fetch variant of ``ensure_experts`` (hybrid backend).
 
@@ -54,10 +54,22 @@ def ensure_experts_hybrid(
     together. ``num_indices`` = capped fetch count (copy_missing); ``num_missing_full`` =
     pre-cap miss count (stats)."""
     # Q16 fixed point so the GPU kernel and the CPU reference cap identically (no float).
+    # A tensor here is the per-layer vector the kernel reads on the device: the fraction is
+    # then an input to the launch rather than part of it, which is what a captured graph
+    # needs if a later step is to change the split without being recaptured. A float is
+    # still accepted -- the CPU mirror and every test that calls this directly pass one.
+    if torch.is_tensor(fetch_fraction):
+        if not expert_ids.is_cuda:
+            frac_q16 = int(fetch_fraction[layer_id].item())
+            return _ensure_experts_hybrid_cpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
+        return _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, fetch_fraction)
     frac_q16 = min(1 << 16, max(0, round(fetch_fraction * (1 << 16))))
     if not expert_ids.is_cuda:
         return _ensure_experts_hybrid_cpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
-    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
+    frac_dev = torch.full(
+        (cache.num_layers,), frac_q16, dtype=torch.int32, device=expert_ids.device
+    )
+    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_dev)
 
 
 def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
@@ -95,7 +107,7 @@ def reset_cache(cache) -> None:
 
 
 def _ensure_experts_hybrid_gpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: torch.Tensor
 ) -> None:
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
@@ -115,7 +127,7 @@ def _ensure_experts_hybrid_gpu(
         layer_id,
         expert_ids.numel(),
         int(max_fetch),
-        int(frac_q16),
+        frac_q16,
         cache.num_experts,
         cache.cache_size,
         BLOCK_E=block_e,
@@ -287,7 +299,7 @@ def _materialize_layer_kernel(
 
 
 
-@triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16"])
+@triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch"])
 def _ensure_experts_hybrid_kernel(
     expert_ids_ptr,
     slot_for_id_ptr,
@@ -303,7 +315,7 @@ def _ensure_experts_hybrid_kernel(
     layer_id,
     num_active,
     max_fetch,
-    fetch_frac_q16,
+    fetch_frac_ptr,
     num_experts: tl.constexpr,
     cache_size: tl.constexpr,
     BLOCK_E: tl.constexpr,
@@ -342,6 +354,9 @@ def _ensure_experts_hybrid_kernel(
     is_missing = is_active & (slot == -1) & e_mask
     num_missing = tl.sum(is_missing.to(tl.int32))
     # Cap the fetches; the overflow misses are computed on the CPU (left non-resident).
+    # Read on the device: a replay re-reads it, so the split a later step wrote takes
+    # effect without the graph being recorded again.
+    fetch_frac_q16 = tl.load(fetch_frac_ptr + layer_id)
     if fetch_frac_q16 > 0:
         # Bandwidth-matched split (fetch_frac = pcie_bw / cpu_bw): fetch time scales with
         # F * (1 - frac), CPU time with (M - F) * frac; they balance at F = frac * M. Pick

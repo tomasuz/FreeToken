@@ -194,6 +194,13 @@ class GraphRunner:
         self.buffer.copy_from(batch)
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
+        # Divide this step before replaying it. The graph holds no Python, so the placement
+        # would otherwise stay at whatever it was when the graph was recorded -- and it was
+        # recorded under capture, where this device is given every miss because the cap is
+        # not capture-safe. Both the labelling and the cap are node inputs read from pinned
+        # host memory, so writing them here, off the stream, is all a replay needs.
+        if self.moe_offload_cache is not None:
+            self.moe_offload_cache.refresh_placement()
         g.replay()
         return self.buffer.logits[: batch.size]
 

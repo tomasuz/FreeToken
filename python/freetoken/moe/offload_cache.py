@@ -301,6 +301,19 @@ class OffloadMoeCache:
         self._gpu_busy_seconds = 0.0
         self._hybrid_ensure_ran = False
         self._owner_maps: dict = {}
+        # The capped fetch reaches the kernel through these rather than as a launch
+        # argument. A launch argument is a host value, and a capture bakes it into the node
+        # -- the split would then be frozen at whatever it was when the graph was recorded,
+        # while the routing it caps goes on being recomputed every replay. A pinned host
+        # vector plus a copy issued inside the captured region makes it a node input: the
+        # replay re-reads the host bytes, so writing them between replays moves the split.
+        seed = min(1 << 16, max(0, round(self.hybrid_fetch_fraction * (1 << 16))))
+        self._fetch_frac_host = torch.full(
+            (self.num_layers,), seed, dtype=torch.int32, device="cpu"
+        ).pin_memory()
+        self._fetch_frac_dev = torch.full(
+            (self.num_layers,), seed, dtype=torch.int32, device=self.device
+        )
         self._pending_timings: list = []
         self._fetched_staging: list = []
         self._timing_slot = 0
@@ -767,6 +780,51 @@ class OffloadMoeCache:
         device.copy_(host, non_blocking=True)
         return device
 
+    def seed_fetch_fraction(self, gpu_share: float) -> None:
+        """One fraction for every layer, for a cap that arrives before the first step.
+
+        The `ft bench bw` profile measures the machine, not a layer, so it seeds all of
+        them; the placement then moves each one on its own as the steps report in.
+        """
+        self.hybrid_fetch_fraction = gpu_share
+        self._fetch_frac_host.fill_(min(1 << 16, max(0, round(gpu_share * (1 << 16)))))
+        self._fetch_frac_dev.copy_(self._fetch_frac_host)
+
+    def set_fetch_fraction(self, layer_id: int, gpu_share: float) -> None:
+        """This layer's capped-fetch share, written where the next launch will read it."""
+        self._fetch_frac_host[layer_id] = min(1 << 16, max(0, round(gpu_share * (1 << 16))))
+
+    def refresh_placement(self) -> None:
+        """Recompute every split this cache has a labelling for, and write it where a replay reads it.
+
+        A captured decode runs no Python: :meth:`split_shares` is called while the graph is
+        being recorded and never again, so without this the division a graph was captured
+        with is the division it keeps -- and since capture is what makes the fetch cap
+        unsafe, that division is "this device takes everything". Both halves of the labelling
+        are already node inputs (the owner map's pinned host buffer, the fetch fraction
+        vector), so a step only has to rewrite the host bytes; the replay picks them up.
+
+        Called once per step from outside the graph, where measuring and dividing are host
+        work that costs nothing on the stream. Layers with no helper are skipped -- there is
+        nothing to divide, and the plain path must stay free of any of this.
+        """
+        from freetoken.layers.moe import _fill_owner_map
+
+        if not self._owner_maps:
+            return
+        for (layer_id, _shape), entry in self._owner_maps.items():
+            helpers = self.split_helpers(layer_id)
+            if not helpers:
+                continue
+            shares = self.split_shares(layer_id, list(helpers))
+            share_list = [(name, shares.get(name, 0.0)) for name in helpers]
+            current = tuple(round(w, 3) for _, w in share_list)
+            if current != entry[2]:
+                _fill_owner_map(entry[0], share_list)
+                entry[2] = current
+            gpu = shares.get("gpu", 1.0)
+            self._fetch_frac_host[layer_id] = min(1 << 16, max(0, round(gpu * (1 << 16))))
+
     def record_event(self):
         """A stream marker for timing device work, or ``None`` where there is no device."""
         if self.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
@@ -1180,8 +1238,12 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         self._hybrid_ensure_ran = True
+        # The copy is issued here, inside whatever region the caller is in: under capture it
+        # becomes a node reading a fixed pinned address, which is what lets a later step
+        # change the fraction without recapturing.
+        self._fetch_frac_dev.copy_(self._fetch_frac_host, non_blocking=True)
         ensure_experts_hybrid(
-            self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
+            self, layer_id, expert_ids, self.hybrid_max_fetch, self._fetch_frac_dev
         )
 
     def materialize_layer(self, layer_id: int) -> None:
