@@ -469,6 +469,19 @@ class WorkerMoeExecutor:
         assert bs <= self._io["x"].tensor.shape[0], (
             f"batch {bs} exceeds the worker's max_batch {self._io['x'].tensor.shape[0]}"
         )
+        # Ask whether the child is still there BEFORE the stream handshake goes in. That
+        # handshake is a device-side wait on a flag only the worker raises: enqueue it for a
+        # worker that has died and the stream never drains, so the engine does not fail, it
+        # stops -- the next host read of any device tensor spins forever with no message and
+        # nothing in the log. The polled path already checks this in _await_slot; the stream
+        # path had no equivalent, and cannot, because by then the wait is already a node.
+        # A non-blocking waitpid per submit is the price of the failure being reportable.
+        rc = self._proc.poll() if self._proc is not None else None
+        if rc is not None:
+            raise RuntimeError(
+                f"MoE worker for device {self.device_index} exited with {rc} before this "
+                f"step: {self._child_error()}"
+            )
         slot = self._slot_for(layer_id, bs) if self.stream_handshake else None
         ids32 = topk_ids.to(torch.int32).contiguous()
         w32 = topk_weights.to(torch.float32).contiguous()
