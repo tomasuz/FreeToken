@@ -77,6 +77,75 @@ def swiglu_clamp_and_mul(
     return _finish(gate * torch.sigmoid(alpha * gate) * up, x, out)
 
 
+# --- the same activations, without allocating -----------------------------------------
+#
+# A device that computes beside a captured graph may not allocate: a capture underway
+# anywhere in the process stops that device's allocator from asking the driver for memory,
+# and it asks even when a block of the right size is already cached. The functions above
+# allocate several times each (``.float()``, the gate, the product), so the executor that
+# runs beside a capture uses these instead: same arithmetic, same float32 interior, every
+# result written into a buffer the caller already owns.
+#
+# ``s0`` and ``s1`` are float32 scratch of the output's shape, held by the caller for the
+# life of the executor. They are read and rewritten freely; nothing survives the call.
+
+
+def _gate_into(x, s0, s1):
+    """``s0`` <- the gate half in float32, ``s1`` free. Shared prologue."""
+    d = x.shape[-1] // 2
+    s0.copy_(x[..., :d])
+    return d
+
+
+def _mul_up_into(x, d, s0, s1, out):
+    """``out`` <- ``s0`` times the value half. Shared epilogue."""
+    s1.copy_(x[..., d:])
+    s0.mul_(s1)
+    out.copy_(s0)
+    return out
+
+
+def silu_and_mul_into(x, out, s0, s1):
+    d = _gate_into(x, s0, s1)
+    torch.sigmoid(s0, out=s1)
+    s0.mul_(s1)
+    return _mul_up_into(x, d, s0, s1, out)
+
+
+def gelu_and_mul_into(x, out, s0, s1):
+    d = _gate_into(x, s0, s1)
+    s1.copy_(s0)
+    s1.mul_(0.7071067811865476)  # 1/sqrt(2)
+    torch.erf(s1, out=s1)
+    s1.add_(1.0)
+    s0.mul_(s1)
+    s0.mul_(0.5)
+    return _mul_up_into(x, d, s0, s1, out)
+
+
+def gelu_tanh_and_mul_into(x, out, s0, s1):
+    d = _gate_into(x, s0, s1)
+    s1.copy_(s0)
+    s1.mul_(s1)
+    s1.mul_(s0)
+    s1.mul_(0.044715)
+    s1.add_(s0)
+    s1.mul_(0.7978845608028654)  # sqrt(2/pi)
+    torch.tanh(s1, out=s1)
+    s1.add_(1.0)
+    s1.mul_(0.5)
+    s0.mul_(s1)
+    return _mul_up_into(x, d, s0, s1, out)
+
+
+INTO_BY_NAME = {
+    "silu": silu_and_mul_into,
+    "gelu": gelu_and_mul_into,
+    "gelu_tanh": gelu_tanh_and_mul_into,
+    "gelu_pytorch_tanh": gelu_tanh_and_mul_into,
+}
+
+
 BY_NAME = {
     "silu": silu_and_mul,
     "gelu": gelu_and_mul,
@@ -89,6 +158,10 @@ BY_NAME = {
 
 __all__ = [
     "BY_NAME",
+    "INTO_BY_NAME",
+    "silu_and_mul_into",
+    "gelu_and_mul_into",
+    "gelu_tanh_and_mul_into",
     "silu_and_mul",
     "gelu_and_mul",
     "gelu_tanh_and_mul",

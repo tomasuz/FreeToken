@@ -911,6 +911,9 @@ class Engine:
                 device,
                 cache.bank_sources,
                 quant_format=cache.quant_format,
+                hidden_size=config.model_config.hidden_size,
+                top_k=config.model_config.num_experts_per_tok,
+                max_batch=max(1, int(config.max_extend_tokens or 1)),
                 activation=getattr(config.model_config, "hidden_act", "silu"),
                 serves_layers=ids,
             )

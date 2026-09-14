@@ -52,6 +52,18 @@ def _module():
     )
 
 
+@functools.cache
+def _warp_size(index: int) -> int:
+    """The device's wave width, asked for once.
+
+    Asking torch rather than the kernel keeps the kernel free of the ATen context header,
+    which hipifies to one that pulls in hipsparse; caching it keeps the question off the
+    per-step path, where a capture underway elsewhere in the process makes every avoidable
+    runtime query a liability.
+    """
+    return torch.cuda.get_device_properties(torch.device("cuda", index)).warp_size
+
+
 def nvfp4_moe_vec(
     a: torch.Tensor,
     packed: torch.Tensor,
@@ -61,18 +73,19 @@ def nvfp4_moe_vec(
     top_k: int,
     row: int,
     tokens: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``[tokens * top_k, row]``: each route's activation against its expert's weight.
 
     ``topk_ids`` is read flat, one entry per route, and names a row of the stacked
     weight banks (a cache slot, not an expert id, wherever the caller keeps a cache).
+
+    ``out`` lets a caller that cannot allocate supply the result buffer; see the note in
+    the kernel about why allocation is not always available.
     """
-    # The wave width is the device's, and asking torch for it here keeps the kernel free
-    # of the ATen context header, which hipifies to one that pulls in hipsparse.
-    warp = torch.cuda.get_device_properties(a.device).warp_size
     return _module().nvfp4_moe_vec(
         a, packed, scale, global_, topk_ids.reshape(-1).to(torch.int32), int(top_k),
-        int(row), int(tokens), int(warp),
+        int(row), int(tokens), int(_warp_size(a.device.index)), out,
     )
 
 

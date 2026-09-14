@@ -31,16 +31,26 @@ def fused_experts_nvfp4_vec(
     topk_ids: torch.Tensor,
     activation: str,
     act_fn=None,
+    bufs: dict | None = None,
 ) -> torch.Tensor:
     """``act_fn`` overrides the activation implementation for callers that cannot use the
     compiled one -- a worker on a device Triton has no backend for. ``None`` keeps the
-    default lookup, so nothing changes for anyone who does not ask."""
+    default lookup, so nothing changes for anyone who does not ask.
+
+    ``bufs`` makes the whole call allocation-free: every intermediate and the result are
+    written into buffers the caller owns and reuses. A device computing beside a captured
+    graph needs this -- while a capture is underway anywhere in the process its allocator
+    may not ask the driver for memory, and it asks even for a block it already has cached.
+    The keys are ``gate_up``, ``inter``, ``down``, ``s0``, ``s1``, ``wbf`` and ``out``; see
+    :class:`~freetoken.moe.device_executor.DeviceMoeExecutor` for how they are sized.
+    """
     from freetoken.kernel.nvfp4_moe import nvfp4_moe_vec
 
-    if act_fn is None:
-        act_fn = _ACT.get(activation)
-    if act_fn is None:
-        raise ValueError(f"unsupported MoE activation {activation!r}")
+    if bufs is None:
+        if act_fn is None:
+            act_fn = _ACT.get(activation)
+        if act_fn is None:
+            raise ValueError(f"unsupported MoE activation {activation!r}")
 
     # The block-scale banks carry their own fp8 type; the kernel reads them as bytes and
     # decodes the bits itself, which is the one path that works on every target (no
@@ -54,6 +64,14 @@ def fused_experts_nvfp4_vec(
     n2 = gate_up_packed.shape[1]  # 2 * intermediate
     h = down_packed.shape[1]  # hidden
     top_k = topk_ids.shape[1]
+
+    if bufs is not None:
+        return _into_bufs(
+            bufs, activation, hidden_states,
+            gate_up_packed, gate_up_scale, gate_up_global,
+            down_packed, down_scale, down_global,
+            topk_weights, topk_ids, top_k, n2, h, num_tokens,
+        )
 
     gate_up = nvfp4_moe_vec(
         hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
@@ -70,6 +88,46 @@ def fused_experts_nvfp4_vec(
         out.dtype
     )
     return out.sum(dim=1)
+
+
+def _into_bufs(
+    bufs, activation, hidden_states,
+    gate_up_packed, gate_up_scale, gate_up_global,
+    down_packed, down_scale, down_global,
+    topk_weights, topk_ids, top_k, n2, h, num_tokens,
+):
+    """The same four steps, every one of them writing into a buffer the caller owns."""
+    from freetoken.kernel.nvfp4_moe import nvfp4_moe_vec
+    from freetoken.layers.activation_torch import INTO_BY_NAME
+
+    act_into = INTO_BY_NAME.get(activation)
+    if act_into is None:
+        raise ValueError(
+            f"MoE activation {activation!r} has no allocation-free form; a device that "
+            f"computes beside a captured graph cannot serve this model"
+        )
+    routes = num_tokens * top_k
+    gate_up = bufs["gate_up"][:routes]
+    inter = bufs["inter"][:routes]
+    down = bufs["down"][:routes]
+
+    nvfp4_moe_vec(
+        hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
+        topk_ids, top_k, n2, num_tokens, out=gate_up,
+    )
+    act_into(gate_up, inter, bufs["s0"][:routes], bufs["s1"][:routes])
+    nvfp4_moe_vec(
+        inter, down_packed, down_scale, down_global,
+        topk_ids, 1, h, routes, out=down,
+    )
+    # The routed weight, then the top_k sum -- both in place, both into buffers that are
+    # already the right shape for this batch.
+    wbf = bufs["wbf"][:routes]
+    wbf.copy_(topk_weights.reshape(routes, 1))
+    down.mul_(wbf)
+    out = bufs["out"][:num_tokens]
+    torch.sum(down.reshape(num_tokens, top_k, h), dim=1, out=out)
+    return out
 
 
 __all__ = ["fused_experts_nvfp4_vec"]

@@ -19,6 +19,8 @@
 // The routed weight is NOT applied here: the caller multiplies it in, matching
 // fused_experts_gguf so the two expert paths compose the same way.
 
+#include <optional>
+
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 
@@ -117,7 +119,8 @@ static constexpr int threads_per_block = 256;
 
 torch::Tensor nvfp4_moe_vec(torch::Tensor a, torch::Tensor packed, torch::Tensor scale,
                             torch::Tensor global_, torch::Tensor topk_ids, int64_t top_k,
-                            int64_t row, int64_t tokens, int64_t warp) {
+                            int64_t row, int64_t tokens, int64_t warp,
+                            std::optional<torch::Tensor> out_opt) {
   TORCH_CHECK(a.is_cuda() && packed.is_cuda() && scale.is_cuda() && global_.is_cuda());
   TORCH_CHECK(a.dim() == 2, "activations must be [rows, K]");
   TORCH_CHECK(packed.dim() == 3 && scale.dim() == 3 && global_.dim() == 2);
@@ -136,7 +139,22 @@ torch::Tensor nvfp4_moe_vec(torch::Tensor a, torch::Tensor packed, torch::Tensor
               "block size must be a whole number of waves, got warp ", warp);
   const at::cuda::CUDAGuard guard(a.device());
   const int64_t routes = tokens * top_k;
-  auto out = torch::empty({routes, row}, a.options());
+  // A caller that must not allocate hands its own buffer in. A capture underway anywhere in
+  // the process forbids this device's allocator from asking the driver for memory, and the
+  // ask happens even when a block of the right size is already cached -- so the executor
+  // that runs beside a captured graph owns its intermediates and passes them here.
+  torch::Tensor out;
+  if (out_opt.has_value()) {
+    out = *out_opt;
+    TORCH_CHECK(out.is_cuda() && out.dim() == 2, "out must be a 2-D device tensor");
+    TORCH_CHECK(out.size(0) == routes && out.size(1) == row,
+                "out is [", out.size(0), ", ", out.size(1), "], expected [", routes, ", ",
+                row, "]");
+    TORCH_CHECK(out.scalar_type() == a.scalar_type(), "out must match the activation dtype");
+    TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+  } else {
+    out = torch::empty({routes, row}, a.options());
+  }
   if (routes == 0) return out;
 
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -173,5 +191,9 @@ torch::Tensor nvfp4_moe_vec(torch::Tensor a, torch::Tensor packed, torch::Tensor
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("nvfp4_moe_vec", &nvfp4_moe_vec,
-        "Grouped expert GEMV over NVFP4 banks (e2m1 codes, e4m3 per-16 scales, fp16 row globals)");
+        "Grouped expert GEMV over NVFP4 banks (e2m1 codes, e4m3 per-16 scales, fp16 row globals)",
+        pybind11::arg("a"), pybind11::arg("packed"), pybind11::arg("scale"),
+        pybind11::arg("global_"), pybind11::arg("topk_ids"), pybind11::arg("top_k"),
+        pybind11::arg("row"), pybind11::arg("tokens"), pybind11::arg("warp"),
+        pybind11::arg("out") = std::nullopt);
 }

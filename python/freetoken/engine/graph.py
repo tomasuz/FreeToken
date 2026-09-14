@@ -124,6 +124,18 @@ class GraphRunner:
         if self.moe_offload_cache is not None:
             self.moe_offload_cache.reset()
 
+    def _device_executors(self):
+        cache = self.moe_offload_cache
+        return getattr(cache, "device_executors", ()) if cache is not None else ()
+
+    def _begin_device_record(self, bs: int) -> None:
+        for executor in self._device_executors():
+            executor.begin_record(bs)
+
+    def _end_device_record(self) -> None:
+        for executor in self._device_executors():
+            executor.end_record()
+
     def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: BaseLLMModel):
         # Mark the post-weights "warmup" phase for /health: this stretch (graph capture — or the
         # remaining readiness work when graphs are disabled) moves no bytes, so without this the
@@ -175,8 +187,16 @@ class GraphRunner:
                 self.buffer.logits[:bs] = model.forward()
                 # Keep the offload cache warmed for capture. Resetting here forces
                 # CUDA graph capture to replay cold-cache expert copies.
-                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
-                    self.buffer.logits[:bs] = model.forward()
+                #
+                # Another device of this process cannot be inside the graph: a capture does
+                # span both, but replaying what it records faults. So it is told to note
+                # this step rather than run it, and to run it again at every replay.
+                self._begin_device_record(bs)
+                try:
+                    with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                        self.buffer.logits[:bs] = model.forward()
+                finally:
+                    self._end_device_record()
                 self._reset_moe_offload_cache()
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
@@ -201,6 +221,10 @@ class GraphRunner:
         # host memory, so writing them here, off the stream, is all a replay needs.
         if self.moe_offload_cache is not None:
             self.moe_offload_cache.refresh_placement()
+        # Hand the other devices their whole step before the graph starts asking for it.
+        # Their work is not in the graph; only the two words that pace it are.
+        for executor in self._device_executors():
+            executor.begin_step(batch.padded_size)
         g.replay()
         return self.buffer.logits[: batch.size]
 
