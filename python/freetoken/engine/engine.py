@@ -295,6 +295,33 @@ class ForwardOutput(NamedTuple):
     copy_done_event: torch.cuda.Event
 
 
+def _warm_device_executors(config) -> None:
+    """Bring up the other GPUs of this process now, before anything registers host memory.
+
+    A device is initialised the first time it is touched, and that initialisation wants
+    address space of its own. Do it after the banks are in and the runtime aborts building
+    the device's null stream rather than failing the call -- hipMemcpyWithStream ->
+    Device::NullStream -> Stream::terminate, with nothing to catch. Touched first, the same
+    device costs one small allocation and works for the rest of the run.
+
+    Cheap enough to do unconditionally for the devices named, and skipped entirely when
+    none are.
+    """
+    if not getattr(config, "moe_device_layers", None):
+        return
+    for entry in str(config.moe_device_layers).split(";"):
+        head = entry.split(":", 1)[0].strip()
+        if not head.isdigit():
+            continue
+        index = int(head)
+        logger.info_rank0(
+            f"--moe-device-layers: bringing up GPU {index} "
+            f"(of {torch.cuda.device_count()} visible) before the banks are registered"
+        )
+        with torch.cuda.device(index):
+            torch.zeros(1, device=torch.device("cuda", index))
+
+
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
@@ -309,6 +336,7 @@ class Engine:
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
+        _warm_device_executors(config)
         self.dtype = config.dtype
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
         # KV pool family fixed at construction from the model config: its classmethods own the
@@ -806,6 +834,9 @@ class Engine:
         )
         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+        # After the sources are in: these read them, so they need the sources the cache
+        # ended up with rather than the ones the loader handed over.
+        self._init_device_executors(config, cache)
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
@@ -854,6 +885,41 @@ class Engine:
             f"--moe-hybrid-max-fetch auto: fetching {fraction:.1%} of each decode step's "
             "expert misses over PCIe (benched PCIe/CPU bandwidth ratio), the rest on the CPU"
         )
+
+    def _init_device_executors(self, config, cache) -> None:
+        """Attach the other GPUs of this process named by --moe-device-layers.
+
+        No process to start, no banks to publish, no registration to spend: the pinned host
+        pages the cache already holds are registered portable, so a second device of this
+        process reads them through the pointer they have. The layer spec only bounds what a
+        device may be offered -- which layers it computes is decided per step by the
+        placement, exactly as it is for a worker and for the CPU.
+        """
+        if not config.moe_device_layers:
+            return
+        from freetoken.moe.device_executor import DeviceMoeExecutor
+
+        num_moe_layers = config.model_config.num_moe_layers
+        for device, spec in _parse_per_device(
+            config.moe_device_layers, "--moe-device-layers"
+        ).items():
+            k = _parse_layer_count(spec, num_moe_layers, "--moe-device-layers")
+            ids = k if isinstance(k, frozenset) else frozenset(_middle_first(num_moe_layers)[:k])
+            if not ids:
+                continue
+            executor = DeviceMoeExecutor(
+                device,
+                cache.bank_sources,
+                quant_format=cache.quant_format,
+                activation=getattr(config.model_config, "hidden_act", "silu"),
+                serves_layers=ids,
+            )
+            cache.device_executors.append(executor)
+            logger.info_rank0(
+                f"--moe-device-layers: GPU {device} may serve {len(ids)} of "
+                f"{num_moe_layers} offloaded layers from this process, reading the "
+                f"engine's own banks; the split is decided per step from measured throughput"
+            )
 
     def _init_worker_executors(self, config: EngineConfig, cache, banks, worker_layers) -> dict:
         """Start one worker per assigned layer and hand it that layer's expert weights.
@@ -1681,6 +1747,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cpu_layers": None,
     "moe_resident_layers": None,
     "moe_worker_layers": None,
+    "moe_device_layers": None,
     "moe_worker_env": None,
     "moe_bank_spill_dir": None,
     "moe_cpu_threads": 0,

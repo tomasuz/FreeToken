@@ -694,6 +694,20 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-device-layers",
+        type=str,
+        default=None,
+        help=(
+            "Serve these expert layers from another GPU of THIS process: '<device>:<spec>' "
+            "(repeat with ';'), the --moe-worker-layers spec without the worker. The banks "
+            "are pinned host pages registered portable, so that device reads the very ones "
+            "this device reads -- no second mapping, no shared files, no doorbell. Use it "
+            "wherever the build has code for the device; --moe-worker-layers is for the "
+            "device that needs a runtime of its own."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-worker-env",
         type=str,
         default=ServerArgs.moe_worker_env,

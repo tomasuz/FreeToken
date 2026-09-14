@@ -134,10 +134,18 @@ int64_t driver_cuda_version() {
 static torch::Tensor tensor_from_device_ptr(uintptr_t addr, std::vector<int64_t> sizes,
                                             py::object dtype, int64_t device_index) {
   auto scalar_type = torch::python::detail::py_object_to_dtype(std::move(dtype));
-  auto options = torch::TensorOptions()
-                     .dtype(scalar_type)
-                     .device(torch::kCUDA, (c10::DeviceIndex)device_index);
-  return torch::from_blob(reinterpret_cast<void*>(addr), sizes, [](void*) {}, options);
+  auto device = c10::Device(torch::kCUDA, (c10::DeviceIndex)device_index);
+  auto options = torch::TensorOptions().dtype(scalar_type).device(device);
+  // target_device, not from_blob's inference. Asked to infer, ATen reads the pointer's
+  // attributes, and for registered host pages the runtime answers with the device the
+  // registration was made for -- so a second device of this process, reading the very same
+  // portable mapping, is refused as "does not match device of data". The caller knows which
+  // device is about to dereference this; say so instead of asking.
+  return at::for_blob(reinterpret_cast<void*>(addr), sizes)
+      .deleter([](void*) {})
+      .options(options)
+      .target_device(device)
+      .make_tensor();
 }
 
 

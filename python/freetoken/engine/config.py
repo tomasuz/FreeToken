@@ -74,6 +74,10 @@ class EngineConfig:
     # only activations cross. A device the engine's own process cannot drive is exactly
     # what this is for -- see moe_worker_env.
     moe_worker_layers: str | None = None
+    # Layers offered to another GPU of THIS process (--moe-device-layers). Same spec shape
+    # as --moe-worker-layers and the same meaning, minus the process: a build with code for
+    # the device needs no runtime of its own, so there is nothing to isolate.
+    moe_device_layers: str | None = None
     # Per-device environment for those workers, as "<device>:<K>=<V>[,<K>=<V>...][;...]".
     # Some devices need a runtime configured differently than the parent's, and those
     # settings are process-wide, so a worker is the only place they can be applied.

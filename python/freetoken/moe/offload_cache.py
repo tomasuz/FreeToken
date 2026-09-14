@@ -255,6 +255,10 @@ class OffloadMoeCache:
         # memory of its own -- but the compute lands elsewhere rather than here.
         self.worker_layer_ids: frozenset = frozenset()
         self.worker_executors: dict = {}
+        # Other devices of this process, each serving whatever layers it was offered. A
+        # worker is the same thing across a process boundary; these need none, so they
+        # share the banks rather than a copy of them (see moe/device_executor.py).
+        self.device_executors: list = []
         # marlin/b12x per-expert global scales ([L*E], GPU resident, see set_alphas).
         self.gate_up_alpha: torch.Tensor | None = None
         self.down_alpha: torch.Tensor | None = None
@@ -751,6 +755,9 @@ class OffloadMoeCache:
         worker = self.worker_executors.get(layer_id)
         if worker is not None and worker.serves(layer_id):
             helpers[f"worker{getattr(worker, 'device_index', '?')}"] = worker
+        for executor in self.device_executors:
+            if executor.serves(layer_id):
+                helpers[f"gpu{executor.device_index}"] = executor
         return helpers
 
     def owner_map(self, layer_id: int, shape, shares: list) -> torch.Tensor:
