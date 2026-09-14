@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+
+from freetoken.utils.phase_timer import phase
 from freetoken.layers import (
     BaseOP,
     LinearColParallelMerged,
@@ -75,10 +77,15 @@ class Qwen3_5MoE(BaseOP):
         # Compute the router + shared expert BEFORE the routed experts: the fused MoE
         # kernel may write into ``hidden_states`` in place, which would corrupt the
         # shared expert's input (HF also evaluates the shared expert first).
-        router_logits = self.gate.forward(hidden_states)
-        shared = self.shared_expert.forward(hidden_states)
-        shared = shared * torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
-        routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+        with phase("mlp.gate"):
+            router_logits = self.gate.forward(hidden_states)
+        with phase("mlp.shared"):
+            shared = self.shared_expert.forward(hidden_states)
+            shared = shared * torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
+        with phase("mlp.experts"):
+            routed = self.experts.forward(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
         return (routed + shared).view(num_tokens, hidden_dim)
 
 

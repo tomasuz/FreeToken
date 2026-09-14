@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+
+from freetoken.utils.phase_timer import phase, step_done
 from freetoken.core import get_global_ctx
 from freetoken.layers import (
     BaseOP,
@@ -67,9 +69,14 @@ class Qwen3_5DecoderLayer(BaseOP):
             hidden = self.input_layernorm.forward(hidden)
         else:
             hidden, residual = self.input_layernorm.forward_add_residual(hidden, residual)
-        hidden = self.linear_attn.forward(hidden) if self._is_linear else self.self_attn.forward(hidden)
+        with phase("linear_attn" if self._is_linear else "self_attn"):
+            hidden = (
+                self.linear_attn.forward(hidden) if self._is_linear
+                else self.self_attn.forward(hidden)
+            )
         hidden, residual = self.post_attention_layernorm.forward_add_residual(hidden, residual)
-        hidden = self.mlp.forward(hidden)
+        with phase("mlp"):
+            hidden = self.mlp.forward(hidden)
         return hidden, residual
 
 
@@ -93,6 +100,7 @@ class Qwen3_5Model(BaseOP):
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
         x, _ = self.norm.forward_add_residual(x, residual)
+        step_done()
         return x
 
 

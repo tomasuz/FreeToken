@@ -898,6 +898,7 @@ class OffloadMoeCache:
         """
         from freetoken.moe.placement import split_misses
 
+        self._drain_self_timed()
         names = ["gpu", *helper_names]
         if _FORCE_GPU_ONLY:
             # Diagnostic: keep every executor in the wiring but give the work to this
@@ -913,6 +914,18 @@ class OffloadMoeCache:
         # assignment both work in fractions, so only the proportions matter here.
         placement = split_misses(rates, 1024, self.bytes_per_expert)
         return {name: placement.counts[name] / 1024 for name in names if name in placement.counts}
+
+    def _drain_self_timed(self) -> None:
+        """Fold in what the executors that measure themselves have measured.
+
+        Their samples are the only ones a captured step produces -- the engine's own
+        clock cannot run inside a replay -- so without this the split a graph was captured
+        with is the split it keeps for the rest of the run.
+        """
+        for executor in self.device_executors:
+            name = f"gpu{executor.device_index}"
+            for routes, seconds in executor.take_samples():
+                self.rate_tracker.observe(name, routes, seconds, self.bytes_per_expert)
 
     def _skips_movement(self, layer_id: int) -> bool:
         """Layers whose host bank this cache can never read: the pages are gone.

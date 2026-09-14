@@ -140,6 +140,7 @@ class DeviceMoeExecutor:
         self._next_slot = 0
         self.hits = 0
         self.misses = 0
+        self.self_timed = True  # the engine's host clock must not speak for this device
 
         h, k, b = int(hidden_size), int(top_k), max(1, int(max_batch))
         self._top_k = k
@@ -173,6 +174,26 @@ class DeviceMoeExecutor:
         }
         self._near_y = self._view(self._y, index=self._near_index)
         self._bufs = self._alloc_bufs(b, k)
+
+        # What this device is worth, measured by this device. The engine times a helper
+        # with a host clock around submit and sync, and that span contains the whole step
+        # -- this device's own fetch, its GEMM, every earlier helper's join. A helper that
+        # overlaps perfectly is therefore charged the makespan, reads back an order of
+        # magnitude slow, and is given proportionally less work, which lengthens the step,
+        # which confirms the reading. Stream events on this device's own stream measure
+        # the compute and nothing else, and a replay does not stop them: this thread runs
+        # every step whether or not there is any Python in it.
+        with torch.cuda.device(self.device):
+            self._ev_start = [torch.cuda.Event(enable_timing=True) for _ in range(_SLOTS)]
+            self._ev_end = [torch.cuda.Event(enable_timing=True) for _ in range(_SLOTS)]
+        # The route count belongs to the step that was timed, so it is taken on the stream
+        # (where it is ordered against the compute) rather than from the live buffer, which
+        # the engine has already overwritten by the time the answer is harvested.
+        self._ids_seen = _pinned((_SLOTS, b, k), torch.int32)
+        self._ids_seen_far = self._view(self._ids_seen)
+        self._inflight: list[tuple[int, int]] = []
+        self._samples: list[tuple[int, float]] = []
+        self._samples_lock = threading.Lock()
 
         # What the far device is asked to do, and when. A recorded program is a step's
         # worth of slots in the order the engine rings them, kept because a replay runs no
@@ -293,13 +314,19 @@ class DeviceMoeExecutor:
                     return
                 slots = item if isinstance(item, list) else (item,)
                 try:
+                    self._harvest()
                     with torch.cuda.device(self.device), torch.cuda.stream(self._stream):
                         for slot in slots:
+                            bs = int(self._slot_bs[slot])
                             handshake.wait(ready_ptr, slot)
-                            self._compute(
-                                int(self._slot_layer[slot]), int(self._slot_bs[slot])
-                            )
+                            # Between the wait and the doorbell is this device's work and
+                            # only this device's work; the events bracket exactly that.
+                            self._ev_start[slot].record(self._stream)
+                            self._ids_seen_far[slot][:bs].copy_(self._far["ids"][:bs])
+                            self._compute(int(self._slot_layer[slot]), bs)
+                            self._ev_end[slot].record(self._stream)
                             handshake.doorbell(ready_ptr, done_ptr, slot)
+                            self._inflight.append((slot, bs))
                 except BaseException as exc:  # noqa: BLE001 -- reported, then released
                     self._fail(exc, slots)
                     return
@@ -319,6 +346,37 @@ class DeviceMoeExecutor:
         )
         with torch.inference_mode():
             self._done.fill_(1)
+
+    def _harvest(self) -> None:
+        """Turn last step's events into samples, for any pair that has actually landed.
+
+        Asked, never waited on: an event that has not finished is left in place for the
+        next pass. A sample only says something about this device if the work it brackets
+        is over, and stalling here to make sure of it would put the host back on the
+        critical path the whole arrangement exists to keep it off.
+        """
+        if not self._inflight:
+            return
+        still: list[tuple[int, int]] = []
+        fresh: list[tuple[int, float]] = []
+        for slot, bs in self._inflight:
+            if not self._ev_end[slot].query():
+                still.append((slot, bs))
+                continue
+            seconds = self._ev_start[slot].elapsed_time(self._ev_end[slot]) / 1e3
+            routes = int((self._ids_seen[slot][:bs] >= 0).sum())
+            if routes > 0 and seconds > 0.0:
+                fresh.append((routes, seconds))
+        self._inflight = still
+        if fresh:
+            with self._samples_lock:
+                self._samples.extend(fresh)
+
+    def take_samples(self) -> list[tuple[int, float]]:
+        """Every (routes, seconds) measured since the last ask, and clear them."""
+        with self._samples_lock:
+            samples, self._samples = self._samples, []
+        return samples
 
     def _compute(self, layer_id: int, bs: int) -> None:
         """One layer's share, entirely into buffers this executor already owns."""

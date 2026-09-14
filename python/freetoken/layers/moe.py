@@ -3,6 +3,8 @@ import time
 from typing import TYPE_CHECKING, Tuple
 
 import torch
+
+from freetoken.utils.phase_timer import phase
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_strategy
@@ -289,12 +291,13 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
     ):
-        topk_weights, topk_ids = fused_topk(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=self.top_k,
-            renormalize=self.renormalize,
-        )
+        with phase("mlp.topk"):
+            topk_weights, topk_ids = fused_topk(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=self.top_k,
+                renormalize=self.renormalize,
+            )
         return self._decode_routed(hidden_states, topk_weights, topk_ids)
 
     def prefill_forward(
@@ -385,9 +388,10 @@ class OffloadMoELayer(MoELayer):
         Each route is computed exactly once: the ids handed to an executor are ``-1``
         wherever a different one owns that route, and the partials are summed.
         """
-        raw = topk_ids.clone()  # raw expert ids, before the kernel rewrites them to slots
-        names = list(helpers)
-        shares = cache.split_shares(self.layer_id, names)
+        with phase("moe.plan"):
+            raw = topk_ids.clone()  # raw ids, before the kernel rewrites them to slots
+            names = list(helpers)
+            shares = cache.split_shares(self.layer_id, names)
 
         # The kernel fetches this fraction of the misses; the rest overflow to the helpers.
         # Under capture this device fetches every miss, and the helpers are left with
@@ -404,14 +408,15 @@ class OffloadMoELayer(MoELayer):
         # eager step writes its own, and the two paths then agree on where the split lives.
         if not capturing_now:
             cache.set_fetch_fraction(self.layer_id, float(shares.get("gpu", 1.0)))
-        cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
-        if cache.collect_stats:
-            cache.record_decode_stats_hybrid(self.layer_id)
-        on_gpu = topk_ids >= 0
+        with phase("moe.ensure"):
+            cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot, or -1
+            if cache.collect_stats:
+                cache.record_decode_stats_hybrid(self.layer_id)
+            on_gpu = topk_ids >= 0
 
-        share_list = [(n, shares.get(n, 0.0)) for n in names]
-        owner = cache.owner_map(self.layer_id, topk_ids.shape, share_list)
-        assignment = _assign_overflow(~on_gpu, owner, share_list)
+            share_list = [(n, shares.get(n, 0.0)) for n in names]
+            owner = cache.owner_map(self.layer_id, topk_ids.shape, share_list)
+            assignment = _assign_overflow(~on_gpu, owner, share_list)
         pending, started = {}, {}
         for name, mask in assignment.items():
             # No "is this mask empty" test: answering it needs the device to tell the host
@@ -425,8 +430,9 @@ class OffloadMoELayer(MoELayer):
             # select. The sum below is over partials that must not overlap.
             weights = torch.where(mask, topk_weights, topk_weights.new_zeros(())).contiguous()
             started[name] = time.perf_counter()
-            pending[name] = _submit(helpers[name], self.layer_id, hidden_states,
-                                    weights, ids)
+            with phase(f"moe.submit.{name}"):
+                pending[name] = _submit(helpers[name], self.layer_id, hidden_states,
+                                        weights, ids)
 
         # Time the fetch alone. What the split needs from this device is the cost of one
         # *more* miss, and that is a transfer -- averaging it with the hits, which cost no
@@ -434,27 +440,32 @@ class OffloadMoELayer(MoELayer):
         # hand it work the link cannot carry. The GEMM that follows is work this device
         # owes whatever the split decides, so it is charged as time already committed
         # rather than as part of the price of a miss.
-        fetch_start = cache.record_event()
-        cache.copy_missing()
-        fetch_end = cache.record_event()
+        with phase("moe.fetch"):
+            fetch_start = cache.record_event()
+            cache.copy_missing()
+            fetch_end = cache.record_event()
 
-        gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
-        gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
-        out = self._expert_gemm(
-            cache,
-            hidden_states,
-            gpu_w,
-            gpu_slots,
-            views=cache.bank_views(),
-            n=None,
-            alphas=cache.alphas_for_slots(self.layer_id),
-            is_prefill=False,
-        )
+        with phase("moe.gemm"):
+            gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
+            gpu_w = torch.where(
+                on_gpu, topk_weights, topk_weights.new_zeros(())
+            ).contiguous()
+            out = self._expert_gemm(
+                cache,
+                hidden_states,
+                gpu_w,
+                gpu_slots,
+                views=cache.bank_views(),
+                n=None,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=False,
+            )
         cache.note_step_timing(fetch_start, fetch_end, cache.record_event())
 
         capturing = capturing_now
         for name, handle in pending.items():
-            part = _sync(helpers[name], handle)
+            with phase(f"moe.join.{name}"):
+                part = _sync(helpers[name], handle)
             if _TRACE_HANDOFF and not capturing:
                 print(f"engine: layer {self.layer_id} <- {name} "
                       f"|y|={float(part.float().abs().sum()):.4f} "
@@ -466,6 +477,13 @@ class OffloadMoELayer(MoELayer):
                 # tracing pass and then stand forever, which is worse than no sample --
                 # and reading the count is a device-to-host read, which ends the capture
                 # outright. The rates learned from the eager steps before capture stand.
+                continue
+            if getattr(helpers[name], "self_timed", False):
+                # This executor measures itself, on its own stream, and does so every step
+                # including the ones a graph replays. The clock below cannot: the span it
+                # reads starts at submit and ends at join, so it contains this device's
+                # fetch and GEMM as well -- an executor that overlaps perfectly is charged
+                # the whole makespan and reads back an order of magnitude slow.
                 continue
             # Count the routes this executor actually received. Reading a device tensor
             # costs a synchronisation, which is why this cannot stand under capture -- but
