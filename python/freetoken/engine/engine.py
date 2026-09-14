@@ -295,6 +295,52 @@ class ForwardOutput(NamedTuple):
     copy_done_event: torch.cuda.Event
 
 
+def _keep_hipblaslt_on_mixed_devices() -> None:
+    """Ask for hipBLASLt by name, because a second device can otherwise lose it for both.
+
+    On ROCm the preferred BLAS backend is decided once, for the process, by walking every
+    visible device: hipBLASLt is preferred only if *all* of them are architectures that
+    prefer it. An integrated GPU that is not on that list therefore takes hipBLASLt away
+    from a discrete one that is -- and the discrete one is where the model runs. The cost
+    is not small. Measured on gfx1200 beside gfx90c, a [1,2048]x[2048,256] bf16 matmul
+    takes 134 us on the fallback and 20 us on hipBLASLt, and decode -- which is almost
+    entirely matmuls this shape -- ran 2.9x slower with the integrated GPU merely visible.
+
+    Naming the backend skips that vote. It is not a claim that every device can use it:
+    the per-operation guard still asks per device and sends anything hipBLASLt cannot
+    serve to hipBLAS, so a device that needs the fallback still gets it.
+
+    Best effort by design. On a build whose architecture check refuses this the request is
+    overridden right back, which is the status quo and not an error; likewise where the
+    knob does not exist. Set FREETOKEN_PREFER_HIPBLASLT=0 to leave the choice alone.
+    """
+    if not getattr(torch.version, "hip", None):
+        return
+    if os.environ.get("FREETOKEN_PREFER_HIPBLASLT", "1") != "1":
+        return
+    if torch.cuda.device_count() < 2:
+        return  # one device votes for itself; nothing to rescue
+    try:
+        before = torch.backends.cuda.preferred_blas_library()
+        if "cublaslt" in str(before).lower():
+            return
+        torch.backends.cuda.preferred_blas_library("hipblaslt")
+        after = torch.backends.cuda.preferred_blas_library()
+    except Exception as exc:  # noqa: BLE001 -- a preference, never a requirement
+        logger.info_rank0(f"could not ask for hipBLASLt ({type(exc).__name__}); keeping the default")
+        return
+    if "cublaslt" in str(after).lower():
+        logger.info_rank0(
+            "BLAS backend: hipBLASLt, asked for by name -- another visible device would "
+            "otherwise have moved this one to hipBLAS"
+        )
+    else:
+        logger.info_rank0(
+            f"BLAS backend stays {after}: this build will not take hipBLASLt while a "
+            f"device it does not support is visible"
+        )
+
+
 def _warm_device_executors(config) -> None:
     """Bring up the other GPUs of this process now, before anything registers host memory.
 
@@ -337,6 +383,8 @@ class Engine:
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
         _warm_device_executors(config)
+        # After the other devices exist, because the vote this overrides counts them.
+        _keep_hipblaslt_on_mixed_devices()
         self.dtype = config.dtype
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
         # KV pool family fixed at construction from the model config: its classmethods own the
