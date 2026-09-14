@@ -153,6 +153,14 @@ class Scheduler(SchedulerIOMixin, MTPDecodeMixin):
         tracker = getattr(cache, "rate_tracker", None)
         if tracker is not None and tracker.describe():
             logger.info_rank0(f"moe executor rates: {tracker.describe()}")
+        # A rate is bytes over time and hides which of the two was the problem. An
+        # executor that measures itself can say whether it spent the step working or
+        # waiting, and that is what decides whether giving it more work would help.
+        for executor in getattr(cache, "device_executors", ()) or ():
+            summary = getattr(executor, "timing_summary", lambda: None)()
+            if summary:
+                logger.info_rank0(summary)
+        if tracker is not None and tracker.describe():
             # Show the division those rates produce, since the rates alone do not say what
             # the engine did with them.
             for layer_id in sorted(getattr(cache, "worker_layer_ids", ()) or ()):

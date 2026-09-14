@@ -34,6 +34,7 @@ host memory both devices address, never device to device.
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 
@@ -149,7 +150,11 @@ class DeviceMoeExecutor:
         self._x = _pinned((b, h), torch.bfloat16)
         self._ids = _pinned((b, k), torch.int32)
         self._w = _pinned((b, k), torch.float32)
-        self._y = _pinned((b, h), torch.bfloat16)
+        # One answer region per slot, not one shared by every layer. The engine reads a
+        # slot's answer some time after the doorbell that announced it, and a single
+        # buffer makes that read a race with the next layer's write -- the two are only
+        # ordered through flags that speak about the slot, not about the buffer.
+        self._y = _pinned((_SLOTS, b, h), torch.bfloat16)
         # ready: the engine has published a request in this slot. done: its answer is in _y.
         # slot_layer / slot_bs say what the slot means; both are fixed the first time a slot
         # is handed out, so a replay -- which runs no Python -- still finds them right.
@@ -162,17 +167,19 @@ class DeviceMoeExecutor:
             self._stream = torch.cuda.Stream(device=self.device)
         self._far = {
             name: self._view(t)
-            for name, t in (("x", self._x), ("ids", self._ids),
-                            ("w", self._w), ("y", self._y))
-        }
-        # The engine writes through its OWN alias of the same memory: a copy whose
-        # destination claims to belong to the far device is a peer copy, and this one is
-        # not -- the bytes never leave the host.
-        self._near = {
-            name: self._view(t, index=self._near_index)
             for name, t in (("x", self._x), ("ids", self._ids), ("w", self._w))
         }
+        self._far_y = self._view(self._y)
+        self._near_device = torch.device("cuda", self._near_index)
+        # This device's own alias of the answer buffer, for reading it back with a kernel
+        # rather than a transfer: a copy engine is a different agent from the one the far
+        # device's release fence orders, and a replay showed it reading the buffer before
+        # those writes were visible.
         self._near_y = self._view(self._y, index=self._near_index)
+        # Diagnostic: a buffer the far device never writes, read through the same path.
+        self._const = _pinned((b, h), torch.bfloat16)
+        self._const.fill_(0.001)
+        self._near_const = self._view(self._const, index=self._near_index)
         self._bufs = self._alloc_bufs(b, k)
 
         # What this device is worth, measured by this device. The engine times a helper
@@ -184,6 +191,12 @@ class DeviceMoeExecutor:
         # the compute and nothing else, and a replay does not stop them: this thread runs
         # every step whether or not there is any Python in it.
         with torch.cuda.device(self.device):
+            # Three, so the two halves of a slot's life can be told apart: _ev_pre is
+            # recorded before the wait, _ev_start after it. pre->start is this device
+            # standing idle because the engine has not rung yet; start->end is the work.
+            # Which of the two dominates says who is waiting for whom, and that is the
+            # only question worth asking about a split that costs more than it saves.
+            self._ev_pre = [torch.cuda.Event(enable_timing=True) for _ in range(_SLOTS)]
             self._ev_start = [torch.cuda.Event(enable_timing=True) for _ in range(_SLOTS)]
             self._ev_end = [torch.cuda.Event(enable_timing=True) for _ in range(_SLOTS)]
         # The route count belongs to the step that was timed, so it is taken on the stream
@@ -191,9 +204,37 @@ class DeviceMoeExecutor:
         # the engine has already overwritten by the time the answer is harvested.
         self._ids_seen = _pinned((_SLOTS, b, k), torch.int32)
         self._ids_seen_far = self._view(self._ids_seen)
+        # A diagnostic, off unless FREETOKEN_DEVICE_TRACE is set: what this device was
+        # handed and what it produced, staged on its own stream so the answer is the one
+        # the work actually saw rather than whatever the engine has written since.
+        self._trace = os.environ.get("FREETOKEN_DEVICE_TRACE", "") == "1"
+        self._zero_out = os.environ.get("FREETOKEN_DEVICE_ZERO_OUT", "") == "1"
+        self._read_dma = os.environ.get("FREETOKEN_DEVICE_READ_DMA", "") == "1"
+        self._const_out = os.environ.get("FREETOKEN_DEVICE_CONST_OUT", "") == "1"
+        if self._trace:
+            self._x_seen = _pinned((_SLOTS, b, h), torch.bfloat16)
+            self._y_seen = _pinned((_SLOTS, b, h), torch.bfloat16)
+            self._w_seen = _pinned((_SLOTS, b, k), torch.float32)
+            self._x_seen_far = self._view(self._x_seen)
+            self._y_seen_far = self._view(self._y_seen)
+            self._w_seen_far = self._view(self._w_seen)
+            self._traced = 0
+            # What the ENGINE read, staged by a node of its own graph, so the host can
+            # look at it afterwards. The only way to see inside a replay.
+            self._engine_seen = _pinned((_SLOTS, b, h), torch.bfloat16)
+        else:
+            self._engine_seen = None
+        self._checked = 0 if self._trace else 99
+        self._retained: dict[int, tuple] = {}
         self._inflight: list[tuple[int, int]] = []
         self._samples: list[tuple[int, float]] = []
         self._samples_lock = threading.Lock()
+        # Cumulative, for the report; the samples above are drained by the rate tracker.
+        self._seen = 0
+        self._busy_s = 0.0
+        self._idle_s = 0.0
+        self._routes = 0
+        self._busy_max = 0.0
 
         # What the far device is asked to do, and when. A recorded program is a step's
         # worth of slots in the order the engine rings them, kept because a replay runs no
@@ -313,20 +354,44 @@ class DeviceMoeExecutor:
                 if item is None:
                     return
                 slots = item if isinstance(item, list) else (item,)
+                acks: list[tuple[int, int]] = []
                 try:
                     self._harvest()
                     with torch.cuda.device(self.device), torch.cuda.stream(self._stream):
                         for slot in slots:
                             bs = int(self._slot_bs[slot])
+                            self._ev_pre[slot].record(self._stream)
                             handshake.wait(ready_ptr, slot)
                             # Between the wait and the doorbell is this device's work and
                             # only this device's work; the events bracket exactly that.
                             self._ev_start[slot].record(self._stream)
                             self._ids_seen_far[slot][:bs].copy_(self._far["ids"][:bs])
-                            self._compute(int(self._slot_layer[slot]), bs)
+                            if self._trace:
+                                self._x_seen_far[slot][:bs].copy_(self._far["x"][:bs])
+                                self._w_seen_far[slot][:bs].copy_(self._far["w"][:bs])
+                            self._compute(int(self._slot_layer[slot]), bs, slot)
+                            if self._trace:
+                                self._y_seen_far[slot][:bs].copy_(self._far_y[slot][:bs])
+                                self._check(int(self._slot_layer[slot]), bs, slot)
                             self._ev_end[slot].record(self._stream)
-                            handshake.doorbell(ready_ptr, done_ptr, slot)
-                            self._inflight.append((slot, bs))
+                            acks.append((slot, bs))
+                    # The answer is acknowledged from the host, not by a kernel of this
+                    # device. A kernel here would be the natural thing and it is wrong on
+                    # this stack: the flag arrives -- the engine never hangs -- but the
+                    # bytes it is meant to vouch for do not. Measured, layer by layer:
+                    # this device wrote a partial whose maximum was 0.16992 and the
+                    # engine, past its wait, read 0.00000. A release fence orders one
+                    # agent's own accesses; it does not make this device's writes to
+                    # mapped host memory visible to another device reading the same
+                    # pages. Waiting on the host and setting the word from the CPU does,
+                    # because a host store to host memory is what the other device's
+                    # aperture read actually observes -- and it is what the worker
+                    # process did, which is why that one was correct.
+                    for slot, bs in acks:
+                        self._ev_end[slot].synchronize()
+                        self._ready[slot] = 0
+                        self._done[slot] = 1
+                        self._inflight.append((slot, bs))
                 except BaseException as exc:  # noqa: BLE001 -- reported, then released
                     self._fail(exc, slots)
                     return
@@ -364,7 +429,25 @@ class DeviceMoeExecutor:
                 still.append((slot, bs))
                 continue
             seconds = self._ev_start[slot].elapsed_time(self._ev_end[slot]) / 1e3
+            idle = self._ev_pre[slot].elapsed_time(self._ev_start[slot]) / 1e3
             routes = int((self._ids_seen[slot][:bs] >= 0).sum())
+            self._seen += 1
+            self._busy_s += seconds
+            self._idle_s += max(0.0, idle)
+            self._routes += routes
+            self._busy_max = max(self._busy_max, seconds)
+            if self._trace and self._traced < 12:
+                self._traced += 1
+                ids = self._ids_seen[slot][:bs]
+                x, y = self._x_seen[slot][:bs].float(), self._y_seen[slot][:bs].float()
+                w = self._w_seen[slot][:bs]
+                logger.info_rank0(
+                    f"  trace slot {slot:2d} layer {int(self._slot_layer[slot]):2d}: "
+                    f"routes={int((ids >= 0).sum())} ids={ids.reshape(-1).tolist()} "
+                    f"wsum={float(w.sum()):.4f} wmax={float(w.abs().max()):.4f} "
+                    f"|x|={float(x.abs().sum()):.4f} xmax={float(x.abs().max()):.4f} "
+                    f"|y|={float(y.abs().sum()):.4f} ymax={float(y.abs().max()):.4f}"
+                )
             if routes > 0 and seconds > 0.0:
                 fresh.append((routes, seconds))
         self._inflight = still
@@ -372,16 +455,73 @@ class DeviceMoeExecutor:
             with self._samples_lock:
                 self._samples.extend(fresh)
 
+    def timing_summary(self) -> str | None:
+        """What this device did with the layers it was given, per layer, in words.
+
+        ``idle`` is time spent waiting for the engine to ring; ``busy`` is the expert
+        work. Idle much larger than busy means the engine sets the pace and this device
+        is free -- give it more. Idle near zero means the opposite: this device is always
+        behind, and the engine's stream is the one doing the waiting.
+        """
+        if not self._seen:
+            return None
+        n = self._seen
+        return (
+            f"MoE device {self.device_index}: {n} layer-steps measured, "
+            f"busy {self._busy_s / n * 1e3:.3f} ms/layer (max {self._busy_max * 1e3:.3f}), "
+            f"idle {self._idle_s / n * 1e3:.3f} ms/layer, "
+            f"{self._routes / n:.2f} routes/layer, "
+            f"busy share {100 * self._busy_s / max(1e-9, self._busy_s + self._idle_s):.1f}%"
+        )
+
     def take_samples(self) -> list[tuple[int, float]]:
         """Every (routes, seconds) measured since the last ask, and clear them."""
         with self._samples_lock:
             samples, self._samples = self._samples, []
         return samples
 
-    def _compute(self, layer_id: int, bs: int) -> None:
+    def _check(self, layer_id: int, bs: int, slot: int) -> None:
+        """Recompute this layer the ordinary way and say whether the fast path agrees.
+
+        Diagnostic only. The allocation-free path exists because an allocation is refused
+        while a capture is underway; a replay is not a capture, so here -- where the work
+        is actually done -- the plain path can still be run for comparison.
+        """
+        if self._checked >= 8:
+            return
+        self._checked += 1
+        # From the snapshot, not the live buffers: the engine reuses x/ids/w for the next
+        # layer the moment this one is acknowledged, so a reference built from what is
+        # there now would answer a different question. The snapshot was taken on this
+        # stream, immediately before the work, and is exactly what the work read.
+        ref = self._call(
+            self._views[layer_id], self._x_seen_far[slot][:bs], self._w_seen_far[slot][:bs],
+            self._ids_seen_far[slot][:bs], self._activation, self._act_fn, None,
+        )
+        got = self._y_seen_far[slot][:bs]
+        torch.cuda.synchronize(self.device)
+        r, g = ref.float(), got.float()
+        xs = self._x_seen[slot][:bs].float()
+        d = (r - g).abs().max().item()
+        scale = max(1e-6, r.abs().max().item())
+        logger.info_rank0(
+            f"  check layer {layer_id:2d}: routes="
+            f"{int((self._ids_seen[slot][:bs] >= 0).sum())} "
+            f"x_nan={bool(torch.isnan(xs).any())} |x|max={xs.abs().max().item():.4f} "
+            f"|ref|max={scale:.5f} |got|max={g.abs().max().item():.5f} "
+            f"skirtumas={d:.5f} ({100 * d / scale:.1f}%)"
+        )
+        if self._engine_seen is not None:
+            e = self._engine_seen[slot][:bs].float()
+            logger.info_rank0(
+                f"    variklis perskaite: nan={bool(torch.isnan(e).any())} "
+                f"max={e.abs().max().item():.5f} (iGPU parase max={g.abs().max().item():.5f})"
+            )
+
+    def _compute(self, layer_id: int, bs: int, slot: int) -> None:
         """One layer's share, entirely into buffers this executor already owns."""
         bufs = dict(self._bufs)
-        bufs["out"] = self._far["y"][:bs]
+        bufs["out"] = self._far_y[slot][:bs]
         self._call(
             self._views[layer_id], self._far["x"][:bs], self._far["w"][:bs],
             self._far["ids"][:bs], self._activation, self._act_fn, bufs,
@@ -437,9 +577,26 @@ class DeviceMoeExecutor:
         slot = self._slot_for(layer_id, bs)
         self._views_for(layer_id)  # an address, taken before a capture can forbid asking
 
-        self._near["x"][:bs].copy_(hidden_states, non_blocking=True)
-        self._near["ids"][:bs].copy_(topk_ids.to(torch.int32), non_blocking=True)
-        self._near["w"][:bs].copy_(topk_weights.to(torch.float32), non_blocking=True)
+        # Hold the sources for the life of the slot. A capture turns each copy into a
+        # node reading a FIXED address, and a dtype cast makes a temporary the allocator
+        # reclaims the moment this returns -- after which the same address is handed to
+        # something else in the same graph, and every replay copies whatever now lives
+        # there. One set per slot, so this is bounded by the number of shapes rather
+        # than by the number of steps.
+        ids32 = topk_ids.to(torch.int32).contiguous()
+        w32 = topk_weights.to(torch.float32).contiguous()
+        x_src = hidden_states.contiguous()
+        self._retained[slot] = (x_src, ids32, w32)
+
+        # Straight to the pinned host tensors, not through this device's alias of them.
+        # These were allocated by torch, so torch knows they are page-locked and issues a
+        # real asynchronous device-to-host copy -- the same thing the CPU executor does,
+        # and the thing a capture records correctly. Writing through the alias instead
+        # makes it a device-to-device copy over a host-mapped pointer, which is what a
+        # replay got wrong: eager steps were right and every captured one was rubbish.
+        self._x[:bs].copy_(x_src, non_blocking=True)
+        self._ids[:bs].copy_(ids32, non_blocking=True)
+        self._w[:bs].copy_(w32, non_blocking=True)
         handshake.doorbell(self._done.data_ptr(), self._ready.data_ptr(), slot)
 
         if self._recording is not None:
@@ -460,13 +617,28 @@ class DeviceMoeExecutor:
 
         slot, bs, dtype = pending
         handshake.wait(self._done.data_ptr(), slot)
-        out = self._near_y[:bs].clone()
+        # And back the same way: a host-to-device copy out of the pinned tensor, into
+        # memory of this device. The copy is needed regardless -- the buffer is reused by
+        # the next layer -- so nothing is lost by taking the ordinary path.
+        out = torch.empty((bs, self._y.shape[2]), dtype=self._y.dtype, device=self._near_device)
+        if self._const_out:  # diagnostic: same read path, content nobody writes
+            torch.mul(self._near_const[:bs], 1.0, out=out)
+        elif self._zero_out:  # diagnostic: keep the handshake, discard the answer
+            out.zero_()
+        elif self._read_dma:  # diagnostic: the transfer path
+            out.copy_(self._y[slot][:bs], non_blocking=True)
+        else:
+            # A kernel read, ordered against the wait above like any other kernel.
+            torch.mul(self._near_y[slot][:bs], 1.0, out=out)
+        if self._engine_seen is not None:
+            self._engine_seen[slot][:bs].copy_(out, non_blocking=True)
         return out.to(dtype) if out.dtype != dtype else out
 
     def shutdown(self) -> None:
         """No process, no files, no registrations of our own -- just the thread."""
         self._queue.put(None)
         self._views.clear()
+        self._retained.clear()
 
 
 __all__ = ["DeviceMoeExecutor"]
