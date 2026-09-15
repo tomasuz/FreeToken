@@ -120,6 +120,15 @@ def _into_bufs(
         inter, down_packed, down_scale, down_global,
         topk_ids, 1, h, routes, out=down,
     )
+    # A route another executor owns is skipped by the kernel, so its rows keep whatever the
+    # buffer held before. A zero routing weight does not make that harmless: NaN * 0 is NaN,
+    # and bf16 memory that was never written is full of NaN encodings. Clear those rows.
+    if "valid" in bufs:
+        valid, invalid = bufs["valid"][:routes], bufs["invalid"][:routes]
+        torch.ge(topk_ids.reshape(routes, 1), 0, out=valid)
+        torch.logical_not(valid, out=invalid)
+        down.masked_fill_(invalid, 0)
+
     # The routed weight, then the top_k sum -- both in place, both into buffers that are
     # already the right shape for this batch.
     wbf = bufs["wbf"][:routes]

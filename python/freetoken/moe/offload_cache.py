@@ -922,9 +922,15 @@ class OffloadMoeCache:
         clock cannot run inside a replay -- so without this the split a graph was captured
         with is the split it keeps for the rest of the run.
         """
+        freeze = os.environ.get("FREETOKEN_DEVICE_FREEZE_RATE", "") == "1"
         for executor in self.device_executors:
             name = f"gpu{executor.device_index}"
-            for routes, seconds in executor.take_samples():
+            samples = executor.take_samples()  # always drained, so they cannot pile up
+            if freeze:
+                # Diagnostic: keep this executor's rate -- and with it the division --
+                # where it stood, so a step never sees the placement move under it.
+                continue
+            for routes, seconds in samples:
                 self.rate_tracker.observe(name, routes, seconds, self.bytes_per_expert)
 
     def _skips_movement(self, layer_id: int) -> bool:

@@ -211,6 +211,14 @@ class DeviceMoeExecutor:
         self._zero_out = os.environ.get("FREETOKEN_DEVICE_ZERO_OUT", "") == "1"
         self._read_dma = os.environ.get("FREETOKEN_DEVICE_READ_DMA", "") == "1"
         self._const_out = os.environ.get("FREETOKEN_DEVICE_CONST_OUT", "") == "1"
+        # The far device raises "done" with a kernel by default; FREETOKEN_DEVICE_HOST_ACK=1
+        # raises it from this process's CPU after the stream drains instead. Both were
+        # checked in isolation and both are correct; the host form costs a synchronisation
+        # per layer and its last run under a graph ended with the server gone.
+        self._host_ack = os.environ.get("FREETOKEN_DEVICE_HOST_ACK", "") == "1"
+        # Diagnostic: the far device writes a constant instead of computing, so the path by
+        # which its answer reaches the engine is exercised with the work taken out.
+        self._far_const = os.environ.get("FREETOKEN_DEVICE_FAR_CONST", "") == "1"
         if self._trace:
             self._x_seen = _pinned((_SLOTS, b, h), torch.bfloat16)
             self._y_seen = _pinned((_SLOTS, b, h), torch.bfloat16)
@@ -219,9 +227,16 @@ class DeviceMoeExecutor:
             self._y_seen_far = self._view(self._y_seen)
             self._w_seen_far = self._view(self._w_seen)
             self._traced = 0
-            # What the ENGINE read, staged by a node of its own graph, so the host can
-            # look at it afterwards. The only way to see inside a replay.
-            self._engine_seen = _pinned((_SLOTS, b, h), torch.bfloat16)
+            # The engine's side of the same slot, staged by nodes of the engine's own graph:
+            # what it handed over (x, ids, w) and what it took back (y). Compared with what
+            # this device read and wrote only when the scheduler is idle, because only then
+            # are both streams known to be drained -- an earlier trace compared too soon and
+            # reported zeros that were never there.
+            self._x_eng = _pinned((_SLOTS, b, h), torch.bfloat16)
+            self._ids_eng = _pinned((_SLOTS, b, k), torch.int32)
+            self._w_eng = _pinned((_SLOTS, b, k), torch.float32)
+            self._y_eng = _pinned((_SLOTS, b, h), torch.bfloat16)
+            self._engine_seen = self._y_eng
         else:
             self._engine_seen = None
         self._checked = 0 if self._trace else 99
@@ -266,12 +281,15 @@ class DeviceMoeExecutor:
         d = n2 // 2
         with torch.cuda.device(self.device):
             return {
-                "gate_up": torch.empty((routes, n2), dtype=torch.bfloat16, device=self.device),
-                "inter": torch.empty((routes, d), dtype=torch.bfloat16, device=self.device),
-                "down": torch.empty((routes, h), dtype=torch.bfloat16, device=self.device),
-                "s0": torch.empty((routes, d), dtype=torch.float32, device=self.device),
-                "s1": torch.empty((routes, d), dtype=torch.float32, device=self.device),
-                "wbf": torch.empty((routes, 1), dtype=torch.bfloat16, device=self.device),
+                "gate_up": torch.zeros((routes, n2), dtype=torch.bfloat16, device=self.device),
+                "inter": torch.zeros((routes, d), dtype=torch.bfloat16, device=self.device),
+                "down": torch.zeros((routes, h), dtype=torch.bfloat16, device=self.device),
+                "s0": torch.zeros((routes, d), dtype=torch.float32, device=self.device),
+                "s1": torch.zeros((routes, d), dtype=torch.float32, device=self.device),
+                "wbf": torch.zeros((routes, 1), dtype=torch.bfloat16, device=self.device),
+                # Which routes are this executor's, for clearing the rest -- see _into_bufs.
+                "valid": torch.zeros((routes, 1), dtype=torch.bool, device=self.device),
+                "invalid": torch.zeros((routes, 1), dtype=torch.bool, device=self.device),
             }
 
     # --- what this device can take ------------------------------------------------------
@@ -374,19 +392,16 @@ class DeviceMoeExecutor:
                                 self._y_seen_far[slot][:bs].copy_(self._far_y[slot][:bs])
                                 self._check(int(self._slot_layer[slot]), bs, slot)
                             self._ev_end[slot].record(self._stream)
-                            acks.append((slot, bs))
-                    # The answer is acknowledged from the host, not by a kernel of this
-                    # device. A kernel here would be the natural thing and it is wrong on
-                    # this stack: the flag arrives -- the engine never hangs -- but the
-                    # bytes it is meant to vouch for do not. Measured, layer by layer:
-                    # this device wrote a partial whose maximum was 0.16992 and the
-                    # engine, past its wait, read 0.00000. A release fence orders one
-                    # agent's own accesses; it does not make this device's writes to
-                    # mapped host memory visible to another device reading the same
-                    # pages. Waiting on the host and setting the word from the CPU does,
-                    # because a host store to host memory is what the other device's
-                    # aperture read actually observes -- and it is what the worker
-                    # process did, which is why that one was correct.
+                            if self._host_ack:
+                                acks.append((slot, bs))
+                            else:
+                                handshake.doorbell(ready_ptr, done_ptr, slot)
+                                self._inflight.append((slot, bs))
+                    # Host acknowledgement, when asked for (see _host_ack). An earlier note
+                    # here claimed the engine read zeros where this device had written a
+                    # partial; that reading came from an unsynchronised trace and was not
+                    # evidence. Isolated, both acknowledgements carry this device's writes
+                    # to the engine intact under replay.
                     for slot, bs in acks:
                         self._ev_end[slot].synchronize()
                         self._ready[slot] = 0
@@ -472,6 +487,36 @@ class DeviceMoeExecutor:
             f"idle {self._idle_s / n * 1e3:.3f} ms/layer, "
             f"{self._routes / n:.2f} routes/layer, "
             f"busy share {100 * self._busy_s / max(1e-9, self._busy_s + self._idle_s):.1f}%"
+        ) + self._idle_comparison()
+
+    def _idle_comparison(self) -> str:
+        """At idle, both streams drained: does this device see what the engine sent, and does
+        the engine get back what this device wrote? Per slot, for the last step served."""
+        if not self._trace or not self._next_slot:
+            return ""
+        n = self._next_slot
+
+        def differs(a, b):
+            a, b = a[:n].float(), b[:n].float()
+            both_nan = torch.isnan(a) & torch.isnan(b)
+            return ((a != b) & ~both_nan).flatten(1).any(dim=1)
+
+        dx = differs(self._x_eng, self._x_seen)
+        di = differs(self._ids_eng, self._ids_seen)
+        dw = differs(self._w_eng, self._w_seen)
+        dy = differs(self._y_eng, self._y_seen)
+        nan_eng = torch.isnan(self._y_eng[:n].float()).flatten(1).any(dim=1)
+        nan_far = torch.isnan(self._y_seen[:n].float()).flatten(1).any(dim=1)
+
+        def first(mask):
+            idx = mask.nonzero()
+            return int(idx[0]) if idx.numel() else -1
+
+        return (
+            f" | idle palyginimas {n} lizdų: x skiriasi {int(dx.sum())} (pirmas {first(dx)}), "
+            f"ids {int(di.sum())} (pirmas {first(di)}), w {int(dw.sum())} (pirmas {first(dw)}), "
+            f"y skiriasi {int(dy.sum())} (pirmas {first(dy)}); "
+            f"NaN y: variklio {int(nan_eng.sum())}, iGPU {int(nan_far.sum())}"
         )
 
     def take_samples(self) -> list[tuple[int, float]]:
@@ -511,15 +556,12 @@ class DeviceMoeExecutor:
             f"|ref|max={scale:.5f} |got|max={g.abs().max().item():.5f} "
             f"skirtumas={d:.5f} ({100 * d / scale:.1f}%)"
         )
-        if self._engine_seen is not None:
-            e = self._engine_seen[slot][:bs].float()
-            logger.info_rank0(
-                f"    variklis perskaite: nan={bool(torch.isnan(e).any())} "
-                f"max={e.abs().max().item():.5f} (iGPU parase max={g.abs().max().item():.5f})"
-            )
 
     def _compute(self, layer_id: int, bs: int, slot: int) -> None:
         """One layer's share, entirely into buffers this executor already owns."""
+        if self._far_const:
+            self._far_y[slot][:bs].fill_(0.001)
+            return
         bufs = dict(self._bufs)
         bufs["out"] = self._far_y[slot][:bs]
         self._call(
@@ -597,6 +639,10 @@ class DeviceMoeExecutor:
         self._x[:bs].copy_(x_src, non_blocking=True)
         self._ids[:bs].copy_(ids32, non_blocking=True)
         self._w[:bs].copy_(w32, non_blocking=True)
+        if self._trace:
+            self._x_eng[slot][:bs].copy_(x_src, non_blocking=True)
+            self._ids_eng[slot][:bs].copy_(ids32, non_blocking=True)
+            self._w_eng[slot][:bs].copy_(w32, non_blocking=True)
         handshake.doorbell(self._done.data_ptr(), self._ready.data_ptr(), slot)
 
         if self._recording is not None:
