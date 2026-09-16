@@ -18,6 +18,8 @@
 
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cstdint>
+#include <sched.h>
 
 namespace {
 
@@ -87,7 +89,58 @@ void handshake_wait(int64_t done_addr, int64_t slot, int64_t max_spins) {
                                    static_cast<int>(slot), static_cast<u64>(max_spins));
 }
 
+
+// --- the same handshake, from the host ------------------------------------------------
+//
+// A layer whose routes all belong to someone else should cost this device nothing. Whether
+// that is so is already written in host memory -- the engine fills the routing before it
+// rings -- so the decision belongs to the host, before a single kernel is launched. These
+// three do from the CPU what the kernels above do from the device.
+//
+// The wait releases the GIL. It sits here for as long as a layer takes, and the engine's
+// own Python has to keep running while it does.
+
+bool handshake_host_wait(int64_t flag_addr, int64_t slot, int64_t max_spins) {
+  u64 *p = reinterpret_cast<u64 *>(flag_addr) + slot;
+  pybind11::gil_scoped_release release;
+  for (int64_t n = 0; n < max_spins; ++n) {
+    if (__atomic_load_n(p, __ATOMIC_ACQUIRE) >= 1ULL) {
+      return true;
+    }
+    if ((n & 0x3F) == 0x3F) {
+      sched_yield();
+    } else {
+#if defined(__x86_64__) || defined(__i386__)
+      __builtin_ia32_pause();
+#endif
+    }
+  }
+  return false;
+}
+
+// Clear one word and raise another, in that order. The release on the second is what makes
+// everything written before it -- the zeroed answer of a layer with no routes -- visible to
+// whoever is waiting on it.
+void handshake_host_raise(int64_t clear_addr, int64_t raise_addr, int64_t slot) {
+  __atomic_store_n(reinterpret_cast<u64 *>(clear_addr) + slot, 0ULL, __ATOMIC_RELAXED);
+  __atomic_store_n(reinterpret_cast<u64 *>(raise_addr) + slot, 1ULL, __ATOMIC_RELEASE);
+}
+
+// How many routes of this step are this executor's: the ids are int32 and a route that
+// belongs to someone else is -1.
+int64_t handshake_count_nonneg_i32(int64_t addr, int64_t n) {
+  const int32_t *p = reinterpret_cast<const int32_t *>(addr);
+  int64_t k = 0;
+  for (int64_t i = 0; i < n; ++i) {
+    k += (p[i] >= 0) ? 1 : 0;
+  }
+  return k;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("doorbell", &handshake_doorbell, "ring the worker's doorbell for one slot");
   m.def("wait", &handshake_wait, "hold the stream until the worker reports that slot done");
+  m.def("host_wait", &handshake_host_wait, "spin on the host until this slot's flag is raised");
+  m.def("host_raise", &handshake_host_raise, "clear one flag and raise another, from the host");
+  m.def("count_nonneg_i32", &handshake_count_nonneg_i32, "how many int32 entries are >= 0");
 }

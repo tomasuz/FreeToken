@@ -60,6 +60,27 @@ def wait(done_addr: int, slot: int, max_spins: int = DEFAULT_MAX_SPINS) -> None:
     _module().wait(int(done_addr), int(slot), int(max_spins))
 
 
+# The host spin is guarded for the same reason the device one is: a step that never
+# arrives must not wedge the thread with no way out. With a yield every 64 turns this is a
+# wall-clock guard of roughly a minute rather than a fixed instruction count.
+DEFAULT_HOST_SPINS = 1 << 32
+
+
+def host_wait(flag_addr: int, slot: int, max_spins: int = DEFAULT_HOST_SPINS) -> bool:
+    """Wait on the host until this slot's flag is raised; False if the guard ran out."""
+    return bool(_module().host_wait(int(flag_addr), int(slot), int(max_spins)))
+
+
+def host_raise(clear_addr: int, raise_addr: int, slot: int) -> None:
+    """Clear one slot's flag and raise the other's, from the host."""
+    _module().host_raise(int(clear_addr), int(raise_addr), int(slot))
+
+
+def count_nonneg_i32(addr: int, n: int) -> int:
+    """How many of ``n`` int32 values at ``addr`` are not negative."""
+    return int(_module().count_nonneg_i32(int(addr), int(n)))
+
+
 def replays_correctly() -> bool:
     """Does a captured graph actually perform this handshake?
 
@@ -89,4 +110,5 @@ def replays_correctly() -> bool:
         return False
 
 
-__all__ = ["doorbell", "wait", "replays_correctly", "DEFAULT_MAX_SPINS"]
+__all__ = ["doorbell", "wait", "host_wait", "host_raise", "count_nonneg_i32",
+           "replays_correctly", "DEFAULT_MAX_SPINS", "DEFAULT_HOST_SPINS"]

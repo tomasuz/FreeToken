@@ -37,6 +37,7 @@ from __future__ import annotations
 import os
 import queue
 import threading
+import time
 
 import torch
 
@@ -191,12 +192,8 @@ class DeviceMoeExecutor:
         # the compute and nothing else, and a replay does not stop them: this thread runs
         # every step whether or not there is any Python in it.
         with torch.cuda.device(self.device):
-            # Three, so the two halves of a slot's life can be told apart: _ev_pre is
-            # recorded before the wait, _ev_start after it. pre->start is this device
-            # standing idle because the engine has not rung yet; start->end is the work.
-            # Which of the two dominates says who is waiting for whom, and that is the
-            # only question worth asking about a split that costs more than it saves.
-            self._ev_pre = [torch.cuda.Event(enable_timing=True) for _ in range(_SLOTS)]
+            # Events bracket the work itself; the waiting is timed on the host, where it
+            # now happens.
             self._ev_start = [torch.cuda.Event(enable_timing=True) for _ in range(_SLOTS)]
             self._ev_end = [torch.cuda.Event(enable_timing=True) for _ in range(_SLOTS)]
         # The route count belongs to the step that was timed, so it is taken on the stream
@@ -211,11 +208,6 @@ class DeviceMoeExecutor:
         self._zero_out = os.environ.get("FREETOKEN_DEVICE_ZERO_OUT", "") == "1"
         self._read_dma = os.environ.get("FREETOKEN_DEVICE_READ_DMA", "") == "1"
         self._const_out = os.environ.get("FREETOKEN_DEVICE_CONST_OUT", "") == "1"
-        # The far device raises "done" with a kernel by default; FREETOKEN_DEVICE_HOST_ACK=1
-        # raises it from this process's CPU after the stream drains instead. Both were
-        # checked in isolation and both are correct; the host form costs a synchronisation
-        # per layer and its last run under a graph ended with the server gone.
-        self._host_ack = os.environ.get("FREETOKEN_DEVICE_HOST_ACK", "") == "1"
         # Diagnostic: the far device writes a constant instead of computing, so the path by
         # which its answer reaches the engine is exercised with the work taken out.
         self._far_const = os.environ.get("FREETOKEN_DEVICE_FAR_CONST", "") == "1"
@@ -246,6 +238,8 @@ class DeviceMoeExecutor:
         self._samples_lock = threading.Lock()
         # Cumulative, for the report; the samples above are drained by the rate tracker.
         self._seen = 0
+        self._served = 0    # sluoksniai, kuriuos šis įrenginys skaičiavo
+        self._skipped = 0   # sluoksniai be nė vieno šio vykdytojo maršruto
         self._busy_s = 0.0
         self._idle_s = 0.0
         self._routes = 0
@@ -350,18 +344,29 @@ class DeviceMoeExecutor:
     # --- the far device's own thread ----------------------------------------------------
 
     def _serve(self) -> None:
-        """Enqueue work for each slot the engine says it will ring, then go back to sleep.
+        """Wait for each slot on the host, and launch nothing at all for an empty layer.
 
-        The thread decides WHAT runs; the flags decide WHEN. Everything it puts on the
-        stream is asynchronous, including the wait -- so a step's whole chain goes in at
-        once and the thread is free again long before the device has started on it. That is
-        what keeps this off the critical path: the engine's stream and this one are only
-        ever coupled through two words in host memory.
+        The engine rings every layer this device is offered, but the placement hands it a
+        share of the misses, and a share of a rare event is usually nothing: measured, 0.01
+        to 0.04 routes per layer. The chain is a dozen kernels and it cost this device
+        0.28 ms of every layer whether or not there was anything in it, with the engine's
+        stream waiting on the answer each time -- which is where the whole slowdown came
+        from.
+
+        So the decision moves to the host. The routing is already in pinned memory, written
+        by the engine before it rang, so this thread reads it: an empty layer gets zeros
+        written into its answer and its flag raised from here, and the far device never
+        hears about it. A layer with routes goes on the stream as before -- and no longer
+        needs a wait kernel in front of it, because the host has already waited.
+
+        The wait itself is C++ with the GIL released, so a thread sitting here for the
+        length of a layer does not stop the engine's Python.
         """
         from freetoken.kernel import handshake
 
         torch.cuda.set_device(self.device)
         ready_ptr, done_ptr = self._ready.data_ptr(), self._done.data_ptr()
+        ids_ptr = self._ids.data_ptr()
         # The engine runs under inference mode and everything here was allocated inside
         # it, which makes these inference tensors: writing to one from a thread that is
         # not itself in inference mode is refused outright. The mode is thread-local, so
@@ -372,16 +377,22 @@ class DeviceMoeExecutor:
                 if item is None:
                     return
                 slots = item if isinstance(item, list) else (item,)
-                acks: list[tuple[int, int]] = []
                 try:
                     self._harvest()
-                    with torch.cuda.device(self.device), torch.cuda.stream(self._stream):
-                        for slot in slots:
-                            bs = int(self._slot_bs[slot])
-                            self._ev_pre[slot].record(self._stream)
-                            handshake.wait(ready_ptr, slot)
-                            # Between the wait and the doorbell is this device's work and
-                            # only this device's work; the events bracket exactly that.
+                    for slot in slots:
+                        bs = int(self._slot_bs[slot])
+                        waited = time.perf_counter()
+                        if not handshake.host_wait(ready_ptr, slot):
+                            raise TimeoutError(
+                                f"the engine did not ring slot {slot} (layer "
+                                f"{int(self._slot_layer[slot])}) before the guard ran out"
+                            )
+                        self._idle_s += time.perf_counter() - waited
+                        if handshake.count_nonneg_i32(ids_ptr, bs * self._top_k) == 0:
+                            self._skip(slot, bs)
+                            handshake.host_raise(ready_ptr, done_ptr, slot)
+                            continue
+                        with torch.cuda.device(self.device), torch.cuda.stream(self._stream):
                             self._ev_start[slot].record(self._stream)
                             self._ids_seen_far[slot][:bs].copy_(self._far["ids"][:bs])
                             if self._trace:
@@ -392,24 +403,23 @@ class DeviceMoeExecutor:
                                 self._y_seen_far[slot][:bs].copy_(self._far_y[slot][:bs])
                                 self._check(int(self._slot_layer[slot]), bs, slot)
                             self._ev_end[slot].record(self._stream)
-                            if self._host_ack:
-                                acks.append((slot, bs))
-                            else:
-                                handshake.doorbell(ready_ptr, done_ptr, slot)
-                                self._inflight.append((slot, bs))
-                    # Host acknowledgement, when asked for (see _host_ack). An earlier note
-                    # here claimed the engine read zeros where this device had written a
-                    # partial; that reading came from an unsynchronised trace and was not
-                    # evidence. Isolated, both acknowledgements carry this device's writes
-                    # to the engine intact under replay.
-                    for slot, bs in acks:
-                        self._ev_end[slot].synchronize()
-                        self._ready[slot] = 0
-                        self._done[slot] = 1
+                            handshake.doorbell(ready_ptr, done_ptr, slot)
+                        self._served += 1
                         self._inflight.append((slot, bs))
                 except BaseException as exc:  # noqa: BLE001 -- reported, then released
                     self._fail(exc, slots)
                     return
+
+    def _skip(self, slot: int, bs: int) -> None:
+        """Nothing here for this device. The engine adds the answer regardless, so the
+        answer has to be zero -- and has to be written before the flag that announces it."""
+        self._y[slot][:bs].zero_()
+        self._skipped += 1
+        if self._trace:
+            self._ids_seen[slot][:bs].copy_(self._ids[:bs])
+            self._x_seen[slot][:bs].copy_(self._x[:bs])
+            self._w_seen[slot][:bs].copy_(self._w[:bs])
+            self._y_seen[slot][:bs].zero_()
 
     def _fail(self, exc: BaseException, slots) -> None:
         """Release everyone waiting on us, so a failure is reported rather than a hang.
@@ -444,11 +454,9 @@ class DeviceMoeExecutor:
                 still.append((slot, bs))
                 continue
             seconds = self._ev_start[slot].elapsed_time(self._ev_end[slot]) / 1e3
-            idle = self._ev_pre[slot].elapsed_time(self._ev_start[slot]) / 1e3
             routes = int((self._ids_seen[slot][:bs] >= 0).sum())
             self._seen += 1
             self._busy_s += seconds
-            self._idle_s += max(0.0, idle)
             self._routes += routes
             self._busy_max = max(self._busy_max, seconds)
             if self._trace and self._traced < 12:
@@ -478,15 +486,16 @@ class DeviceMoeExecutor:
         is free -- give it more. Idle near zero means the opposite: this device is always
         behind, and the engine's stream is the one doing the waiting.
         """
-        if not self._seen:
+        total = self._served + self._skipped
+        if not total:
             return None
-        n = self._seen
+        n = max(1, self._seen)
         return (
-            f"MoE device {self.device_index}: {n} layer-steps measured, "
-            f"busy {self._busy_s / n * 1e3:.3f} ms/layer (max {self._busy_max * 1e3:.3f}), "
-            f"idle {self._idle_s / n * 1e3:.3f} ms/layer, "
-            f"{self._routes / n:.2f} routes/layer, "
-            f"busy share {100 * self._busy_s / max(1e-9, self._busy_s + self._idle_s):.1f}%"
+            f"MoE device {self.device_index}: {total} layer-steps -- "
+            f"{self._skipped} skipped with no kernel at all, {self._served} computed; "
+            f"busy {self._busy_s / n * 1e3:.3f} ms per computed layer "
+            f"(max {self._busy_max * 1e3:.3f}), {self._routes / n:.2f} routes/computed layer; "
+            f"host wait {self._idle_s / total * 1e3:.3f} ms/layer"
         ) + self._idle_comparison()
 
     def _idle_comparison(self) -> str:
