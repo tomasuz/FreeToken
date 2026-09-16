@@ -60,25 +60,34 @@ class Qwen3_5MTPLayer(BaseOP):
     """
 
     def __init__(self, config: ModelConfig, layer_id: int):
+        # The head is plain bf16 in the checkpoint -- every ``mtp.*`` tensor arrives as a
+        # bare ``.weight``, with none of the scale tensors the base model's quantized
+        # weights carry -- so the whole block is built from a config copy with the
+        # quantization cleared. Building it quantized fails twice over: kernel selection
+        # picks a table these weights cannot feed, and the engine, which casts each loaded
+        # MTP tensor to its parameter's dtype, would cast bf16 values to a packed integer
+        # dtype element by element.
+        #
+        # The copy also moves the MoE to the fused strategy. The head is the speculative
+        # draft's hot path, so its experts stay RESIDENT on GPU instead of going to the
+        # offload host banks, whatever the engine's --moe-strategy is; their packed
+        # tensors ride the dense state dict.
+        head_config = replace(
+            config,
+            moe_strategy="fused",
+            expert_quant="none",
+            moe_weight_format=None,
+            attn_quant="none",
+            dense_quant="none",
+            quant=None,
+        )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = Qwen3_5Attention(config, layer_id)
+        self.self_attn = Qwen3_5Attention(head_config, layer_id)
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # MTP uses the same MoE geometry as the base decoder layers (256 experts for the
-        # 35B-A3B class). The head is the speculative-draft hot path, so its experts are kept
-        # RESIDENT on GPU (never sent to the offload host banks): build the MoE with a
-        # fused-backend config copy so make_moe_layer allocates a resident MoELayer regardless
-        # of the engine's --moe-backend. Their packed tensors ride the dense state dict.
         if config.moe_enabled:
-            mtp_config = replace(
-                config,
-                moe_backend="fused",
-                expert_quant="none",
-                gguf_expert_types=None,
-                dense_quant="none",
-            )
-            self.mlp = Qwen3_5MoE(mtp_config, layer_id)
+            self.mlp = Qwen3_5MoE(head_config, layer_id)
         else:
-            self.mlp = Qwen3_5DenseMLP(config)
+            self.mlp = Qwen3_5DenseMLP(head_config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
