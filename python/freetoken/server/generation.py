@@ -153,6 +153,23 @@ class GenSpec:
 # context by the scheduler regardless.
 DEFAULT_MAX_OUTPUT_TOKENS = 32768
 
+# The server-wide default, set once at boot from --max-output-tokens. Kept beside the
+# constant rather than threaded through every protocol's converter, for the same reason
+# the model's recommended sampling is a module global in api_server: the converters are
+# pure request->GenSpec mappers and have no view of the server config. A request that
+# names its own max_tokens is never affected.
+_SERVER_MAX_OUTPUT_TOKENS: int | None = None
+
+
+def set_server_max_output_tokens(value: int | None) -> None:
+    """Install --max-output-tokens as the default for requests that omit max_tokens."""
+    global _SERVER_MAX_OUTPUT_TOKENS
+    _SERVER_MAX_OUTPUT_TOKENS = value
+
+
+def default_max_output_tokens() -> int:
+    return _SERVER_MAX_OUTPUT_TOKENS or DEFAULT_MAX_OUTPUT_TOKENS
+
 
 def resolve_sampling(
     *,
@@ -179,7 +196,7 @@ def resolve_sampling(
         raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
     return SamplingParams(
         ignore_eos=ignore_eos,
-        max_tokens=DEFAULT_MAX_OUTPUT_TOKENS if max_tokens is None else max_tokens,
+        max_tokens=default_max_output_tokens() if max_tokens is None else max_tokens,
         temperature=pick(temperature, "temperature", 0.0),
         top_k=pick(top_k, "top_k", -1),
         top_p=pick(top_p, "top_p", 1.0),

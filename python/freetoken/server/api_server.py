@@ -36,6 +36,7 @@ from freetoken.utils import (
 from pydantic import BaseModel
 
 from .args import ServerArgs
+from .generation import set_server_max_output_tokens
 from .anthropic_api import register_anthropic_routes
 from .accounting import AdmissionClosedError, register_accounting_routes
 from .control_api import register_control_routes
@@ -932,6 +933,15 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
 
     if config.sampling_defaults == "model" and not config.use_dummy_weight:
         _MODEL_SAMPLING = load_generation_sampling(config.model_path)
+    # --max-output-tokens is a server policy, not a model recommendation: it bounds any
+    # request that names no max_tokens of its own. Without it such a request may decode
+    # until DEFAULT_MAX_OUTPUT_TOKENS (32k) or the context limit, and with
+    # --max-running-requests 1 that one request holds the only slot for as long as it runs.
+    set_server_max_output_tokens(config.max_output_tokens)
+    if config.max_output_tokens:
+        logger.info(
+            "Default max output tokens for requests that omit one: %d", config.max_output_tokens
+        )
     # Always surface the effective default sampling (model-recommended where available,
     # else framework defaults), since unspecified request fields resolve to these.
     logger.info(
