@@ -4,12 +4,21 @@ A pure renderer over the ``/v1/stats`` document: every number here already exist
 :func:`freetoken.server.stats.build_stats`, so scraping adds no instrumentation to the
 decode path -- it reads the same counters the desktop app polls.
 
-Names follow the Prometheus conventions rather than llama.cpp's ``llamacpp:`` prefix,
-which is not a legal exposition name (a colon is reserved for recording rules). Counters
-carry the ``_total`` suffix and everything else is a gauge; the model identity rides a
-single ``freetoken_model_info`` info metric instead of being repeated as a label on every
-series, so a scraper that turns labels into tags (telegraf's prometheus input with
-``metric_version = 2``) does not fan every value out per model.
+Every metric llama.cpp served under the same name and meaning keeps that exact name here,
+including the ``llamacpp:`` prefix. A colon is legal in an exposition name (the grammar is
+``[a-zA-Z_:][a-zA-Z0-9_:]*``; the convention that reserves it for recording rules is a
+style rule, not a syntax one), and telegraf turns a metric name straight into a field name
+-- so renaming these would silently break every dashboard built against llama-server, for
+no gain. This endpoint is a drop-in: the existing scrape config needs no edit.
+
+Metrics with no llama.cpp counterpart are additive ``freetoken_`` ones. A scraper picks
+them up as new fields without any configuration change, and they carry what actually
+matters for this engine: KV pressure, recurrent-state slots, device memory. The model
+identity rides a single ``freetoken_model_info`` metric instead of being repeated as a
+label on every series, so a collector that turns labels into tags does not fan every
+value out per model.
+
+Three llama.cpp metrics are deliberately absent rather than faked -- see ``_ABSENT``.
 """
 
 from __future__ import annotations
@@ -21,14 +30,16 @@ CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 # name -> (type, help). Kept beside the renderer so HELP/TYPE and the emitted samples
 # cannot drift apart.
 _METRICS: tuple[tuple[str, str, str], ...] = (
+    # --- llama.cpp's names, kept verbatim so an existing scrape keeps working -------------
+    ("llamacpp:prompt_tokens_total", "counter", "Number of prompt tokens processed."),
+    ("llamacpp:prompt_tokens_seconds", "gauge", "Average prompt throughput in tokens/s."),
+    ("llamacpp:tokens_predicted_total", "counter", "Number of generation tokens processed."),
+    ("llamacpp:predicted_tokens_seconds", "gauge", "Average generation throughput in tokens/s."),
+    ("llamacpp:requests_processing", "gauge", "Number of requests processing."),
+    # --- engine-specific, additive: new fields, no scrape-config change ------------------
     ("freetoken_up", "gauge", "1 when the engine is serving, 0 while it is still starting"),
     ("freetoken_uptime_seconds", "gauge", "Seconds since the engine became ready"),
-    ("freetoken_requests_active", "gauge", "Requests admitted and not yet finished"),
     ("freetoken_requests_completed_total", "counter", "Requests finished since start"),
-    ("freetoken_prompt_tokens_total", "counter", "Prompt tokens processed since start"),
-    ("freetoken_completion_tokens_total", "counter", "Completion tokens generated since start"),
-    ("freetoken_decode_tokens_per_second", "gauge", "Decode throughput over the tracker's sliding window"),
-    ("freetoken_prefill_tokens_per_second", "gauge", "Prefill throughput over the tracker's sliding window"),
     ("freetoken_request_latency_p95_milliseconds", "gauge", "95th percentile end-to-end request latency"),
     ("freetoken_request_ttft_mean_milliseconds", "gauge", "Mean time to first token"),
     ("freetoken_kv_pages_used", "gauge", "KV cache pages in use"),
@@ -42,6 +53,26 @@ _METRICS: tuple[tuple[str, str, str], ...] = (
     ("freetoken_vram_bytes", "gauge", "Device memory the engine holds"),
     ("freetoken_gpu_memory_total_bytes", "gauge", "Total memory of each GPU the engine uses"),
     ("freetoken_model_info", "gauge", "Served model identity; the value is always 1"),
+)
+
+# llama.cpp metrics this engine does not emit. Each would have to be invented rather than
+# read, and a fabricated series is worse for an operator than a missing one: a panel that
+# stays empty says "not measured", while a panel pinned at 0 says "measured, and idle".
+#
+#   llamacpp:prompt_seconds_total            cumulative prompt seconds -- the tracker keeps
+#   llamacpp:tokens_predicted_seconds_total  a sliding window, not lifetime busy time
+#   llamacpp:requests_deferred               the frontend counts admitted requests; the
+#                                            processing/queued split lives in the scheduler
+#   llamacpp:n_tokens_max                    context high-water mark, never recorded
+#   llamacpp:n_decode_total                  llama_decode() call count: no such call here
+#   llamacpp:n_busy_slots_per_decode         slots are a llama.cpp scheduling concept
+_ABSENT = (
+    "llamacpp:prompt_seconds_total",
+    "llamacpp:tokens_predicted_seconds_total",
+    "llamacpp:requests_deferred",
+    "llamacpp:n_tokens_max",
+    "llamacpp:n_decode_total",
+    "llamacpp:n_busy_slots_per_decode",
 )
 
 
@@ -98,16 +129,16 @@ def render_prometheus(doc: dict | None) -> str:
     out.add("freetoken_uptime_seconds", doc.get("uptime_s", 0))
 
     req = doc.get("requests") or {}
-    out.add("freetoken_requests_active", req.get("active", 0))
+    out.add("llamacpp:requests_processing", req.get("active", 0))
     out.add("freetoken_requests_completed_total", req.get("completed", 0))
-    out.add("freetoken_prompt_tokens_total", req.get("prompt_tokens_total", 0))
-    out.add("freetoken_completion_tokens_total", req.get("completion_tokens_total", 0))
+    out.add("llamacpp:prompt_tokens_total", req.get("prompt_tokens_total", 0))
+    out.add("llamacpp:tokens_predicted_total", req.get("completion_tokens_total", 0))
     out.add("freetoken_request_latency_p95_milliseconds", req.get("p95_ms", 0))
     out.add("freetoken_request_ttft_mean_milliseconds", req.get("ttft_mean_ms", 0))
 
     thr = doc.get("throughput") or {}
-    out.add("freetoken_decode_tokens_per_second", thr.get("decode_tps", 0))
-    out.add("freetoken_prefill_tokens_per_second", thr.get("prefill_tps", 0))
+    out.add("llamacpp:predicted_tokens_seconds", thr.get("decode_tps", 0))
+    out.add("llamacpp:prompt_tokens_seconds", thr.get("prefill_tps", 0))
 
     # kv/mamba/swa are null when the pool does not exist for this model (non-hybrid, no SWA,
     # borrowed KV): skip them instead of reporting zeros that would read as "full pool, idle".

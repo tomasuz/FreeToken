@@ -23,8 +23,10 @@ if _PY not in sys.path:
 
 from freetoken.server.metrics import CONTENT_TYPE, render_prometheus  # noqa: E402
 
-_SAMPLE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*(\{[^}]*\})? -?[0-9.eE+-]+$')
-_META = re.compile(r'^# (HELP|TYPE) [a-zA-Z_][a-zA-Z0-9_]* ')
+# A colon is legal in an exposition name -- llama.cpp's metrics use one, and this
+# endpoint keeps those names verbatim.
+_SAMPLE = re.compile(r'^[a-zA-Z_:][a-zA-Z0-9_:]*(\{[^}]*\})? -?[0-9.eE+-]+$')
+_META = re.compile(r'^# (HELP|TYPE) [a-zA-Z_:][a-zA-Z0-9_:]* ')
 
 
 def _doc(**over):
@@ -69,12 +71,35 @@ def test_counters_are_typed_and_suffixed():
     text = render_prometheus(_doc())
     counters = {ln.split()[2] for ln in _lines(text) if ln.startswith("# TYPE ") and ln.endswith(" counter")}
     assert counters == {
+        "llamacpp:prompt_tokens_total",
+        "llamacpp:tokens_predicted_total",
         "freetoken_requests_completed_total",
-        "freetoken_prompt_tokens_total",
-        "freetoken_completion_tokens_total",
     }
     for name in counters:
         assert name.endswith("_total")
+
+
+def test_llamacpp_names_are_kept_verbatim():
+    """The point of the endpoint: an existing llama-server scrape keeps working untouched.
+
+    telegraf turns a metric name straight into a field name, so renaming any of these
+    breaks every dashboard built against llama-server. Pin the exact spellings.
+    """
+    text = render_prometheus(_doc())
+    assert "llamacpp:prompt_tokens_total 12345" in text
+    assert "llamacpp:tokens_predicted_total 67890" in text
+    assert "llamacpp:predicted_tokens_seconds 31.4" in text
+    assert "llamacpp:prompt_tokens_seconds 52.8" in text
+    assert "llamacpp:requests_processing 1" in text
+
+
+def test_unmeasured_llamacpp_metrics_are_absent_not_faked():
+    """A panel pinned at 0 claims "measured, and idle"; an empty one says "not measured"."""
+    from freetoken.server.metrics import _ABSENT
+
+    text = render_prometheus(_doc())
+    for name in _ABSENT:
+        assert name not in text
 
 
 def test_absent_pool_is_omitted_not_zeroed():
