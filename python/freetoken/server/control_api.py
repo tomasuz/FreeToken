@@ -1,5 +1,6 @@
 """Read-only control-plane endpoints consumed by the desktop app: /health (lifecycle),
-/v1/stats (runtime metrics, Task 6), /v1/requests (request log ring, Task 5).
+/v1/stats (runtime metrics, Task 6), /v1/requests (request log ring, Task 5), and /metrics
+(the same stats rendered for Prometheus scrapers).
 
 All handlers read a shared FrontendManager snapshot via ``get_state``; nothing here touches
 the scheduler or blocks. Registered on the app alongside the OpenAI/Anthropic/Responses routes.
@@ -10,7 +11,7 @@ from __future__ import annotations
 import time
 from typing import Any, Callable
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 
 
 def build_health(state: Any, version: str) -> dict:
@@ -78,3 +79,22 @@ def register_control_routes(
         if get_model_sampling is not None:
             doc["model"]["sampling"] = get_model_sampling() or {}
         return doc
+
+    from .metrics import CONTENT_TYPE as _PROM_CONTENT_TYPE, render_prometheus
+
+    @app.get("/metrics")
+    async def metrics():
+        """Prometheus exposition of the /v1/stats numbers.
+
+        A scraper polls this on a fixed interval whether or not the engine is up, so a
+        failure to build the document must not become a 500: the renderer emits
+        ``freetoken_up 0`` instead, which shows a restart as a gap in the series rather
+        than as a scrape error in the collector's own logs.
+        """
+        try:
+            doc = build_stats(
+                get_state(), request_ring.requests_p95_ms(), request_ring.requests_ttft_mean_ms()
+            )
+        except Exception:  # noqa: BLE001 -- the scrape reports "down", it never fails
+            doc = None
+        return Response(content=render_prometheus(doc), media_type=_PROM_CONTENT_TYPE)
