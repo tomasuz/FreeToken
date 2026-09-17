@@ -25,16 +25,41 @@ _ROUTED_EXPERT_KEY_RE = re.compile(
     r"^model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
 )
+def _layer_to_bank(layer: int, config) -> int | None:
+    if layer < config.first_k_dense_replace or layer >= config.num_layers:
+        return None
+    return layer - config.first_k_dense_replace
+
+
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     key_pattern=_ROUTED_EXPERT_KEY_RE,
     proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
-    layer_to_bank=lambda layer, config: (
-        None
-        if layer < config.first_k_dense_replace or layer >= config.num_layers
-        else layer - config.first_k_dense_replace
-    ),
+    layer_to_bank=_layer_to_bank,
     desc="GLM NVFP4 experts",
 )
+
+# llm-compressor export (e.g. GLM-4.5-Air-REAP NVFP4): weight_packed | weight_scale |
+# weight_global_scale, the global being the quant-side scale (reciprocal at ingest). The MTP
+# layer's bf16 experts carry a plain ``weight`` and so never match.
+_NVFP4_CT_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
+    key_pattern=re.compile(
+        r"^model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+        r"(?P<proj>gate_proj|up_proj|down_proj)\."
+        r"(?P<kind>weight_packed|weight_global_scale|weight_scale)$"
+    ),
+    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+    layer_to_bank=_layer_to_bank,
+    desc="GLM NVFP4 experts (compressed-tensors)",
+    kind_map={"weight_packed": "weight", "weight_global_scale": "weight_scale_2"},
+    global_reciprocal=True,
+)
+
+
+def _select_expert_source_spec(model_path: str) -> Nvfp4ExpertSourceSpec:
+    quant = getattr(cached_load_hf_config(model_path), "quantization_config", None) or {}
+    get = quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+    method = str(get("quant_method") or "").lower()
+    return _NVFP4_CT_SOURCE_SPEC if method == "compressed-tensors" else _NVFP4_SOURCE_SPEC
 
 
 # --------------------------------------------------------------------------------------
@@ -80,15 +105,34 @@ def _iter_nvfp4_resident(
     ``weight`` (packed fp4) + ``weight_scale`` (fp8 block scale) verbatim; per-tensor
     ``weight_scale_2`` broadcast to per-row fp16 ``weight_global`` as the NVFP4 linear
     method / dequant_nvfp4 expect. lossless vs checkpoint; same dequant math as routed experts.
+
+    An llm-compressor export stores the same three as ``weight_packed`` / ``weight_scale`` /
+    ``weight_global_scale``, with the global on the quant side, so it is inverted here -- the
+    same reading its QuantConfig dialect gives it.
     """
-    packed = reader.get(f"{src_prefix}.weight")  # [OUT, IN//2] uint8
-    scale = reader.get(f"{src_prefix}.weight_scale")  # [OUT, IN//16] fp8-e4m3
-    g = reader.get(f"{src_prefix}.weight_scale_2").reshape(()).to(torch.float16)  # scalar
+    if reader.has(f"{src_prefix}.weight_packed"):
+        packed = reader.get(f"{src_prefix}.weight_packed")
+        scale = reader.get(f"{src_prefix}.weight_scale")
+        g = (1.0 / reader.get(f"{src_prefix}.weight_global_scale").reshape(()).float()).to(torch.float16)
+        input_scale = f"{src_prefix}.input_global_scale"
+        reciprocal_input = True
+    else:
+        packed = reader.get(f"{src_prefix}.weight")  # [OUT, IN//2] uint8
+        scale = reader.get(f"{src_prefix}.weight_scale")  # [OUT, IN//16] fp8-e4m3
+        g = reader.get(f"{src_prefix}.weight_scale_2").reshape(()).to(torch.float16)  # scalar
+        input_scale = f"{src_prefix}.input_scale"
+        reciprocal_input = False
     yield f"{dst_prefix}.weight", packed
     yield f"{dst_prefix}.weight_scale", scale
     yield f"{dst_prefix}.weight_global", g.expand(packed.shape[0]).contiguous()
-    if reader.has(f"{src_prefix}.input_scale"):
-        yield f"{dst_prefix}.input_scale", reader.get(f"{src_prefix}.input_scale").reshape(()).to(torch.float32)
+    if reader.has(input_scale):
+        a = reader.get(input_scale).reshape(()).to(torch.float32)
+        yield f"{dst_prefix}.input_scale", (1.0 / a) if reciprocal_input else a
+
+
+def _is_nvfp4(reader: _ShardReader, prefix: str) -> bool:
+    """Whether the checkpoint stores this Linear as NVFP4, in either export's naming."""
+    return reader.has(f"{prefix}.weight_packed") or reader.has(f"{prefix}.weight_scale_2")
 
 
 def _iter_attn_df11(
@@ -114,7 +158,8 @@ def iter_weights(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield the resident (non routed-expert) weights for GLM-4 MoE.
 
-    - qkvo: lossless DF11 (+ bf16 .bias) so the ~25GB of bf16 attention fits a 32 GB VRAM target.
+    - qkvo: lossless DF11 (+ bf16 .bias) so the ~25GB of bf16 attention fits a 32 GB VRAM target;
+      native NVFP4 (+ bf16 .bias) where the checkpoint quantized them (llm-compressor exports).
     - leading dense MLP layers + each MoE layer's shared expert: native NVFP4 (dequant in
       forward), faithful and smallest footprint.
     - embedding: row-contiguous DF11, decode only looked-up rows. router gate (+
@@ -146,9 +191,13 @@ def _iter_resident_weights(reader, config, primary) -> Iterator[tuple[str, torch
 
     for layer in tqdm(range(L), desc="Loading GLM dense weights", disable=not primary):
         a = f"model.layers.{layer}.self_attn"
-        # DF11 projections (+ qkv bias, bias-free o_proj).
+        # DF11 or NVFP4 projections, as the checkpoint stores them (+ qkv bias, bias-free
+        # o_proj). Glm4MoeAttention builds the matching module from the checkpoint's QuantConfig.
         for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
-            yield from _iter_attn_df11(reader, f"{a}.{proj}", device)
+            if _is_nvfp4(reader, f"{a}.{proj}"):
+                yield from _iter_nvfp4_resident(reader, f"{a}.{proj}", f"{a}.{proj}")
+            else:
+                yield from _iter_attn_df11(reader, f"{a}.{proj}", device)
             bias_name = f"{a}.{proj}.bias"
             if reader.has(bias_name):
                 yield bias_name, reader.get(bias_name).to(torch.bfloat16)
@@ -193,7 +242,7 @@ def _iter_resident_weights(reader, config, primary) -> Iterator[tuple[str, torch
 # Routed expert host banks (NVFP4) for the offload cache.
 # --------------------------------------------------------------------------------------
 def nvfp4_expert_spec(model_path: str, config):
-    return _NVFP4_SOURCE_SPEC
+    return _select_expert_source_spec(model_path)
 
 
 __all__ = ["iter_weights", "nvfp4_expert_spec"]

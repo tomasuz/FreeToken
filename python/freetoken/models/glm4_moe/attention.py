@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, RMSNorm
+from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import nvtx_annotate
 
@@ -27,9 +27,13 @@ class Glm4MoeAttention(BaseOP):
     every ``self_attn`` out of quantization (qkvo stay bf16), so we reproduce that exactly by
     storing the bf16 weights compressed (~10.7 bits/weight) and decoding them bit-for-bit in
     the forward. This fits a 32 GB VRAM target without the accuracy loss fp8 attention would add.
+
+    An export that did quantize them (llm-compressor's, e.g. GLM-4.5-Air REAP NVFP4) is served
+    as it was quantized: the checkpoint's QuantConfig names a scheme for the projection, and it
+    becomes the ordinary quantized Linear -- DF11 would only have been decoding a dequant.
     """
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         head_dim = config.head_dim
         self.layer_id = layer_id
         self.num_qo_heads = config.num_qo_heads
@@ -38,10 +42,18 @@ class Glm4MoeAttention(BaseOP):
         self.kv_attn_dim = self.num_kv_heads * head_dim
         self.head_dim = head_dim
 
-        self.q_proj = LinearDF11(config.hidden_size, self.qo_attn_dim, has_bias=config.has_attn_bias)
-        self.k_proj = LinearDF11(config.hidden_size, self.kv_attn_dim, has_bias=config.has_attn_bias)
-        self.v_proj = LinearDF11(config.hidden_size, self.kv_attn_dim, has_bias=config.has_attn_bias)
-        self.o_proj = LinearDF11(self.qo_attn_dim, config.hidden_size, has_bias=False)
+        def proj(name: str, input_size: int, output_size: int, has_bias: bool) -> BaseOP:
+            quant = config.quant
+            if quant is not None and quant.scheme_for(f"{prefix}.{name}") is not None:
+                return LinearReplicated(
+                    input_size, output_size, has_bias=has_bias, quant_config=quant, prefix=f"{prefix}.{name}"
+                )
+            return LinearDF11(input_size, output_size, has_bias=has_bias)
+
+        self.q_proj = proj("q_proj", config.hidden_size, self.qo_attn_dim, config.has_attn_bias)
+        self.k_proj = proj("k_proj", config.hidden_size, self.kv_attn_dim, config.has_attn_bias)
+        self.v_proj = proj("v_proj", config.hidden_size, self.kv_attn_dim, config.has_attn_bias)
+        self.o_proj = proj("o_proj", self.qo_attn_dim, config.hidden_size, False)
 
         if config.use_qk_norm:
             self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)

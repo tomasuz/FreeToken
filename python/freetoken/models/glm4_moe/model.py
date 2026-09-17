@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 class Glm4MoeDecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
-        self.self_attn = Glm4MoeAttention(config, layer_id)
+        self.self_attn = Glm4MoeAttention(config, layer_id, prefix=f"{prefix}.self_attn")
         if layer_id >= config.first_k_dense_replace:
             self.mlp: BaseOP = Glm4MoeSparseBlock(config, layer_id, prefix=f"{prefix}.mlp")
         else:
