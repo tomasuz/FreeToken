@@ -1361,6 +1361,18 @@ struct CpuMoeExecutor {
   std::atomic<uint64_t> submitted{0};
   std::atomic<uint64_t> completed{0};
 
+  // Self-timing, for the placement's rate tracker. The engine cannot time this pool: a
+  // clock around its submit and sync spans the GPU's own fetch and GEMM too, so a pool
+  // that overlaps well reads back an order of magnitude slow and is starved of work.
+  // The pool times itself instead -- from the task being handed over to the last worker
+  // finishing -- and counts the routes it actually computed. A task with no routes is
+  // left out: an empty layer costs a wake-up and says nothing about speed.
+  std::chrono::steady_clock::time_point task_t0{};
+  int64_t task_routes = 0;
+  std::atomic<uint64_t> timed_tasks{0};
+  std::atomic<uint64_t> timed_routes{0};
+  std::atomic<uint64_t> timed_ns{0};
+
   std::atomic<int64_t> p1_next{0};
   std::atomic<int64_t> p2_next{0};
   std::atomic<int64_t> prt_next{0};  // ds_fp4 intermediate fp8 round-trip phase
@@ -1945,6 +1957,13 @@ struct CpuMoeExecutor {
       }
       run_task_body(t);
       if (done_count.fetch_add(1) + 1 == num_threads) {
+        if (task_routes > 0) {  // counted before completion, so a sync sees this task
+          const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - task_t0).count();
+          timed_ns.fetch_add(static_cast<uint64_t>(ns), std::memory_order_relaxed);
+          timed_routes.fetch_add(static_cast<uint64_t>(task_routes), std::memory_order_relaxed);
+          timed_tasks.fetch_add(1, std::memory_order_relaxed);
+        }
         completed.store(my_gen, std::memory_order_release);
         {
           std::lock_guard<std::mutex> lk(sync_mtx);
@@ -1955,6 +1974,13 @@ struct CpuMoeExecutor {
   }
 
   void submit(MoeTask* t) {
+    task_t0 = std::chrono::steady_clock::now();
+    {
+      int64_t routes = 0;
+      const int64_t n = static_cast<int64_t>(t->num_tokens) * top_k;
+      for (int64_t i = 0; i < n; ++i) routes += t->ids[i] >= 0;
+      task_routes = routes;
+    }
     n_iblk = (I + IBLK - 1) / IBLK;
     n_hblk = (H + HBLK - 1) / HBLK;
     // Grow the per-token intermediate scratch if a larger batch shows up than the
@@ -2209,7 +2235,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_input_prequant",
            [](CpuMoeExecutor& e, bool v) { e.input_prequant = v; },
            py::arg("value"))
-      .def("isa_name", &CpuMoeExecutor::isa_name);
+      .def("isa_name", &CpuMoeExecutor::isa_name)
+      .def("timing_counters",
+           [](const CpuMoeExecutor& e) {
+             return py::make_tuple(e.timed_tasks.load(), e.timed_routes.load(),
+                                   e.timed_ns.load());
+           },
+           "(tasks, routes, nanoseconds) the pool has spent computing tasks with routes");
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));
   m.def("memcpy_async", &hip_memcpy_async, py::arg("stream"), py::arg("dst"),
         py::arg("src"), py::arg("nbytes"));

@@ -337,6 +337,15 @@ class CpuMoeExecutor:
                 "(bit-identical grid; the CPU-side scalar round-trip is skipped)"
             )
 
+        # The pool times what it computes (see timing_counters in cpu_moe_ext.cpp). With
+        # that, the placement reads this executor the way it reads an in-process device --
+        # from samples taken where the work happens -- instead of from a clock around
+        # submit and sync, which contains this GPU's own fetch and GEMM and starved the
+        # CPU of work: 17.7 GB/s at start-up, 2 GB/s one request later, half the speed.
+        # A prebuilt extension without the counters keeps the old measurement.
+        self.self_timed = hasattr(self._ext, "timing_counters")
+        self._timing_last = (0, 0)
+
         logger.info_rank0(
             f"CPU MoE executor ready: threads={nthreads} (pinned to cores "
             f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} fmt={fmt} "
@@ -634,6 +643,20 @@ class CpuMoeExecutor:
         io = self._io[bs]
         out.copy_(io["y"], non_blocking=True)
         return out
+
+    def take_samples(self) -> list[tuple[int, float]]:
+        """Routes computed, and seconds spent computing them, since the last ask.
+
+        One aggregate per ask rather than one per layer: the pool's counters are totals, and
+        a step's worth of layers read together is less noisy than any one of them.
+        """
+        if not self.self_timed:
+            return []
+        _, routes, ns = self._ext.timing_counters()
+        last_routes, last_ns = self._timing_last
+        self._timing_last = (routes, ns)
+        routes, ns = routes - last_routes, ns - last_ns
+        return [(routes, ns / 1e9)] if routes > 0 and ns > 0 else []
 
     def _watchdog_tick(self, suspects: dict) -> None:
         """One watchdog sampling round (called every 2 s by ``_watchdog_main``).

@@ -936,8 +936,10 @@ class OffloadMoeCache:
         with is the split it keeps for the rest of the run.
         """
         freeze = os.environ.get("FREETOKEN_DEVICE_FREEZE_RATE", "") == "1"
-        for executor in self.device_executors:
-            name = f"gpu{executor.device_index}"
+        timed = [(f"gpu{executor.device_index}", executor) for executor in self.device_executors]
+        if self.cpu_executor is not None and getattr(self.cpu_executor, "self_timed", False):
+            timed.append(("cpu", self.cpu_executor))
+        for name, executor in timed:
             samples = executor.take_samples()  # always drained, so they cannot pile up
             if freeze:
                 # Diagnostic: keep this executor's rate -- and with it the division --
