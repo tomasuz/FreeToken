@@ -392,9 +392,18 @@ class DeviceMoeExecutor:
                             self._skip(slot, bs)
                             handshake.host_raise(ready_ptr, done_ptr, slot)
                             continue
+                        # The route count, taken on the host. It used to be a copy between
+                        # two aliases, which reads as device-to-device and is issued to the
+                        # queue of the device those pages are registered with -- the
+                        # ENGINE's. With a CPU helper in the same step that queue is inside
+                        # a spin-wait by the time this runs, the copy never completes, and
+                        # the two wait for each other: the engine for this device's answer,
+                        # this device for the engine's queue. Both operands are host memory
+                        # and the doorbell has already been acquired, so a host copy says
+                        # the same thing and asks no device for anything.
+                        self._ids_seen[slot][:bs].copy_(self._ids[:bs])
                         with torch.cuda.device(self.device), torch.cuda.stream(self._stream):
                             self._ev_start[slot].record(self._stream)
-                            self._ids_seen_far[slot][:bs].copy_(self._far["ids"][:bs])
                             if self._trace:
                                 self._x_seen_far[slot][:bs].copy_(self._far["x"][:bs])
                                 self._w_seen_far[slot][:bs].copy_(self._far["w"][:bs])
