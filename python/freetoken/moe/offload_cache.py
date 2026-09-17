@@ -89,6 +89,10 @@ from freetoken.kernel.aot_models import fp8_block_scale_pad
 # staler rates; shallower starts discarding measurements on a busy stream.
 _TIMING_RING = 8
 
+# Diagnostic: per layer-step histogram of how many experts had to be fetched (FREETOKEN_MISS_HIST=1).
+# Wide enough for a batch of eight at top-8; a larger count lands in the last bin.
+_MISS_HIST_BINS = 65
+
 # Diagnostic: route every miss to the main device while leaving the split path in place.
 _FORCE_GPU_ONLY = os.getenv("FREETOKEN_SPLIT_GPU_ONLY", "0") == "1"
 
@@ -274,6 +278,15 @@ class OffloadMoeCache:
         self.lru_stats = torch.zeros(
             (self.num_layers, N_STATS), dtype=torch.int64, device=self.device
         )
+        # Diagnostic, off unless FREETOKEN_MISS_HIST=1: how many experts each layer-step had
+        # to fetch. The mean hides what a placement decision acts on -- whether the misses
+        # come a few at a time or many at once -- and a helper can only pay on the steps
+        # with many. One launch per layer per step when on, captured like the rest.
+        self.collect_miss_hist = os.getenv("FREETOKEN_MISS_HIST", "0") == "1"
+        self.miss_hist = torch.zeros(
+            (self.num_layers, _MISS_HIST_BINS), dtype=torch.int64, device=self.device
+        )
+        self._miss_hist_one = torch.ones((1,), dtype=torch.int64, device=self.device)
         self.stat_missing = torch.zeros((), dtype=torch.int64, device=self.device)
         self.stat_active = torch.zeros((), dtype=torch.int64, device=self.device)
         self.stat_calls = torch.zeros((), dtype=torch.int64, device=self.device)
@@ -1299,6 +1312,21 @@ class OffloadMoeCache:
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
+        self.miss_hist.zero_()
+
+    def record_miss_hist(self, layer_id: int) -> None:
+        """Count this layer-step's fetch into :attr:`miss_hist` (``FREETOKEN_MISS_HIST``)."""
+        index = self.num_indices.clamp(max=_MISS_HIST_BINS - 1)
+        self.miss_hist[layer_id].index_add_(0, index, self._miss_hist_one)
+
+    def miss_hist_summary(self) -> dict | None:
+        """Share of layer-steps by fetched-expert count over every layer, or None if empty."""
+        totals = self.miss_hist.sum(0).tolist()
+        steps = sum(totals)
+        if not steps:
+            return None
+        last = max(i for i, count in enumerate(totals) if count)
+        return {"steps": steps, "share": [count / steps for count in totals[: last + 1]]}
 
     def record_decode_stats(self, layer_id: int) -> None:
         """No-op: ``ensure_experts`` accumulates into ``lru_stats`` inside its own launch.

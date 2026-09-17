@@ -7,6 +7,7 @@ from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, RMSNormFused
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
+from freetoken.utils.phase_timer import phase, step_done
 
 from .attention import Glm4MoeAttention
 from .df11_embedding import EmbeddingDF11
@@ -37,9 +38,11 @@ class Glm4MoeDecoderLayer(BaseOP):
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x, residual = self.input_layernorm.forward(x, residual)
-        x = self.self_attn.forward(x)
+        with phase("self_attn"):
+            x = self.self_attn.forward(x)
         x, residual = self.post_attention_layernorm.forward(x, residual)
-        x = self.mlp.forward(x)
+        with phase("mlp"):
+            x = self.mlp.forward(x)
         return x, residual
 
 
@@ -80,7 +83,10 @@ class Glm4MoeForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
-        return self.lm_head.forward(output)
+        with phase("lm_head"):
+            logits = self.lm_head.forward(output)
+        step_done()
+        return logits
 
 
 __all__ = ["Glm4MoeForCausalLM"]

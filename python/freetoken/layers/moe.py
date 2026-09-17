@@ -351,18 +351,23 @@ class OffloadMoELayer(MoELayer):
             return self._decode_split(
                 cache, helpers, hidden_states, topk_weights, topk_ids
             )
-        cache.ensure_experts(self.layer_id, topk_ids)
-        cache.copy_missing()
-        return self._expert_gemm(
-            cache,
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            views=cache.bank_views(),
-            n=None,
-            alphas=cache.alphas_for_slots(self.layer_id),
-            is_prefill=False,
-        )
+        with phase("moe.ensure"):
+            cache.ensure_experts(self.layer_id, topk_ids)
+            if cache.collect_miss_hist:
+                cache.record_miss_hist(self.layer_id)
+        with phase("moe.fetch"):
+            cache.copy_missing()
+        with phase("moe.gemm"):
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=cache.bank_views(),
+                n=None,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=False,
+            )
 
     def _decode_split(
         self,

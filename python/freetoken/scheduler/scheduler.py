@@ -217,6 +217,10 @@ class Scheduler(SchedulerIOMixin, MTPDecodeMixin):
             f"{overall['missing_per_layer']:.1f} missing experts per layer-step, "
             f"miss rate {overall['miss_rate'] * 100:.1f}%"
         )
+        hist = cache.miss_hist_summary() if getattr(cache, "collect_miss_hist", False) else None
+        if hist:
+            shares = " ".join(f"{m}:{share * 100:.1f}%" for m, share in enumerate(hist["share"]))
+            logger.info_rank0(f"moe misses per layer-step over {hist['steps']} steps: {shares}")
         rows = [r for r in per_layer.get("per_layer", []) if r.get("steps")]
         for row in rows:
             logger.info_rank0(

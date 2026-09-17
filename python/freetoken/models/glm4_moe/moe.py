@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 import torch.nn.functional as F
 from freetoken.layers import BaseOP, LinearReplicated, make_moe_layer
+from freetoken.utils.phase_timer import phase
 
 from .mlp import GlmGatedMLP
 
@@ -81,9 +82,12 @@ class Glm4MoeSparseBlock(BaseOP):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        topk_weights, topk_ids = self._route(hidden_states)
-        out = self.experts.routed_forward(hidden_states, topk_weights, topk_ids)
-        out = out + self.shared_experts.forward(hidden_states)
+        with phase("mlp.gate"):
+            topk_weights, topk_ids = self._route(hidden_states)
+        with phase("mlp.experts"):
+            out = self.experts.routed_forward(hidden_states, topk_weights, topk_ids)
+        with phase("mlp.shared"):
+            out = out + self.shared_experts.forward(hidden_states)
         return out.view(num_tokens, hidden_dim)
 
 
