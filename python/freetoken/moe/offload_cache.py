@@ -348,6 +348,7 @@ class OffloadMoeCache:
         self._count_layers: dict[int, tuple[str, ...]] = {}
         self._count_plan_memo: dict[tuple[str, ...], tuple[tuple, list]] = {}
         self._count_rows_last: dict[tuple[str, ...], list] = {}
+        self._fetch_calibrated = False
         self._fetched_staging: list = []
         self._timing_slot = 0
         # (per-layer sources, cache) per bank, in schema order. Every piece of cache
@@ -905,6 +906,49 @@ class OffloadMoeCache:
         self._helper_bounds_dev = self._helper_bounds_host.to(self.device)
         self._count_width = width
         self._count_rows_last.clear()
+        self.calibrate_fetch_cost()
+
+    def calibrate_fetch_cost(self, sizes: tuple[int, ...] = (1, 2, 4, 8), repeats: int = 3) -> None:
+        """Measure this device's fetch directly, once, before anything is captured.
+
+        A decode driven by graph replays takes its only fetch samples in the eager steps that
+        warm up and record the graphs, and in those the host is still compiling between the
+        two stream markers: the stream idles inside the window, and one expert reads 9.4 ms
+        where the link moves it in 0.7. Timed copies of real bank rows -- a few sizes, the best
+        of a few tries each -- give the cost the way a decode step pays it, with nothing else
+        in the window. From then on the warm-up samples are not used for the plan.
+        """
+        import time
+
+        if self._fetch_calibrated or self.device.type != "cuda" or not self.banks:
+            return
+        layer = next(
+            (l for l in range(self.num_layers)
+             if l not in self._unpinned_layers and not self._skips_movement(l)),
+            None,
+        )
+        if layer is None:
+            return
+        rows = min(max(sizes), self.num_experts)
+        scratch = [
+            torch.empty_like(per_layer[layer][:rows], device=self.device)
+            for per_layer, _ in self.banks
+        ]
+        for count in sizes:
+            if count > rows:
+                continue
+            best = None
+            for _ in range(repeats):
+                torch.cuda.synchronize(self.device)
+                started = time.perf_counter()
+                for (per_layer, _), dst in zip(self.banks, scratch):
+                    dst[:count].copy_(per_layer[layer][:count], non_blocking=True)
+                torch.cuda.synchronize(self.device)
+                elapsed = time.perf_counter() - started
+                best = elapsed if best is None else min(best, elapsed)
+            self.cost_tracker.observe("gpu", 1, count, best)
+        del scratch
+        self._fetch_calibrated = True
 
     def _executor_costs(self, names: list[str]):
         """This device and each helper as fixed + per-expert seconds, from what they reported."""
@@ -1081,7 +1125,8 @@ class OffloadMoeCache:
             # The fit separates the copy's launch from its cost per expert: rated as a plain
             # average, a step that fetched one expert reads 3x slow and the plan gives this
             # device less, which reads slower still -- until it fetches nothing at all.
-            self.cost_tracker.observe("gpu", 1, fetched, seconds)
+            if not self._fetch_calibrated:
+                self.cost_tracker.observe("gpu", 1, fetched, seconds)
             self._gpu_busy_seconds = end.elapsed_time(gemm) / 1e3
         if len(self._pending_timings) >= _TIMING_RING:
             # Nothing is completing, and the ring is about to be reused underneath entries

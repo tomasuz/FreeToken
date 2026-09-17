@@ -137,6 +137,22 @@ def test_until_a_plan_is_written_the_device_fetches_everything():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_the_fetch_is_calibrated_from_timed_copies_and_warm_up_samples_are_ignored():
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=8, cache_size=8, device=torch.device("cuda"),
+        quant_format="bf16", decode_target="hybrid", hybrid_max_fetch=8,
+    )
+    bank = [torch.randn(8, 1 << 20).pin_memory() for _ in range(2)]  # 4 MB an expert
+    cache.banks = [(bank, torch.empty(8, 1 << 20, device="cuda"))]
+    cache.placement_counts = True
+    cache.ensure_count_tables(8, 1)
+
+    assert cache._fetch_calibrated and cache.cost_tracker.samples("gpu") == 4
+    fixed, per_expert = cache.cost_tracker.cost("gpu")
+    assert 0.0 <= fixed < 0.1 and 0.0 < per_expert < 0.1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_table_fetch_gpu_matches_cpu_reference():
     torch.manual_seed(0)
     num_experts, cache_size, top_k = 32, 40, 8
