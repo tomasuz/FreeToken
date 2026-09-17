@@ -77,7 +77,20 @@ def test_cost_fit_separates_the_fixed_part_from_the_part_per_expert():
     assert per_expert == pytest.approx(0.3 * MS)
 
 
-def test_cost_fit_falls_back_to_the_average_when_the_terms_cannot_be_told_apart():
+def test_cost_fit_is_not_moved_by_a_few_warm_up_outliers():
+    tracker = CostTracker()
+    for experts in (8, 8, 7, 8):  # compiling: hundreds of times the real cost
+        tracker.observe("gpu", 1, experts, 0.5)
+    for step in range(40):
+        experts = 1 + step % 8
+        tracker.observe("gpu", 1, experts, 0.05 * MS + experts * 0.72 * MS)
+
+    fixed, per_expert = tracker.cost("gpu")
+    assert per_expert == pytest.approx(0.72 * MS)
+    assert fixed == pytest.approx(0.05 * MS)
+
+
+def test_cost_fit_falls_back_to_the_median_per_expert_when_the_terms_cannot_be_told_apart():
     tracker = CostTracker()
     tracker.observe("cpu", 10, 30, 0.03)
     tracker.observe("cpu", 20, 60, 0.06)  # every window three experts per task

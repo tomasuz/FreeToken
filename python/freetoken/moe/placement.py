@@ -335,49 +335,78 @@ class CostTracker:
     """Each executor's fixed and per-expert cost, fitted from the work it reports.
 
     A sample is ``(tasks, experts, seconds)`` -- one layer from an executor that times each
-    layer, or a window of many from one that keeps totals. The fit is least squares over the
-    most recent windows, ``seconds ~ fixed * tasks + per_expert * experts``: a pool that is
-    handed one expert at a time and one handed eight give different averages, and only the
-    two terms together say which it will be next time. When the samples cannot separate the
-    terms (every window with the same experts per task), the fixed part is taken as zero and
-    the cost is the plain average -- the same answer a rate would give.
+    layer, or a window of many from one that keeps totals. Per task it is a point
+    ``(experts / tasks, seconds / tasks)`` on the line ``fixed + per_expert * experts``: a
+    pool handed one expert at a time and one handed eight give different averages, and only
+    the two terms together say which it will be next time.
+
+    The line is fitted with Theil-Sen -- the median of the slopes between every pair of
+    points, then the median intercept -- not least squares. The samples an executor reports
+    in its first steps include compiling and warming up, a few of them hundreds of times
+    slower than the rest, and a squared error lets exactly those set the slope: the main
+    device then rates several times slower than its link, is given nothing to fetch, and
+    stops producing the samples that would correct it. A median ignores them.
+
+    When the points cannot separate the terms (every window with the same experts per task)
+    the fixed part is taken as zero and the cost is the median per expert.
     """
 
-    __slots__ = ("_samples", "_window")
+    __slots__ = ("_samples", "_window", "_fits")
 
-    def __init__(self, window: int = 64) -> None:
+    def __init__(self, window: int = 48) -> None:
         self._window = window
-        self._samples: dict[str, list[tuple[float, float, float]]] = {}
+        self._samples: dict[str, list[tuple[float, float]]] = {}
+        self._fits: dict[str, tuple[int, tuple[float, float]]] = {}
 
     def observe(self, name: str, tasks: int, experts: int, seconds: float) -> None:
         if tasks <= 0 or experts <= 0 or seconds <= 0.0:
             return
         bucket = self._samples.setdefault(name, [])
-        bucket.append((float(tasks), float(experts), float(seconds)))
+        bucket.append((experts / tasks, seconds / tasks))
         if len(bucket) > self._window:
             del bucket[: len(bucket) - self._window]
+        count, fit = self._fits.get(name, (0, None))
+        self._fits[name] = (count + 1, fit)
 
     def samples(self, name: str) -> int:
         return len(self._samples.get(name, ()))
 
     def cost(self, name: str) -> tuple[float, float] | None:
-        """``(fixed_seconds, per_expert_seconds)``, or None before any sample."""
+        """``(fixed_seconds, per_expert_seconds)``, or None before any sample.
+
+        Refitted after every few new samples rather than on every ask: an ask comes every
+        step, and the fit is quadratic in the window.
+        """
         bucket = self._samples.get(name)
         if not bucket:
             return None
-        stt = sum(t * t for t, _, _ in bucket)
-        see = sum(e * e for _, e, _ in bucket)
-        ste = sum(t * e for t, e, _ in bucket)
-        sts = sum(t * s for t, _, s in bucket)
-        ses = sum(e * s for _, e, s in bucket)
-        det = stt * see - ste * ste
-        if det > 1e-9 * stt * see:
-            fixed = (sts * see - ses * ste) / det
-            per_expert = (stt * ses - ste * sts) / det
-            if fixed >= 0.0 and per_expert > 0.0:
+        pending, fit = self._fits.get(name, (0, None))
+        if fit is None or pending >= 8:
+            fit = _theil_sen(bucket)
+            self._fits[name] = (0, fit)
+        return fit
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _theil_sen(points: list[tuple[float, float]]) -> tuple[float, float]:
+    slopes = [
+        (y2 - y1) / (x2 - x1)
+        for i, (x1, y1) in enumerate(points)
+        for x2, y2 in points[i + 1:]
+        if abs(x2 - x1) > 1e-9
+    ]
+    if slopes:
+        per_expert = _median(slopes)
+        if per_expert > 0.0:
+            fixed = _median([y - per_expert * x for x, y in points])
+            if fixed >= 0.0:
                 return fixed, per_expert
-        total_e = sum(e for _, e, _ in bucket)
-        return 0.0, sum(s for _, _, s in bucket) / total_e
+    return 0.0, _median([y / x for x, y in points])
 
 
 __all__ = [

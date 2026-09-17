@@ -1019,7 +1019,7 @@ class OffloadMoeCache:
                 continue
             plan = " ".join(f"{m}:" + "/".join(map(str, row)) for m, row in enumerate(memo[1]))
             costs = []
-            for name in key:
+            for name in ("gpu", *key):
                 fitted = self.cost_tracker.cost(name)
                 if fitted is not None:
                     costs.append(f"{name} {fitted[0] * 1e3:.2f}+{fitted[1] * 1e3:.2f} ms/expert")
