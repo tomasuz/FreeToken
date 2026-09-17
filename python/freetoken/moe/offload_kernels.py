@@ -41,7 +41,8 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
 
 
 def ensure_experts_hybrid(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction=0.0
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction=0.0,
+    fetch_table: torch.Tensor | None = None,
 ) -> None:
     """Capped-fetch variant of ``ensure_experts`` (hybrid backend).
 
@@ -52,7 +53,16 @@ def ensure_experts_hybrid(
     split (fraction = pcie_bw / cpu_bw): fetch ~fraction of the step's misses, rounded to
     the integer that makes the PCIe fetch and the CPU overflow compute finish closest to
     together. ``num_indices`` = capped fetch count (copy_missing); ``num_missing_full`` =
-    pre-cap miss count (stats)."""
+    pre-cap miss count (stats).
+
+    ``fetch_table`` (``[num_layers, width]`` int32) replaces both: row ``layer_id``, column
+    ``min(misses, width - 1)`` is how many of the misses this device fetches. The device
+    counts the misses and reads the answer for that count -- see ``plan_miss_counts``."""
+    if fetch_table is not None:
+        if not expert_ids.is_cuda:
+            return _ensure_experts_hybrid_cpu(cache, layer_id, expert_ids, max_fetch, 0, fetch_table)
+        frac = fetch_fraction if torch.is_tensor(fetch_fraction) else fetch_table
+        return _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac, fetch_table)
     # Q16 fixed point so the GPU kernel and the CPU reference cap identically (no float).
     # A tensor here is the per-layer vector the kernel reads on the device: the fraction is
     # then an input to the launch rather than part of it, which is what a captured graph
@@ -107,7 +117,8 @@ def reset_cache(cache) -> None:
 
 
 def _ensure_experts_hybrid_gpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: torch.Tensor
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: torch.Tensor,
+    fetch_table: torch.Tensor | None = None,
 ) -> None:
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
@@ -128,17 +139,21 @@ def _ensure_experts_hybrid_gpu(
         expert_ids.numel(),
         int(max_fetch),
         frac_q16,
+        fetch_table if fetch_table is not None else frac_q16,
+        fetch_table.shape[1] if fetch_table is not None else 1,
         cache.num_experts,
         cache.cache_size,
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
+        USE_TABLE=fetch_table is not None,
         num_warps=num_warps,
     )
 
 
 def _ensure_experts_hybrid_cpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int,
+    fetch_table: torch.Tensor | None = None,
 ) -> None:
     """CPU reference mirror of the hybrid kernel (eviction/fetch decisions bit-identical to
     the GPU path; see tests/test_offload_lru_kernels.py). Fetches at most ``max_fetch`` (or
@@ -167,7 +182,9 @@ def _ensure_experts_hybrid_cpu(
         missing.sort(key=lambda e: (-rec[e], e))
     else:
         missing.sort()
-    if frac_q16 > 0:
+    if fetch_table is not None:
+        max_fetch = int(fetch_table[layer_id, min(len(missing), fetch_table.shape[1] - 1)])
+    elif frac_q16 > 0:
         m, q = len(missing), 1 << 16
         lo = (m * frac_q16) >> 16
         cost = lambda f: max(f * (q - frac_q16), (m - f) * frac_q16)  # noqa: E731
@@ -316,11 +333,14 @@ def _ensure_experts_hybrid_kernel(
     num_active,
     max_fetch,
     fetch_frac_ptr,
+    fetch_table_ptr,
+    table_width,
     num_experts: tl.constexpr,
     cache_size: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BY_RECENCY: tl.constexpr,
+    USE_TABLE: tl.constexpr,
 ):
     """Capped-fetch timestamp-LRU (hybrid backend).
 
@@ -357,7 +377,12 @@ def _ensure_experts_hybrid_kernel(
     # Read on the device: a replay re-reads it, so the split a later step wrote takes
     # effect without the graph being recorded again.
     fetch_frac_q16 = tl.load(fetch_frac_ptr + layer_id)
-    if fetch_frac_q16 > 0:
+    if USE_TABLE:
+        # Per miss count: the host solved every count ahead of time; this reads the one the
+        # step has. Also a node input, so a later plan takes effect on the next replay.
+        row = tl.minimum(num_missing, table_width - 1)
+        max_fetch = tl.load(fetch_table_ptr + layer_id * table_width + row)
+    elif fetch_frac_q16 > 0:
         # Bandwidth-matched split (fetch_frac = pcie_bw / cpu_bw): fetch time scales with
         # F * (1 - frac), CPU time with (M - F) * frac; they balance at F = frac * M. Pick
         # the integer neighbor that minimizes the slower (max) side of the overlap.

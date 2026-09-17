@@ -248,10 +248,131 @@ def rates_from_throughputs(
     ]
 
 
+# --------------------------------------------------------------------------------------
+# Deciding per miss count, for the device to look up.
+#
+# The split above is one ratio for a layer, applied to whatever the step brings. That is the
+# right answer only when an executor's cost is proportional to its work, and for a helper it
+# is not: waking a pool and handing it a layer costs the same whether it gets one expert or
+# six. A ratio cannot say "give it none, or give it several", so it hands out single experts
+# that cost more to hand over than they save -- and, rated from the steps where it had many,
+# a helper looks fast enough to be given the lot. The device knows how many experts a layer
+# is missing before it moves any; what it lacks is the answer for that number. So the host
+# answers for every number at once, and the device reads the row it has.
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExecutorCost:
+    """What one executor costs a layer, as a fixed part and a part per expert.
+
+    For the main device ``fixed_seconds`` is the work it owes whatever the placement decides
+    (its GEMM) and ``per_expert_seconds`` a fetch over its link. For a helper the fixed part
+    is only paid when it is given something: waking it, handing the layer over, taking the
+    answer back.
+    """
+
+    name: str
+    per_expert_seconds: float
+    fixed_seconds: float = 0.0
+
+
+def _helper_seconds(cost: ExecutorCost, count: int) -> float:
+    return cost.fixed_seconds + count * cost.per_expert_seconds if count else 0.0
+
+
+def plan_miss_counts(
+    main: ExecutorCost, helpers: list[ExecutorCost], max_misses: int
+) -> list[tuple[int, ...]]:
+    """For every miss count ``m`` in ``[0, max_misses]``, how many each executor takes.
+
+    Row ``m`` is ``(main, helper_0, helper_1, ...)`` summing to ``m``: the split with the
+    shortest layer -- the slowest executor's finish -- over every integer division. Ties go
+    to the arrangement that hands helpers the fewest experts, so an executor that cannot
+    shorten the layer is not woken for nothing. The search is exhaustive; with a handful of
+    helpers and a top-k of eight it is a few hundred candidates per row, computed on the
+    host when the rates move, never on the decode path.
+    """
+    rows: list[tuple[int, ...]] = []
+    n = len(helpers)
+    for misses in range(max_misses + 1):
+        best_key, best = None, None
+
+        def search(index: int, left: int, taken: tuple[int, ...]) -> None:
+            nonlocal best_key, best
+            if index == n:
+                main_count = left
+                span = main.fixed_seconds + main_count * main.per_expert_seconds
+                for cost, count in zip(helpers, taken):
+                    span = max(span, _helper_seconds(cost, count))
+                key = (span, misses - main_count, taken)
+                if best_key is None or key < best_key:
+                    best_key, best = key, (main_count, *taken)
+                return
+            for count in range(left + 1):
+                search(index + 1, left - count, taken + (count,))
+
+        search(0, misses, ())
+        rows.append(best)
+    return rows
+
+
+class CostTracker:
+    """Each executor's fixed and per-expert cost, fitted from the work it reports.
+
+    A sample is ``(tasks, experts, seconds)`` -- one layer from an executor that times each
+    layer, or a window of many from one that keeps totals. The fit is least squares over the
+    most recent windows, ``seconds ~ fixed * tasks + per_expert * experts``: a pool that is
+    handed one expert at a time and one handed eight give different averages, and only the
+    two terms together say which it will be next time. When the samples cannot separate the
+    terms (every window with the same experts per task), the fixed part is taken as zero and
+    the cost is the plain average -- the same answer a rate would give.
+    """
+
+    __slots__ = ("_samples", "_window")
+
+    def __init__(self, window: int = 64) -> None:
+        self._window = window
+        self._samples: dict[str, list[tuple[float, float, float]]] = {}
+
+    def observe(self, name: str, tasks: int, experts: int, seconds: float) -> None:
+        if tasks <= 0 or experts <= 0 or seconds <= 0.0:
+            return
+        bucket = self._samples.setdefault(name, [])
+        bucket.append((float(tasks), float(experts), float(seconds)))
+        if len(bucket) > self._window:
+            del bucket[: len(bucket) - self._window]
+
+    def samples(self, name: str) -> int:
+        return len(self._samples.get(name, ()))
+
+    def cost(self, name: str) -> tuple[float, float] | None:
+        """``(fixed_seconds, per_expert_seconds)``, or None before any sample."""
+        bucket = self._samples.get(name)
+        if not bucket:
+            return None
+        stt = sum(t * t for t, _, _ in bucket)
+        see = sum(e * e for _, e, _ in bucket)
+        ste = sum(t * e for t, e, _ in bucket)
+        sts = sum(t * s for t, _, s in bucket)
+        ses = sum(e * s for _, e, s in bucket)
+        det = stt * see - ste * ste
+        if det > 1e-9 * stt * see:
+            fixed = (sts * see - ses * ste) / det
+            per_expert = (stt * ses - ste * sts) / det
+            if fixed >= 0.0 and per_expert > 0.0:
+                return fixed, per_expert
+        total_e = sum(e for _, e, _ in bucket)
+        return 0.0, sum(s for _, _, s in bucket) / total_e
+
+
 __all__ = [
+    "CostTracker",
+    "ExecutorCost",
     "ExecutorRate",
     "Placement",
     "RateTracker",
+    "plan_miss_counts",
     "rates_from_throughputs",
     "split_misses",
 ]

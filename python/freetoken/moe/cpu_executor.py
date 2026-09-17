@@ -344,7 +344,7 @@ class CpuMoeExecutor:
         # CPU of work: 17.7 GB/s at start-up, 2 GB/s one request later, half the speed.
         # A prebuilt extension without the counters keeps the old measurement.
         self.self_timed = hasattr(self._ext, "timing_counters")
-        self._timing_last = (0, 0)
+        self._timing_last = (0, 0, 0)
 
         logger.info_rank0(
             f"CPU MoE executor ready: threads={nthreads} (pinned to cores "
@@ -644,19 +644,24 @@ class CpuMoeExecutor:
         out.copy_(io["y"], non_blocking=True)
         return out
 
-    def take_samples(self) -> list[tuple[int, float]]:
-        """Routes computed, and seconds spent computing them, since the last ask.
+    def take_task_samples(self) -> list[tuple[int, int, float]]:
+        """Tasks with routes, routes computed, and seconds spent, since the last ask.
 
         One aggregate per ask rather than one per layer: the pool's counters are totals, and
-        a step's worth of layers read together is less noisy than any one of them.
+        a step's worth of layers read together is less noisy than any one of them. The task
+        count is what lets a fixed per-layer cost be told apart from the cost per expert.
         """
         if not self.self_timed:
             return []
-        _, routes, ns = self._ext.timing_counters()
-        last_routes, last_ns = self._timing_last
-        self._timing_last = (routes, ns)
-        routes, ns = routes - last_routes, ns - last_ns
-        return [(routes, ns / 1e9)] if routes > 0 and ns > 0 else []
+        tasks, routes, ns = self._ext.timing_counters()
+        last_tasks, last_routes, last_ns = self._timing_last
+        self._timing_last = (tasks, routes, ns)
+        tasks, routes, ns = tasks - last_tasks, routes - last_routes, ns - last_ns
+        return [(tasks, routes, ns / 1e9)] if routes > 0 and ns > 0 else []
+
+    def take_samples(self) -> list[tuple[int, float]]:
+        """Routes computed, and seconds spent computing them, since the last ask."""
+        return [(routes, seconds) for _, routes, seconds in self.take_task_samples()]
 
     def _watchdog_tick(self, suspects: dict) -> None:
         """One watchdog sampling round (called every 2 s by ``_watchdog_main``).

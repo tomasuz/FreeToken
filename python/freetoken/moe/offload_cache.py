@@ -332,6 +332,22 @@ class OffloadMoeCache:
             (self.num_layers,), seed, dtype=torch.int32, device=self.device
         )
         self._pending_timings: list = []
+        # FREETOKEN_PLACEMENT=counts: instead of one fraction per layer, the device looks up
+        # -- per layer and per miss count -- how many misses it fetches and how the rest
+        # divide among the helpers (freetoken.moe.placement.plan_miss_counts). The costs
+        # behind the plan are fitted from what each self-timed executor reports.
+        from freetoken.moe.placement import CostTracker
+
+        self.placement_counts = os.getenv("FREETOKEN_PLACEMENT", "shares") == "counts"
+        self.cost_tracker = CostTracker()
+        self._count_width = 0
+        self._fetch_table_host: torch.Tensor | None = None
+        self._fetch_table_dev: torch.Tensor | None = None
+        self._helper_bounds_host: torch.Tensor | None = None
+        self._helper_bounds_dev: torch.Tensor | None = None
+        self._count_layers: dict[int, tuple[str, ...]] = {}
+        self._count_plan_memo: dict[tuple[str, ...], tuple[tuple, list]] = {}
+        self._count_rows_last: dict[tuple[str, ...], list] = {}
         self._fetched_staging: list = []
         self._timing_slot = 0
         # (per-layer sources, cache) per bank, in schema order. Every piece of cache
@@ -836,6 +852,9 @@ class OffloadMoeCache:
         """
         from freetoken.layers.moe import _fill_owner_map
 
+        if self.placement_counts:
+            self._refresh_count_placement()
+            return
         if not self._owner_maps:
             return
         # helper names -> (labelled shares, their rounded signature, fetch fraction in Q16)
@@ -860,6 +879,145 @@ class OffloadMoeCache:
                 _fill_owner_map(entry[0], share_list)
                 entry[2] = current
             self._fetch_frac_host[layer_id] = fraction
+
+    # --- the device's per-miss-count lookup (FREETOKEN_PLACEMENT=counts) -----------------
+
+    def ensure_count_tables(self, routes: int, helpers: int) -> None:
+        """Size the lookup tables for ``routes`` routes a step and up to ``helpers`` helpers.
+
+        Allocated on the first split -- an eager step before any capture, the only time an
+        allocation a graph will read can be made. Until a plan is written every row says
+        "this device fetches everything", which is always a correct answer.
+        """
+        width = int(routes) + 1
+        helpers = max(1, int(helpers))
+        if (self._fetch_table_host is not None and width <= self._count_width
+                and helpers <= self._helper_bounds_host.shape[1]):
+            return
+        assert not torch.cuda.is_current_stream_capturing(), "count tables must exist before capture"
+        width = max(width, self._count_width)
+        pin = self.device.type == "cuda"
+        table = torch.arange(width, dtype=torch.int32).expand(self.num_layers, width).contiguous()
+        self._fetch_table_host = table.pin_memory() if pin else table
+        self._fetch_table_dev = self._fetch_table_host.to(self.device)
+        bounds = torch.zeros((self.num_layers, helpers, width), dtype=torch.int32)
+        self._helper_bounds_host = bounds.pin_memory() if pin else bounds
+        self._helper_bounds_dev = self._helper_bounds_host.to(self.device)
+        self._count_width = width
+        self._count_rows_last.clear()
+
+    def _executor_costs(self, names: list[str]):
+        """This device and each helper as fixed + per-expert seconds, from what they reported."""
+        from freetoken.moe.placement import ExecutorCost
+
+        self._drain_self_timed()
+        rates = {r.name: r for r in self.rate_tracker.rates(["gpu", *names])}
+
+        def per_expert(name: str) -> float:
+            rate = rates.get(name)
+            if rate is None or not rate.usable:
+                return 1.0  # unmeasurable: a second per expert keeps it out of the plan
+            return self.bytes_per_expert / rate.bytes_per_second
+
+        main = ExecutorCost("gpu", per_expert("gpu"), getattr(self, "_gpu_busy_seconds", 0.0))
+        helpers = []
+        for name in names:
+            fitted = self.cost_tracker.cost(name)
+            if fitted is None:
+                helpers.append(ExecutorCost(name, per_expert(name), 0.0))
+            else:
+                helpers.append(ExecutorCost(name, fitted[1], fitted[0]))
+        return main, helpers
+
+    def _count_rows(self, names: tuple[str, ...]) -> list:
+        """The plan for one set of helpers, recomputed only when a cost has really moved."""
+        from freetoken.moe.placement import plan_miss_counts
+
+        if _FORCE_GPU_ONLY:
+            return [(m,) + (0,) * len(names) for m in range(self._count_width)]
+        main, helpers = self._executor_costs(list(names))
+        quantum = 20e-6  # costs jitter step to step; a plan that followed the jitter would flap
+        signature = tuple(
+            round(min(value, 1.0) / quantum)
+            for cost in (main, *helpers)
+            for value in (cost.fixed_seconds, cost.per_expert_seconds)
+        )
+        cached = self._count_plan_memo.get(names)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        rows = plan_miss_counts(main, helpers, self._count_width - 1)
+        self._count_plan_memo[names] = (signature, rows)
+        return rows
+
+    def _write_count_rows(self, layers: list[int], names: tuple[str, ...], rows: list) -> None:
+        table = torch.tensor(rows, dtype=torch.int32)  # [width, 1 + helpers]
+        index = torch.tensor(layers, dtype=torch.long)
+        self._fetch_table_host[index] = table[:, 0]
+        if names:
+            bounds = torch.cumsum(table[:, 1:], dim=1, dtype=torch.int32).T.contiguous()
+            self._helper_bounds_host[index, : len(names)] = bounds
+
+    def plan_counts_for(self, layer_id: int, names: list[str]) -> None:
+        """An eager step's plan for this layer, written where the device reads it."""
+        key = tuple(names)
+        self._count_layers[layer_id] = key
+        self._write_count_rows([layer_id], key, self._count_rows(key))
+        self._count_rows_last.pop(key, None)  # the next refresh rewrites every such layer
+
+    def _refresh_count_placement(self) -> None:
+        """Once per replayed step: rewrite the rows of every layer whose plan changed."""
+        groups: dict[tuple[str, ...], list[int]] = {}
+        for layer_id, key in self._count_layers.items():
+            groups.setdefault(key, []).append(layer_id)
+        for key, layers in groups.items():
+            rows = self._count_rows(key)
+            if self._count_rows_last.get(key) is rows:
+                continue
+            self._write_count_rows(layers, key, rows)
+            self._count_rows_last[key] = rows
+
+    def assign_overflow_counts(self, layer_id: int, overflow: torch.Tensor, names: list[str]) -> dict:
+        """Deal this layer-step's overflow routes to the helpers by count, on the device.
+
+        Routes are ranked in order among the overflow positions, and helper ``i`` takes the
+        ranks between the row's cumulative bounds for this miss count. The last helper takes
+        every rank from its lower bound on, so each overflow route is assigned exactly once
+        even when the counts disagree with the routes (a batch where two tokens miss the
+        same expert).
+        """
+        self._helper_bounds_dev[layer_id].copy_(self._helper_bounds_host[layer_id], non_blocking=True)
+        flat = overflow.reshape(-1)
+        rank = torch.cumsum(flat.to(torch.int32), dim=0) - 1
+        row = self.num_missing_full.reshape(-1)[:1].clamp(max=self._count_width - 1)
+        bounds = self._helper_bounds_dev[layer_id].index_select(1, row).reshape(-1)
+        assignment, lower = {}, None
+        last = len(names) - 1
+        for index, name in enumerate(names):
+            mask = flat if lower is None else flat & (rank >= lower)
+            if index < last:
+                upper = bounds[index]
+                mask = mask & (rank < upper)
+                lower = upper
+            assignment[name] = mask.view(overflow.shape)
+        return assignment
+
+    def describe_count_plans(self) -> list[str]:
+        lines = []
+        for key in sorted(set(self._count_layers.values())):
+            memo = self._count_plan_memo.get(key)
+            if memo is None:
+                continue
+            plan = " ".join(f"{m}:" + "/".join(map(str, row)) for m, row in enumerate(memo[1]))
+            costs = []
+            for name in key:
+                fitted = self.cost_tracker.cost(name)
+                if fitted is not None:
+                    costs.append(f"{name} {fitted[0] * 1e3:.2f}+{fitted[1] * 1e3:.2f} ms/expert")
+            lines.append(
+                f"moe count plan (m: gpu/{'/'.join(key)}): {plan}"
+                + (f"; fitted {', '.join(costs)}" if costs else "")
+            )
+        return lines
 
     def record_event(self):
         """A stream marker for timing device work, or ``None`` where there is no device."""
@@ -959,13 +1117,20 @@ class OffloadMoeCache:
         if self.cpu_executor is not None and getattr(self.cpu_executor, "self_timed", False):
             timed.append(("cpu", self.cpu_executor))
         for name, executor in timed:
-            samples = executor.take_samples()  # always drained, so they cannot pile up
+            # always drained, so they cannot pile up; (tasks, routes, seconds) where the
+            # executor keeps totals, one task per sample where it times each layer
+            take_tasks = getattr(executor, "take_task_samples", None)
+            if take_tasks is not None:
+                samples = take_tasks()
+            else:
+                samples = [(1, routes, seconds) for routes, seconds in executor.take_samples()]
             if freeze:
                 # Diagnostic: keep this executor's rate -- and with it the division --
                 # where it stood, so a step never sees the placement move under it.
                 continue
-            for routes, seconds in samples:
+            for tasks, routes, seconds in samples:
                 self.rate_tracker.observe(name, routes, seconds, self.bytes_per_expert)
+                self.cost_tracker.observe(name, tasks, routes, seconds)
 
     def _skips_movement(self, layer_id: int) -> bool:
         """Layers whose host bank this cache can never read: the pages are gone.
@@ -1302,8 +1467,13 @@ class OffloadMoeCache:
         # becomes a node reading a fixed pinned address, which is what lets a later step
         # change the fraction without recapturing.
         self._fetch_frac_dev.copy_(self._fetch_frac_host, non_blocking=True)
+        table = None
+        if self.placement_counts and self._fetch_table_dev is not None:
+            self._fetch_table_dev[layer_id].copy_(self._fetch_table_host[layer_id], non_blocking=True)
+            table = self._fetch_table_dev
         ensure_experts_hybrid(
-            self, layer_id, expert_ids, self.hybrid_max_fetch, self._fetch_frac_dev
+            self, layer_id, expert_ids, self.hybrid_max_fetch, self._fetch_frac_dev,
+            fetch_table=table,
         )
 
     def materialize_layer(self, layer_id: int) -> None:

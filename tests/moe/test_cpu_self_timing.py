@@ -33,7 +33,7 @@ def _executor(ext):
     executor = CpuMoeExecutor.__new__(CpuMoeExecutor)  # the pool itself needs the extension
     executor._ext = ext
     executor.self_timed = hasattr(ext, "timing_counters")
-    executor._timing_last = (0, 0)
+    executor._timing_last = (0, 0, 0)
     return executor
 
 

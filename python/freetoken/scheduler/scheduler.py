@@ -153,6 +153,9 @@ class Scheduler(SchedulerIOMixin, MTPDecodeMixin):
         tracker = getattr(cache, "rate_tracker", None)
         if tracker is not None and tracker.describe():
             logger.info_rank0(f"moe executor rates: {tracker.describe()}")
+        if getattr(cache, "placement_counts", False):
+            for line in cache.describe_count_plans():
+                logger.info_rank0(line)
         # A rate is bytes over time and hides which of the two was the problem. An
         # executor that measures itself can say whether it spent the step working or
         # waiting, and that is what decides whether giving it more work would help.

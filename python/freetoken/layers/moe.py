@@ -393,10 +393,19 @@ class OffloadMoELayer(MoELayer):
         Each route is computed exactly once: the ids handed to an executor are ``-1``
         wherever a different one owns that route, and the partials are summed.
         """
+        counts = cache.placement_counts
+        capturing_now = torch.cuda.is_current_stream_capturing()
         with phase("moe.plan"):
             raw = topk_ids.clone()  # raw ids, before the kernel rewrites them to slots
             names = list(helpers)
-            shares = cache.split_shares(self.layer_id, names)
+            if counts:
+                # The device reads a plan per miss count; an eager step writes this layer's.
+                # Under capture the host rows stand as they are and the replay reads them.
+                if not capturing_now:
+                    cache.ensure_count_tables(topk_ids.numel(), len(names))
+                    cache.plan_counts_for(self.layer_id, names)
+            else:
+                shares = cache.split_shares(self.layer_id, names)
 
         # The kernel fetches this fraction of the misses; the rest overflow to the helpers.
         # Under capture this device fetches every miss, and the helpers are left with
@@ -406,12 +415,11 @@ class OffloadMoELayer(MoELayer):
         # answers, reproducibly (correct with the cap lifted, garbage with it in place, on
         # the same graph and the same worker). A helper that idles costs a doorbell; a
         # helper fed by a frozen cap costs the answer.
-        capturing_now = torch.cuda.is_current_stream_capturing()
         # Under capture the fraction written here would describe the tracing pass and then
         # stand for every replay, so capture leaves the vector alone: what a replay reads is
         # what OffloadMoeCache.refresh_placement wrote for that step, off the stream. An
         # eager step writes its own, and the two paths then agree on where the split lives.
-        if not capturing_now:
+        if not counts and not capturing_now:
             cache.set_fetch_fraction(self.layer_id, float(shares.get("gpu", 1.0)))
         with phase("moe.ensure"):
             cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot, or -1
@@ -419,9 +427,12 @@ class OffloadMoELayer(MoELayer):
                 cache.record_decode_stats_hybrid(self.layer_id)
             on_gpu = topk_ids >= 0
 
-            share_list = [(n, shares.get(n, 0.0)) for n in names]
-            owner = cache.owner_map(self.layer_id, topk_ids.shape, share_list)
-            assignment = _assign_overflow(~on_gpu, owner, share_list)
+            if counts:
+                assignment = cache.assign_overflow_counts(self.layer_id, ~on_gpu, names)
+            else:
+                share_list = [(n, shares.get(n, 0.0)) for n in names]
+                owner = cache.owner_map(self.layer_id, topk_ids.shape, share_list)
+                assignment = _assign_overflow(~on_gpu, owner, share_list)
         pending, started = {}, {}
         for name, mask in assignment.items():
             # No "is this mask empty" test: answering it needs the device to tell the host
