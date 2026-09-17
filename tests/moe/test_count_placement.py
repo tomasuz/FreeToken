@@ -59,6 +59,14 @@ def test_a_fixed_cost_holds_the_helper_back_until_the_misses_pay_for_it():
     assert all(rows[m][1] for m in range(min(used), 9))
 
 
+def test_the_main_device_keeps_its_floor_of_the_fetching():
+    floor = [int(0.3 * m + 0.5) for m in range(9)]
+    rows = plan_miss_counts(GPU, [CPU, IGPU], 8, min_main=floor)
+
+    for misses, row in enumerate(rows):
+        assert row[0] >= floor[misses] and sum(row) == misses
+
+
 def test_cost_fit_separates_the_fixed_part_from_the_part_per_expert():
     tracker = CostTracker()
     for experts in (1, 2, 4, 8, 3, 5):

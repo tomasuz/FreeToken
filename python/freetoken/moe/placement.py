@@ -282,7 +282,10 @@ def _helper_seconds(cost: ExecutorCost, count: int) -> float:
 
 
 def plan_miss_counts(
-    main: ExecutorCost, helpers: list[ExecutorCost], max_misses: int
+    main: ExecutorCost,
+    helpers: list[ExecutorCost],
+    max_misses: int,
+    min_main: list[int] | None = None,
 ) -> list[tuple[int, ...]]:
     """For every miss count ``m`` in ``[0, max_misses]``, how many each executor takes.
 
@@ -292,16 +295,27 @@ def plan_miss_counts(
     shorten the layer is not woken for nothing. The search is exhaustive; with a handful of
     helpers and a top-k of eight it is a few hundred candidates per row, computed on the
     host when the rates move, never on the decode path.
+
+    ``min_main[m]`` is the least the main device fetches at ``m`` misses. A fetch is worth
+    more than the layer it serves: the expert stays in the slot cache and the next step
+    that routes to it is a hit, which no helper's compute can buy. The makespan alone
+    cannot see that -- given a helper cheaper per expert, it hands the helper every miss,
+    the cache never warms, and every route stays a miss (measured: 100 % misses, 7.7 tok/s
+    where the proportional split ran at 11.7). The floor keeps the main device's share of
+    the fetching; the plan decides how the rest divides.
     """
     rows: list[tuple[int, ...]] = []
     n = len(helpers)
     for misses in range(max_misses + 1):
+        floor = min(misses, min_main[misses]) if min_main is not None else 0
         best_key, best = None, None
 
         def search(index: int, left: int, taken: tuple[int, ...]) -> None:
             nonlocal best_key, best
             if index == n:
                 main_count = left
+                if main_count < floor:
+                    return
                 span = main.fixed_seconds + main_count * main.per_expert_seconds
                 for cost, count in zip(helpers, taken):
                     span = max(span, _helper_seconds(cost, count))

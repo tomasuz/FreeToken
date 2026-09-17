@@ -919,7 +919,12 @@ class OffloadMoeCache:
                 return 1.0  # unmeasurable: a second per expert keeps it out of the plan
             return self.bytes_per_expert / rate.bytes_per_second
 
-        main = ExecutorCost("gpu", per_expert("gpu"), getattr(self, "_gpu_busy_seconds", 0.0))
+        busy = getattr(self, "_gpu_busy_seconds", 0.0)
+        fitted_gpu = self.cost_tracker.cost("gpu")
+        if fitted_gpu is None:
+            main = ExecutorCost("gpu", per_expert("gpu"), busy)
+        else:  # the copy is launched every layer, so its fixed part is paid regardless
+            main = ExecutorCost("gpu", fitted_gpu[1], busy + fitted_gpu[0])
         helpers = []
         for name in names:
             fitted = self.cost_tracker.cost(name)
@@ -936,16 +941,21 @@ class OffloadMoeCache:
         if _FORCE_GPU_ONLY:
             return [(m,) + (0,) * len(names) for m in range(self._count_width)]
         main, helpers = self._executor_costs(list(names))
+        # This device keeps at least its throughput share of the fetching (see min_main in
+        # plan_miss_counts): what it fetches stays cached, what a helper computes does not.
+        speeds = [1.0 / max(cost.per_expert_seconds, 1e-9) for cost in (main, *helpers)]
+        share = speeds[0] / sum(speeds)
+        min_main = [int(share * m + 0.5) for m in range(self._count_width)]
         quantum = 20e-6  # costs jitter step to step; a plan that followed the jitter would flap
         signature = tuple(
             round(min(value, 1.0) / quantum)
             for cost in (main, *helpers)
             for value in (cost.fixed_seconds, cost.per_expert_seconds)
-        )
+        ) + tuple(min_main)
         cached = self._count_plan_memo.get(names)
         if cached is not None and cached[0] == signature:
             return cached[1]
-        rows = plan_miss_counts(main, helpers, self._count_width - 1)
+        rows = plan_miss_counts(main, helpers, self._count_width - 1, min_main=min_main)
         self._count_plan_memo[names] = (signature, rows)
         return rows
 
@@ -1066,9 +1076,12 @@ class OffloadMoeCache:
 
         while self._pending_timings and self._pending_timings[0][4].query():
             start, end, gemm, count, _ = self._pending_timings.pop(0)
-            self.rate_tracker.observe(
-                "gpu", int(count.item()), start.elapsed_time(end) / 1e3, self.bytes_per_expert
-            )
+            fetched, seconds = int(count.item()), start.elapsed_time(end) / 1e3
+            self.rate_tracker.observe("gpu", fetched, seconds, self.bytes_per_expert)
+            # The fit separates the copy's launch from its cost per expert: rated as a plain
+            # average, a step that fetched one expert reads 3x slow and the plan gives this
+            # device less, which reads slower still -- until it fetches nothing at all.
+            self.cost_tracker.observe("gpu", 1, fetched, seconds)
             self._gpu_busy_seconds = end.elapsed_time(gemm) / 1e3
         if len(self._pending_timings) >= _TIMING_RING:
             # Nothing is completing, and the ring is about to be reused underneath entries
