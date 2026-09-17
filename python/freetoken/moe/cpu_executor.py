@@ -48,24 +48,29 @@ logger = init_logger(__name__)
 # raise_if_unhealthy) instead of an indefinite stream stall.
 # Caveat: the coordinator busy-polls one core while decode traffic flows (idle backoff
 # otherwise); FREETOKEN_CPU_MOE_FLAG_SYNC=0 opts out entirely.
+#
+# On HIP neither GPU-side mechanism above survives a capture. The stream memory
+# operations are silently not recorded into a graph (kernel/csrc/handshake says so), and
+# the host-func nodes fare no better: a replayed step never hands the pool its layer, the
+# engine reads back whatever an earlier eager step left in the answer buffer, and decode
+# produces fluent-looking garbage at a very good speed. So there the GPU side of the same
+# handshake is the capturable kernel pair the in-process device executor already relies
+# on (``kernel/handshake``: a doorbell kernel, a spin-wait kernel), probed by an actual
+# capture and replay before it is trusted. The coordinator does not change -- it reads and
+# writes the same 64-bit words.
 def _flag_sync_default() -> bool:
     """Whether the flag handshake is on unless asked otherwise.
 
-    Off on HIP. Not because the memory operations are missing -- they work here, and a
-    long-standing bug hid that: the resolver only ever looked for the NVIDIA driver
-    library, so on every AMD machine the probe reported "not supported" and this path was
-    dead code. Fixing the lookup turned it on for the first time, and it does not pass:
-    tests/moe/test_cpu_moe.py goes from 5 failures to 8, the three new ones being the
-    graph-replay cases this handshake exists to enable.
-
-    So the lookup stays fixed -- other callers use those operations correctly -- and this
-    particular consumer stays off where it has never been shown to work. Set
-    FREETOKEN_CPU_MOE_FLAG_SYNC=1 to opt in and find out.
+    On everywhere. On HIP the GPU side is carried by the handshake kernels rather than the
+    stream memory operations -- those do exist here, but a graph does not record them, which
+    is what the three graph-replay failures in tests/moe/test_cpu_moe.py were. Set
+    FREETOKEN_CPU_MOE_FLAG_SYNC=0 to fall back to the host-func sync, which on HIP is only
+    correct for steps that are not replayed.
     """
     explicit = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC")
     if explicit is not None:
         return explicit != "0"
-    return getattr(torch.version, "hip", None) is None
+    return True
 
 
 _FLAG_SYNC = _flag_sync_default()
@@ -73,6 +78,24 @@ _FLAG_SYNC = _flag_sync_default()
 # sizes plus any eager padded sizes); more than that is unheard of, and the overflow
 # just keeps the host-func path for the extra combos.
 _FLAG_SLOTS_PER_LAYER = 16
+
+
+def _torch_pinned(*shape: int, dtype: torch.dtype) -> torch.Tensor:
+    """Page-locked host memory from torch's own allocator.
+
+    The kernel handshake needs it: torch then knows the pages are locked and issues a real
+    asynchronous copy into them -- the copy a capture records correctly -- and the device
+    can be handed an alias of them."""
+    return torch.zeros(shape, dtype=dtype, device="cpu").pin_memory()
+
+
+def _device_alias(host: torch.Tensor, index: int) -> torch.Tensor:
+    """``host`` as a tensor on device ``index``: the same pages, no copy, not owned."""
+    from freetoken.kernel.pinned import _load_pinned_extension, tensor_from_device_ptr
+
+    with torch.cuda.device(index):
+        addr = _load_pinned_extension().host_device_ptr(host.data_ptr())
+        return tensor_from_device_ptr(addr, host.shape, host.dtype, index)
 
 # Activation ids must match ActKind in csrc/cpu_moe/cpu_moe_ext.cpp. Id 3 is the
 # clamped (up + 1) swiglu: "swigluoai" runs it in the generic GEMV epilogue,
@@ -227,7 +250,23 @@ class CpuMoeExecutor:
         # destabilizes throughput on fully-subscribed boxes).
         self._flag_sync = _FLAG_SYNC and device.type == "cuda"
         self._cpu_moe = _cpu_moe  # module ref for the decode-path memop calls
-        if self._flag_sync:
+        # HIP: the GPU side of the handshake is a kernel pair, trusted only once a capture
+        # has been seen to replay it. Without them the host-func sync remains, which a
+        # replay does not perform -- said loudly, because its failure is silent.
+        self._flag_kernels = False
+        if self._flag_sync and getattr(torch.version, "hip", None) is not None:
+            from freetoken.kernel import handshake
+
+            self._flag_kernels = handshake.replays_correctly()
+            if not self._flag_kernels:
+                logger.warning(
+                    "cpu-moe flag handshake unavailable: the handshake kernels do not replay "
+                    "here. Falling back to the host-func sync, which a captured graph does "
+                    "not perform on this runtime -- captured decode steps with CPU experts "
+                    "will be wrong. Run eager (--cuda-graph-max-bs 0) or without the CPU."
+                )
+                self._flag_sync = False
+        elif self._flag_sync:
             probe_scratch = alloc_pinned_tensor(1, dtype=torch.int64)
             probe_scratch.zero_()
             if not _cpu_moe.memops_probe(
@@ -280,6 +319,10 @@ class CpuMoeExecutor:
 
         self._io: dict[int, dict[str, torch.Tensor]] = {}
         self._tasks: dict[tuple[int, int], int] = {}
+        # Kernel handshake only (see _flag_kernels): each task's own answer region and this
+        # device's alias of it, and the tensors each slot's copies read from.
+        self._answers: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._retained: dict[tuple[int, int], tuple[torch.Tensor, ...]] = {}
 
         # Flag-based handshake: mapped-pinned ready/done/err int64 arrays (one slot per
         # (MoE layer, decode batch size) pair, allocated as tasks are created) + a
@@ -296,9 +339,12 @@ class CpuMoeExecutor:
         self._flag_slots: dict[tuple[int, int], int] = {}  # (layer_id, bs) -> slot
         self._flag_capacity = self.num_layers * _FLAG_SLOTS_PER_LAYER
         if self._flag_sync:
-            self._ready = alloc_pinned_tensor(self._flag_capacity, dtype=torch.int64)
-            self._done = alloc_pinned_tensor(self._flag_capacity, dtype=torch.int64)
-            self._err = alloc_pinned_tensor(self._flag_capacity, dtype=torch.int64)
+            # The handshake kernels address these words from the device, so they come from
+            # torch's pinned allocator, as the device executor's do.
+            flags = _torch_pinned if self._flag_kernels else alloc_pinned_tensor
+            self._ready = flags(self._flag_capacity, dtype=torch.int64)
+            self._done = flags(self._flag_capacity, dtype=torch.int64)
+            self._err = flags(self._flag_capacity, dtype=torch.int64)
             self._ready.zero_()
             self._done.zero_()
             self._err.zero_()
@@ -533,27 +579,48 @@ class CpuMoeExecutor:
     def _io_for(self, bs: int) -> dict[str, torch.Tensor]:
         io = self._io.get(bs)
         if io is None:
+            host = _torch_pinned if self._flag_kernels else alloc_pinned_tensor
             io = {
-                "x": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
-                "ids": alloc_pinned_tensor(bs, self.top_k, dtype=torch.int32),
-                "w": alloc_pinned_tensor(bs, self.top_k, dtype=torch.float32),
-                "y": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
+                "x": host(bs, self.H, dtype=torch.bfloat16),
+                "ids": host(bs, self.top_k, dtype=torch.int32),
+                "w": host(bs, self.top_k, dtype=torch.float32),
+                "y": host(bs, self.H, dtype=torch.bfloat16),
             }
             self._io[bs] = io
         return io
+
+    def _answer_for(self, layer_id: int, bs: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Kernel handshake: this task's answer region, and this device's alias of it.
+
+        One region per task rather than the batch size's shared one. The engine reads a
+        layer's answer after its wait, and the pool writes the next layer's only after the
+        next doorbell -- ordered, but only through flags that speak about the slot. A
+        region nobody else writes needs no such argument. And the read is a kernel on the
+        alias, not a copy: a copy engine is not the agent the pool's release fence orders,
+        and on this runtime a replay has been seen reading a buffer before writes it was
+        told about were visible (the device executor's lesson)."""
+        key = (layer_id, bs)
+        answer = self._answers.get(key)
+        if answer is None:
+            y = _torch_pinned(bs, self.H, dtype=torch.bfloat16)
+            index = self.device.index if self.device.index is not None else torch.cuda.current_device()
+            answer = (y, _device_alias(y, index))
+            self._answers[key] = answer
+        return answer
 
     def _task_for(self, layer_id: int, bs: int) -> int:
         key = (layer_id, bs)
         task = self._tasks.get(key)
         if task is None:
             io = self._io_for(bs)
+            y = self._answer_for(layer_id, bs)[0] if self._flag_kernels else io["y"]
             task = self._ext.create_task(
                 layer_id,
                 bs,
                 io["x"].data_ptr(),
                 io["ids"].data_ptr(),
                 io["w"].data_ptr(),
-                io["y"].data_ptr(),
+                y.data_ptr(),
             )
             self._tasks[key] = task
             # Allocate this (layer, bs) combo a flag slot and register its task with the
@@ -606,6 +673,30 @@ class CpuMoeExecutor:
 
             hidden_states = act_quant_fp8_roundtrip(hidden_states, block=128)
 
+        if self._flag_kernels:
+            # Hold the sources for the life of the task. A capture turns each copy into a
+            # node reading a fixed address, and a cast makes a temporary the allocator can
+            # hand to something else in the same graph -- every replay would then copy
+            # whatever lives there by then.
+            ids32 = topk_ids.to(torch.int32).contiguous()
+            w32 = topk_weights.to(torch.float32).contiguous()
+            x_src = hidden_states.contiguous()
+            self._retained[(layer_id, bs)] = (x_src, ids32, w32)
+            io["x"].copy_(x_src, non_blocking=True)
+            io["ids"].copy_(ids32, non_blocking=True)
+            io["w"].copy_(w32, non_blocking=True)
+            task = self._task_for(layer_id, bs)
+            slot = self._flag_slots.get((layer_id, bs))
+            if slot is not None:
+                from freetoken.kernel import handshake
+
+                # done[slot] = 0, ready[slot] = 1 -- from a kernel, which a graph records.
+                handshake.doorbell(self._done.data_ptr(), self._ready.data_ptr(), slot)
+                return (bs, task, None, slot, layer_id)
+            # Past the slot capacity: the host-func sync, eager only on this runtime.
+            self._ext.submit_with_cuda_stream(torch.cuda.current_stream().cuda_stream, task)
+            return (bs, task, torch.empty_like(hidden_states), None, layer_id)
+
         # D2H: ship this step's activations + routing to pinned host memory.
         io["x"].copy_(hidden_states, non_blocking=True)
         io["ids"].copy_(topk_ids.to(torch.int32), non_blocking=True)
@@ -624,13 +715,24 @@ class CpuMoeExecutor:
         else:
             stream = torch.cuda.current_stream().cuda_stream
             self._ext.submit_with_cuda_stream(stream, task)
-        return (bs, task, out, slot)
+        return (bs, task, out, slot, layer_id)
 
     def decode_sync(self, pending: tuple) -> torch.Tensor:
         """Issue the CPU-pool sync + the H2D result copy for a prior :meth:`decode_submit`,
         and return the GPU output tensor. With flag-sync the wait is a front-end stream
-        memop on done[slot] (set by the CPU coordinator); otherwise a cudaLaunchHostFunc."""
-        bs, task, out, slot = pending
+        memop on done[slot] (set by the CPU coordinator), or on HIP the handshake's
+        spin-wait kernel followed by a kernel read of the answer; otherwise a
+        cudaLaunchHostFunc."""
+        bs, task, out, slot, layer_id = pending
+        if self._flag_kernels and slot is not None:
+            from freetoken.kernel import handshake
+
+            handshake.wait(self._done.data_ptr(), slot)
+            y_near = self._answer_for(layer_id, bs)[1]
+            answer = torch.empty((bs, self.H), dtype=y_near.dtype, device=y_near.device)
+            # A kernel read, ordered against the wait above like any other kernel.
+            torch.mul(y_near, 1.0, out=answer)
+            return answer
         if slot is not None:
             # Front-end WAIT(done[slot] >= 1): blocks this stream's later nodes without
             # occupying an SM, so GPU utilization stays truthful during the CPU window.
@@ -640,8 +742,10 @@ class CpuMoeExecutor:
         else:
             stream = torch.cuda.current_stream().cuda_stream
             self._ext.sync_with_cuda_stream(stream, task)
-        io = self._io[bs]
-        out.copy_(io["y"], non_blocking=True)
+        # Under the kernel handshake every task writes its own answer region, including the
+        # ones past the slot capacity that fell back to the host-func sync.
+        y = self._answer_for(layer_id, bs)[0] if self._flag_kernels else self._io[bs]["y"]
+        out.copy_(y, non_blocking=True)
         return out
 
     def take_task_samples(self) -> list[tuple[int, int, float]]:

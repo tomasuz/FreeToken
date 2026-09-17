@@ -509,6 +509,68 @@ def test_cpu_moe_decode_cuda_graph_replay():
     print("cpu moe cuda graph replay OK")
 
 
+def test_cpu_moe_replay_runs_every_layer_of_the_step():
+    """A decode graph runs many layers, one after another, through one pool.
+
+    The single-layer replay above cannot see an answer read before the pool has written it,
+    or a layer reading the buffer the next layer has just overwritten -- one layer has no
+    neighbour. Several layers, each routed differently and fed from the previous one, can:
+    on HIP the host-func sync replayed to stale answers exactly this way, and decode looked
+    fluent while being wrong. On HIP the kernel handshake must be the one in use.
+    """
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    torch.manual_seed(1)
+    L, E, H, I, top_k, bs = 4, 8, 512, 256, 2, 1
+    cache = _make_cache(L, E, H, I)
+    dev = torch.device("cuda")
+    ex = CpuMoeExecutor(cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+                        num_threads=0, max_tokens=bs, device=dev)
+    if getattr(torch.version, "hip", None) is not None and ex._flag_sync:
+        assert ex._flag_kernels, "HIP must carry the handshake on the capturable kernels"
+
+    hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
+    ids = torch.randint(0, E, (L, bs, top_k), device=dev, dtype=torch.int32)
+    w = torch.rand(L, bs, top_k, device=dev, dtype=torch.float32)
+
+    def step():
+        x, outs = hidden, []
+        for layer in range(L):
+            y = ex.decode(layer, x, w[layer], ids[layer])
+            outs.append(y)
+            x = (x + y).to(torch.bfloat16)  # the next layer reads this layer's answer
+        return outs
+
+    def reference(h, ids_now, w_now):
+        x, outs = h.float(), []
+        for layer in range(L):
+            y = _reference(cache, layer, x.bfloat16(), ids_now[layer], w_now[layer])
+            outs.append(y)
+            x = (x + y).bfloat16().float()
+        return outs
+
+    step()  # eager: materializes buffers, tasks and slots
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = step()
+    torch.cuda.synchronize()
+
+    for it in range(3):
+        torch.manual_seed(200 + it)
+        new_hidden = torch.randn(bs, H, dtype=torch.bfloat16)
+        new_ids = torch.randint(0, E, (L, bs, top_k), dtype=torch.int32)
+        new_w = torch.rand(L, bs, top_k, dtype=torch.float32)
+        hidden.copy_(new_hidden)
+        ids.copy_(new_ids)
+        w.copy_(new_w)
+        graph.replay()
+        torch.cuda.synchronize()
+        for layer, (got, want) in enumerate(zip(captured, reference(new_hidden, new_ids, new_w))):
+            rel = (got.float().cpu() - want).abs().max() / want.abs().max()
+            assert rel < 2e-2, f"replay {it} layer {layer} rel err {rel}"
+
+
 def test_cpu_moe_decode_cuda_graph_replay_mxfp4():
     """gpt-oss mxfp4 path under capture/replay: the host nodes must recompute the
     clamped-swiglu+bias GEMV from the freshly written pinned routing on each replay."""
