@@ -811,26 +811,42 @@ class OffloadMoeCache:
         are already node inputs (the owner map's pinned host buffer, the fetch fraction
         vector), so a step only has to rewrite the host bytes; the replay picks them up.
 
-        Called once per step from outside the graph, where measuring and dividing are host
-        work that costs nothing on the stream. Layers with no helper are skipped -- there is
+        Called once per step from outside the graph. That keeps the work off the stream, but
+        not free: the replay is not launched until this returns, so every microsecond here
+        is a microsecond on every token. Layers with no helper are skipped -- there is
         nothing to divide, and the plain path must stay free of any of this.
+
+        The division is computed once per distinct set of helpers, not once per layer. It
+        depends on which executors take part and on the rates they share, and on nothing
+        about the layer, so layers with the same helpers get the same answer. Recomputing
+        it for each of forty layers was ~4 ms of host time in front of a ~25 ms step.
         """
         from freetoken.layers.moe import _fill_owner_map
 
         if not self._owner_maps:
             return
+        # helper names -> (labelled shares, their rounded signature, fetch fraction in Q16)
+        splits: dict[tuple[str, ...], tuple[list, tuple, int]] = {}
         for (layer_id, _shape), entry in self._owner_maps.items():
             helpers = self.split_helpers(layer_id)
             if not helpers:
                 continue
-            shares = self.split_shares(layer_id, list(helpers))
-            share_list = [(name, shares.get(name, 0.0)) for name in helpers]
-            current = tuple(round(w, 3) for _, w in share_list)
+            key = tuple(helpers)
+            split = splits.get(key)
+            if split is None:
+                shares = self.split_shares(layer_id, list(helpers))
+                share_list = [(name, shares.get(name, 0.0)) for name in helpers]
+                gpu = shares.get("gpu", 1.0)
+                split = splits[key] = (
+                    share_list,
+                    tuple(round(w, 3) for _, w in share_list),
+                    min(1 << 16, max(0, round(gpu * (1 << 16)))),
+                )
+            share_list, current, fraction = split
             if current != entry[2]:
                 _fill_owner_map(entry[0], share_list)
                 entry[2] = current
-            gpu = shares.get("gpu", 1.0)
-            self._fetch_frac_host[layer_id] = min(1 << 16, max(0, round(gpu * (1 << 16))))
+            self._fetch_frac_host[layer_id] = fraction
 
     def record_event(self):
         """A stream marker for timing device work, or ``None`` where there is no device."""
@@ -895,6 +911,9 @@ class OffloadMoeCache:
         The main device is named ``"gpu"`` and is always in the split: it is the one
         executor that is always present, and the fraction it gets is what the capped-fetch
         kernel is told to fetch.
+
+        ``layer_id`` does not enter the answer; :meth:`refresh_placement` relies on that to
+        divide once per set of helpers rather than once per layer.
         """
         from freetoken.moe.placement import split_misses
 
