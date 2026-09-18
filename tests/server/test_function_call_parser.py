@@ -262,6 +262,54 @@ def test_parser_accepts_family_specific_tool_call_shapes(
     assert json.loads(result.calls[0].parameters) == expected_args
 
 
+def test_glm_call_is_parsed_when_the_turn_ended_before_the_closing_tag():
+    """GLM-4.5-Air ends the turn straight after the last </arg_value>.
+
+    The closing </tool_call> the template asks for is never generated, so a parser that
+    insists on the pair reports no calls at all while the text plainly holds a complete
+    one -- which is what tm served for both GLM-4.5-Air checkpoints until 2026-09-18.
+    """
+    parser = FunctionCallParser(TOOLS, tool_call_parser="glm47")
+
+    result = parser.parse_non_stream(
+        "I'll check that for you.\n"
+        "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Vilnius</arg_value>"
+    )
+
+    assert result.normal_text == "I'll check that for you."
+    assert len(result.calls) == 1
+    assert result.calls[0].name == "get_weather"
+    assert json.loads(result.calls[0].parameters) == {"city": "Vilnius"}
+
+
+def test_glm_unterminated_call_cut_mid_argument_yields_no_call():
+    """Half an argument is not a call.
+
+    A turn stopped by max_tokens can end anywhere, and closing such a fragment would hand
+    the caller a value the model never finished writing. Balanced argument tags are what
+    separate "finished, closer missing" from "cut off".
+    """
+    parser = FunctionCallParser(TOOLS, tool_call_parser="glm47")
+
+    result = parser.parse_non_stream(
+        "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Viln"
+    )
+
+    assert result.calls == []
+
+
+def test_glm_closed_call_is_unaffected():
+    """The well-formed shape keeps parsing exactly as before."""
+    parser = FunctionCallParser(TOOLS, tool_call_parser="glm47")
+
+    result = parser.parse_non_stream(
+        "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Kaunas</arg_value>\n</tool_call>"
+    )
+
+    assert len(result.calls) == 1
+    assert json.loads(result.calls[0].parameters) == {"city": "Kaunas"}
+
+
 # --------------------------------------------------------------------------- #
 # Streaming incremental parsing (parse_stream_chunk)
 # --------------------------------------------------------------------------- #

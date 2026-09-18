@@ -1270,6 +1270,7 @@ class Glm47Detector(BaseFormatDetector):
         :param tools: List of available tools.
         :return: StreamingParseResult with normal_text and parsed calls.
         """
+        text = self._close_unterminated(text)
         idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx != -1 else text
 
@@ -1320,6 +1321,34 @@ class Glm47Detector(BaseFormatDetector):
     _G_KEY_CLOSE = "</arg_key>"
     _G_VAL_OPEN = "<arg_value>"
     _G_VAL_CLOSE = "</arg_value>"
+
+    def _close_unterminated(self, text: str) -> str:
+        """Close a final tool call the generation stopped in the middle of.
+
+        Both block regexes want a ``<tool_call>`` and its ``</tool_call>``, and a turn that
+        ends without the closer therefore parses to nothing at all. That is not a corner
+        case: on GLM-4.5-Air (both the 106B and the REAP-82B) every single tool call arrives
+        this way -- the name and every argument complete, then the turn-ending token instead
+        of the closing tag -- so ``tool_calls`` came back null while the text plainly held
+        the call. Measured on tm, 2026-09-18, on three shapes including tool_choice=required.
+
+        Only the LAST opener can be the unterminated one: an earlier opener with no closer
+        would mean two calls are interleaved, which this format cannot express.
+
+        The tail is closed only when its argument tags are balanced. Ending mid-argument
+        means the text was cut (max_tokens, an abort) rather than finished, and inventing a
+        call out of half an argument is worse than reporting none -- the caller would act on
+        a value the model never finished writing.
+        """
+        last = text.rfind(self.bot_token)
+        if last == -1 or self.eot_token in text[last:]:
+            return text
+        tail = text[last:]
+        if tail.count(self._G_KEY_OPEN) != tail.count(self._G_KEY_CLOSE):
+            return text
+        if tail.count(self._G_VAL_OPEN) != tail.count(self._G_VAL_CLOSE):
+            return text
+        return text + self.eot_token
 
     def _g_reset(self) -> None:
         self._g_mode = "idle"  # idle|name|invoke|invoke_skip|key|key_skip|preval|preval_skip|pstr|pbuf|pskip
