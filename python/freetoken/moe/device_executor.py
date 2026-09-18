@@ -45,7 +45,14 @@ from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
 
-_SLOTS = 64  # (layer, batch) pairs a decode ever asks for; one flag word each
+# Handshake slots: one per (layer, batch) shape this device is ever asked for, claimed on
+# first sight and never released. The count has to scale with the LAYER COUNT, not be a flat
+# number -- every MoE layer takes a slot for each decode shape, so a 45-layer model exhausts
+# a flat 64 the moment a second batch shape appears, and the engine dies mid-run with
+# "ran out of handshake slots" (GLM-4.5-Air on tm, 2026-09-18, 45 minutes into a run).
+# The CPU pool already sizes its flags this way; this is the same arithmetic.
+_SLOTS_PER_LAYER = 4
+_SLOTS_MIN = 64
 
 
 def _nvfp4_call(banks: dict, x, w, ids, activation, act_fn, bufs=None):
@@ -146,6 +153,9 @@ class DeviceMoeExecutor:
 
         h, k, b = int(hidden_size), int(top_k), max(1, int(max_batch))
         self._top_k = k
+        # Sized from this model's layer count (see _SLOTS_PER_LAYER). Each slot costs one
+        # answer region, b x h bf16, so the whole table stays in the tens of MB.
+        _SLOTS = self._n_slots = max(_SLOTS_MIN, len(self.layers) * _SLOTS_PER_LAYER)
         # The hand-over, in memory both devices reach, at addresses that do not move: a
         # captured graph records them and every replay must find the same ones.
         self._x = _pinned((b, h), torch.bfloat16)
@@ -330,10 +340,12 @@ class DeviceMoeExecutor:
         key = (int(layer_id), int(bs))
         slot = self._slots.get(key)
         if slot is None:
-            if self._next_slot >= _SLOTS:
+            if self._next_slot >= self._n_slots:
                 raise RuntimeError(
-                    f"in-process device executor ran out of handshake slots ({_SLOTS}): "
-                    f"more (layer, batch) shapes than it was built for"
+                    f"in-process device executor ran out of handshake slots "
+                    f"({self._n_slots} = {len(self.layers)} layers x {_SLOTS_PER_LAYER}): this "
+                    f"model asked for more distinct (layer, batch) shapes than that. Raise "
+                    f"_SLOTS_PER_LAYER; each slot costs one b x hidden bf16 answer region."
                 )
             slot = self._slots[key] = self._next_slot
             self._next_slot += 1
