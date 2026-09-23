@@ -947,6 +947,11 @@ class OffloadMoeCache:
                 elapsed = time.perf_counter() - started
                 best = elapsed if best is None else min(best, elapsed)
             self.cost_tracker.observe("gpu", 1, count, best)
+            # Feed the shares path too. It reads rate_tracker, which is filled only by
+            # note_step_timing -- and that lives inside the captured region, so under a
+            # graph-driven decode it never runs again after the warm-up. Without this the
+            # counts path got a measured fetch and the shares path kept the warm-up guess.
+            self.rate_tracker.observe("gpu", count, best, self.bytes_per_expert)
         del scratch
         self._fetch_calibrated = True
 
@@ -1153,11 +1158,24 @@ class OffloadMoeCache:
             # device, so a wrong answer can be attributed to the split itself rather than
             # to what the other executors did with their share.
             return {name: (1.0 if name == "gpu" else 0.0) for name in names}
+        # Measure this device's fetch directly, once, the same way the counts path does.
+        # Self-guarded, and refresh_placement -- the only caller -- runs outside the graph.
+        self.calibrate_fetch_cost()
         # The GEMM this device owes regardless of the split is time it starts the step
         # already committed to, so it is given proportionally fewer misses.
-        rates = self.rate_tracker.rates(
-            names, busy={"gpu": getattr(self, "_gpu_busy_seconds", 0.0)}
-        )
+        busy = getattr(self, "_gpu_busy_seconds", 0.0)
+        if self._fetch_calibrated:
+            # ...but only when that figure means something. It is written by
+            # note_step_timing, which lives inside the captured region and so never runs
+            # again once decode is driven by replays: what it holds was measured in the
+            # eager warm-up, the very window calibrate_fetch_cost exists to distrust --
+            # there one expert read 9.4 ms against a real 0.7. An inflated "already
+            # committed" figure makes this device look busier than it is and pushes misses
+            # onto the helpers; on tm that showed as the iGPU being the long pole (2.68 ms
+            # against the dGPU's 1.9) while the dGPU sat at 37 % utilisation. Omitting an
+            # unknown is better than using a wrong one.
+            busy = 0.0
+        rates = self.rate_tracker.rates(names, busy={"gpu": busy})
         # A large nominal count keeps rounding out of the ratio; the kernel and the route
         # assignment both work in fractions, so only the proportions matter here.
         placement = split_misses(rates, 1024, self.bytes_per_expert)
