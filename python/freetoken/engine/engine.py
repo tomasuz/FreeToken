@@ -289,6 +289,21 @@ def _materialize_loaded_weight_state_dict(
     return state_dict
 
 
+def _max_decode_batch(config) -> int:
+    """Largest batch the MoE helper executors can ever be handed.
+
+    Both DeviceMoeExecutor and WorkerMoeExecutor expose only ``decode_submit`` /
+    ``decode_sync``; the prefill path (``prefill_forward``) never reaches them. So the
+    bound is the decode batch, not ``max_extend_tokens`` -- and the difference is not
+    cosmetic: every helper keeps ONE ANSWER REGION PER HANDSHAKE SLOT, sized
+    ``max_batch x hidden``. Sizing those by the prefill chunk (512) made each slot cost
+    4 MiB of pinned host memory, so raising the slot count to cover a 45-layer model
+    added ~470 MiB and the model stopped loading on a RAM-tight host (tm, 2026-09-18).
+    """
+    return max(1, int(getattr(config, "cuda_graph_max_bs", None) or 0),
+               int(getattr(config, "max_running_req", 1) or 1))
+
+
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
@@ -961,7 +976,7 @@ class Engine:
                 quant_format=cache.quant_format,
                 hidden_size=config.model_config.hidden_size,
                 top_k=config.model_config.num_experts_per_tok,
-                max_batch=max(1, int(config.max_extend_tokens or 1)),
+                max_batch=_max_decode_batch(config),
                 activation=getattr(config.model_config, "hidden_act", "silu"),
                 serves_layers=ids,
             )
@@ -1020,7 +1035,7 @@ class Engine:
             )
             for dev, spec in _parse_per_device(config.moe_worker_env, "--moe-worker-env").items()
         }
-        max_batch = max(1, int(config.max_extend_tokens or 1))
+        max_batch = _max_decode_batch(config)
         model_config = config.model_config
         slots = _parse_worker_slots(config.moe_worker_slots, sorted(worker_layers))
         from freetoken.moe.worker_executor import SharedBankCatalogue

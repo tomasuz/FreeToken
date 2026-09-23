@@ -153,6 +153,7 @@ class DeviceMoeExecutor:
 
         h, k, b = int(hidden_size), int(top_k), max(1, int(max_batch))
         self._top_k = k
+        self._max_batch = b
         # Sized from this model's layer count (see _SLOTS_PER_LAYER). Each slot costs one
         # answer region, b x h bf16, so the whole table stays in the tens of MB.
         _SLOTS = self._n_slots = max(_SLOTS_MIN, len(self.layers) * _SLOTS_PER_LAYER)
@@ -646,6 +647,16 @@ class DeviceMoeExecutor:
             ) from self._error
 
         bs = hidden_states.shape[0]
+        if bs > self._max_batch:
+            # The per-slot answer regions are sized for the DECODE batch (see
+            # _max_decode_batch in engine.py): this executor has no prefill path, so a
+            # larger batch means the engine's assumption changed. Say so plainly rather
+            # than letting a copy fail with a shape error inside a graph capture.
+            raise RuntimeError(
+                f"in-process device executor was handed a batch of {bs}, but its buffers "
+                f"are sized for {self._max_batch} (the decode bound). Either the decode "
+                f"batch grew or a prefill reached decode_submit."
+            )
         slot = self._slot_for(layer_id, bs)
         self._views_for(layer_id)  # an address, taken before a capture can forbid asking
 
