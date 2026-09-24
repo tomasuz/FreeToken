@@ -562,6 +562,14 @@ torch::Tensor ggml_moe_a8_vec(
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
   at::Tensor Y = torch::zeros({tokens * top_k, row}, options);
   hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  // A 3-D [experts, rows, row_bytes] bank may be a strided view: a slot cache sized for the
+  // widest layer, seen with one narrower layer's rows. Rows must stay packed within an expert.
+  int64_t expert_stride = -1;
+  if (W.dim() == 3) {
+    TORCH_CHECK(W.stride(2) == 1 && W.stride(1) == W.size(2),
+                "ggml_moe_a8_vec: rows of one expert must be packed");
+    expert_stride = W.stride(0) * W.element_size();
+  }
   options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
   at::Tensor quant_X = torch::empty({tokens, padded / 32 * 9}, options);
   DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_vec_a8", [&] {
@@ -578,6 +586,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
       case 3:
@@ -591,6 +600,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
       case 6:
@@ -604,6 +614,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
       case 7:
@@ -617,6 +628,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
       case 8:
@@ -630,6 +642,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
       case 10:
@@ -643,6 +656,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
       case 11:
@@ -656,6 +670,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
       case 12:
@@ -669,6 +684,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
       case 13:
@@ -682,6 +698,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
       case 14:
@@ -695,6 +712,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
       case 16:
@@ -708,6 +726,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
       case 17:
@@ -721,6 +740,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
       case 18:
@@ -734,6 +754,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
       case 19:
@@ -747,6 +768,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
       case 20:
@@ -760,6 +782,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
       case 21:
@@ -773,6 +796,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
       case 22:
@@ -786,6 +810,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
       case 23:
@@ -799,6 +824,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
       case 29:
@@ -812,6 +838,7 @@ torch::Tensor ggml_moe_a8_vec(
             col,
             row,
             quant_X.stride(0),
+            expert_stride,
             stream);
         break;
     }

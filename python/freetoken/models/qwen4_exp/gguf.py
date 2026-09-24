@@ -170,10 +170,126 @@ def _hf_like_config(shim: "GgufConfigShim") -> types.SimpleNamespace:
     )
 
 
+def _expert_types(model_path: str, num_layers: int) -> tuple[tuple[int, int], ...]:
+    """Per layer ``(gate_up type, down type)`` of the routed experts. The ggml type is per
+    tensor, and unsloth's UD quants vary it by layer; gate and up must agree (one bank)."""
+    from freetoken.models.gguf.reader import _reader, gguf_shard_paths
+
+    types = {t.name: int(t.tensor_type) for p in gguf_shard_paths(model_path) for t in _reader(p).tensors}
+    out = []
+    for layer in range(num_layers):
+        gate, up, down = (types.get(f"blk.{layer}.{sfx}") for sfx in _EXPERT_SUFFIXES)
+        if None in (gate, up, down):
+            raise ValueError(f"qwen4exp GGUF: layer {layer} lacks routed-expert tensors")
+        if gate != up:
+            raise ValueError(
+                f"qwen4exp GGUF: layer {layer} gate is {GGML_NAME.get(gate, gate)} but up is "
+                f"{GGML_NAME.get(up, up)}; they share one bank, so they must match"
+            )
+        out.append((gate, down))
+    return tuple(out)
+
+
 def parse_gguf_config(shim: "GgufConfigShim") -> "ModelConfig":
+    import dataclasses
+
     from .config import parse_config
 
-    return parse_config(_hf_like_config(shim))
+    cfg = parse_config(_hf_like_config(shim))
+    # The routed experts stream from the offload cache as their native ggml bytes, each
+    # layer at its own type; everything dense was dequantized at load (iter_gguf_weights).
+    return dataclasses.replace(
+        cfg, expert_quant="gguf", gguf_expert_types=_expert_types(shim.model_path, cfg.num_layers)
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Routed experts: per-layer host banks of native ggml bytes, for the offload cache
+# --------------------------------------------------------------------------------------
+
+
+def _expert_bank_specs(cfg: "ModelConfig") -> list[dict]:
+    from freetoken.gguf_quant import row_bytes
+
+    E, H, I = cfg.num_experts, cfg.hidden_size, cfg.moe_intermediate_size
+    return [
+        {
+            "gate_up": ((E, 2 * I, row_bytes(H, gate_up)), torch.uint8),
+            "down": ((E, H, row_bytes(I, down)), torch.uint8),
+        }
+        for gate_up, down in cfg.gguf_expert_types
+    ]
+
+
+def load_q4_0_expert_sources(model_path: str, config: "ModelConfig", *, layer_sink=None) -> dict[str, list[torch.Tensor]]:
+    """Per-layer host banks of the routed experts' packed ggml bytes (the name is the loader
+    hook's, from when every GGUF expert was Q4_0).
+
+    ``gate_up`` is one ``[E, 2I, row_bytes(H)]`` tensor per layer, gate rows then up rows of
+    each expert -- the order the MoE kernel's activation splits; ``down`` is
+    ``[E, H, row_bytes(I)]``. Rows are copied verbatim from the file (no dequant), each
+    layer at its own ggml type (``config.gguf_expert_types``). ``layer_sink`` as in
+    :func:`freetoken.models.gemma4.gguf.load_q4_0_expert_sources`.
+    """
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_varying_layer_banks
+
+    from freetoken.distributed import get_tp_info
+
+    if get_tp_info().size > 1:
+        raise NotImplementedError("qwen4exp GGUF expert banks support TP=1 only")
+    L, E, I = config.num_layers, config.num_experts, config.moe_intermediate_size
+    hb = alloc_varying_layer_banks(_expert_bank_specs(config))  # lazy anon mmaps (unpinned)
+    banks = {name: [b.tensor for b in hb[name]] for name in hb}
+    seen: dict[str, set[int]] = {sfx: set() for sfx in _EXPERT_SUFFIXES}
+
+    def _load(sink) -> None:
+        tracker = LayerCompletionTracker(3, hb, sink) if sink is not None else None  # gate, up, down
+        for t in iter_gguf_tensors(model_path):
+            sfx = t.name.split(".", 2)[2] if t.name.startswith("blk.") else None
+            if sfx not in seen:
+                continue
+            layer = int(t.name.split(".")[1])
+            gate_up_type, down_type = config.gguf_expert_types[layer]
+            if sfx == "ffn_down_exps.weight":
+                assert t.ggml_type == down_type, (t.name, t.ggml_type, down_type)
+                bank = banks["down"][layer]
+                bank.copy_(t.packed().reshape(bank.shape))
+            else:
+                assert t.ggml_type == gate_up_type, (t.name, t.ggml_type, gate_up_type)
+                bank = banks["gate_up"][layer]
+                half = slice(0, I) if sfx == "ffn_gate_exps.weight" else slice(I, 2 * I)
+                bank[:, half].copy_(t.packed().reshape(E, I, bank.shape[-1]))
+            seen[sfx].add(layer)
+            if tracker is not None:
+                tracker.note(layer)
+
+    if layer_sink is not None:
+        _load(layer_sink)
+    elif torch.cuda.is_available():
+        with PinPipeline() as pins:
+            _load(pins)
+    else:
+        _load(None)
+
+    want = set(range(L))
+    missing = {sfx: sorted(want - got) for sfx, got in seen.items() if got != want}
+    assert not missing, f"qwen4exp GGUF: missing routed-expert layers {missing}"
+    return banks
+
+
+def dummy_q4_0_expert_sources(config: "ModelConfig") -> dict[str, list[torch.Tensor]]:
+    """Zeroed banks shaped like :func:`load_q4_0_expert_sources` (a zero block scale is a
+    valid all-zero block in every ggml type, where random bytes could decode to NaN)."""
+    from freetoken.moe.host_banks import alloc_varying_layer_banks, pin_banks
+
+    hb = alloc_varying_layer_banks(_expert_bank_specs(config))
+    banks = {name: [b.tensor for b in hb[name]] for name in hb}
+    for t in banks["gate_up"] + banks["down"]:
+        t.zero_()
+    if torch.cuda.is_available():
+        pin_banks(hb)
+    return banks
 
 
 # --------------------------------------------------------------------------------------
@@ -390,4 +506,10 @@ def iter_gguf_weights(
             yield f"{prefix}.{attr}", torch.tensor([int(x) for x in meta[f"{_ARCH}.{key}"]], dtype=torch.int64)
 
 
-__all__ = ["PLE_TABLE_TENSOR", "iter_gguf_weights", "parse_gguf_config"]
+__all__ = [
+    "PLE_TABLE_TENSOR",
+    "dummy_q4_0_expert_sources",
+    "iter_gguf_weights",
+    "load_q4_0_expert_sources",
+    "parse_gguf_config",
+]

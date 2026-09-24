@@ -626,6 +626,20 @@ class OffloadMoELayer(MoELayer):
                 hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill
             )
         fmt = cache.quant_format
+        if fmt == "gguf":
+            # Native GGUF experts whose ggml type varies by layer (and by projection): slot
+            # rows are the widest layer's, so read them at this layer's width and types.
+            # Resident banks are already this layer's own [E, rows, row_bytes].
+            from freetoken.moe.fused_q4_0 import fused_experts_gguf
+
+            gate_up, down = views
+            if gate_up.dim() == 2:
+                gate_up, down = cache.layer_bank_views(self.layer_id, n)
+            gate_up_type, down_type = cache.gguf_layer_types[self.layer_id]
+            return fused_experts_gguf(
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation,
+                gate_up_type, down_type=down_type,
+            )
         if fmt in GGUF_EXPERT_FORMATS:
             # Native GGUF experts (any ggml quant the borrowed kernels dispatch):
             # dequant-in-kernel grouped GEMV (MMVQ) over the streamed packed banks;

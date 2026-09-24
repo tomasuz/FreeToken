@@ -27,10 +27,16 @@ def fused_experts_gguf(
     activation: str,
     ggml_type: int,
     act_fn=None,
+    *,
+    down_type: int | None = None,
 ) -> torch.Tensor:
     """``act_fn`` overrides the activation implementation for callers that cannot use the
     compiled one -- a worker process on a device Triton has no backend for, say. ``None``
-    keeps the default lookup, so nothing changes for anyone who does not ask."""
+    keeps the default lookup, so nothing changes for anyone who does not ask.
+
+    ``down_type`` is the down projection's ggml type when it differs from gate/up's
+    (unsloth's UD quants: IQ3_XXS gate/up over an IQ4_NL or Q8_0 down); ``None`` means the
+    same. The banks may be strided views -- a slot cache sized for the widest layer."""
     from freetoken.kernel.gguf import ggml_moe_a8_vec
 
     if act_fn is None:
@@ -43,12 +49,13 @@ def fused_experts_gguf(
     h = down_q.shape[1]  # hidden
     top_k = topk_ids.shape[1]
     qt = int(ggml_type)
+    qt_down = qt if down_type is None else int(down_type)
 
     # gate_up: [num_tokens*top_k, 2I] -> activation -> [num_tokens*top_k, I]
     gate_up = ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens)
     inter = act_fn(gate_up)
     # down: each of the num_tokens*top_k intermediate rows uses its own expert id.
-    out = ggml_moe_a8_vec(inter, down_q, topk_ids, 1, qt, h, num_tokens * top_k)
+    out = ggml_moe_a8_vec(inter, down_q, topk_ids, 1, qt_down, h, num_tokens * top_k)
     out = out.reshape(num_tokens, top_k, h) * topk_weights.reshape(num_tokens, top_k, 1).to(
         out.dtype
     )

@@ -47,6 +47,10 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # native GGUF Q4_0 experts: packed block bytes per output row, dequantized inside
     # the borrowed ggml MoE kernels. gate_up [L*E, 2I, H//32*18], down [L*E, H, I//32*18].
     "q4_0": ("gate_up", "down"),
+    # native GGUF experts whose layers use different ggml types (unsloth's UD mixes): the
+    # same two banks, but each layer's [E, rows, row_bytes] shape is its own. A slot holds
+    # the widest layer's expert; each layer reads it through a view of its own width.
+    "gguf": ("gate_up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -192,6 +196,19 @@ class OffloadMoeCache:
         # Layers a worker reads where they lie. Like the CPU layers, these need no device
         # address from this process -- the difference is only which executor computes them.
         self.inplace_layer_ids: frozenset = frozenset()
+        # Per-layer (gate_up, down) ggml types of "gguf" banks; set by the engine.
+        self.gguf_layer_types: list[tuple[int, int]] | None = None
+        # "gguf" only: each bank's per-layer [rows, row_bytes] (the slot is the widest).
+        self.bank_layer_shapes: dict[str, list[tuple[int, ...]]] = {}
+        if self.quant_format == "gguf" and (self.prefill_overlap or self.prefill_hit_d2d):
+            # Both move whole layers or hit rows at one fixed width; materialize +
+            # copy_missing are the paths that honor a width per layer.
+            logger.info_rank0(
+                "MoE gguf experts: layer row widths differ, so prefill overlap and the hit-D2D "
+                "gather are off (prefill materializes each layer)"
+            )
+            self.prefill_overlap = False
+            self.prefill_hit_d2d = False
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size)
         assert not self.prefill_overlap or self.cache_size >= 2 * self.num_experts, (
@@ -457,19 +474,46 @@ class OffloadMoeCache:
                     continue  # released host bank: shape is still right, the pages are not there
                 assert source.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
                 assert source.size(0) == self.num_experts, (name, layer_id, source.shape)
-                assert source.shape == head.shape and source.dtype == head.dtype, (
-                    name, layer_id, source.shape, source.dtype,
-                )
+                if self.quant_format == "gguf":
+                    # packed ggml rows; the row width is the layer's own
+                    assert source.dtype == torch.uint8 and source.dim() == 3, (
+                        name, layer_id, source.shape, source.dtype,
+                    )
+                else:
+                    assert source.shape == head.shape and source.dtype == head.dtype, (
+                        name, layer_id, source.shape, source.dtype,
+                    )
             self.bank_sources[name] = list(per_layer)
-            self.bank_caches[name] = torch.empty(
-                (self.cache_size, *head.shape[1:]),
-                dtype=head.dtype,
-                device=self.device,
-            )
+            if self.quant_format == "gguf":
+                self.bank_layer_shapes[name] = [tuple(t.shape[1:]) for t in per_layer]
+            self.bank_caches[name] = self._alloc_slot_cache(name, self.cache_size)
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+
+    def _alloc_slot_cache(self, name: str, cache_size: int) -> torch.Tensor:
+        """One bank's GPU slot cache: ``[cache_size, *row shape]`` in the bank dtype, or for
+        "gguf" banks ``[cache_size, widest layer's bytes]`` uint8, read per layer through
+        :meth:`layer_bank_views`."""
+        if self.quant_format == "gguf":
+            widest = max(math.prod(shape) for shape in self.bank_layer_shapes[name])
+            return torch.empty((cache_size, widest), dtype=torch.uint8, device=self.device)
+        head = self.bank_sources[name][0]
+        return torch.empty((cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device)
+
+    def layer_bank_views(self, layer_id: int, n: int | None = None) -> tuple[torch.Tensor, ...]:
+        """:meth:`bank_views` as ``layer_id`` reads them. For "gguf" banks each slot row is
+        viewed as that layer's ``[rows, row_bytes]`` (rows packed at the slot's start, slots
+        a widest-layer apart); every other format's views are already the layer's."""
+        views = self.bank_views(n)
+        if self.quant_format != "gguf":
+            return views
+        out = []
+        for name, flat in zip(self.bank_schema, views):
+            rows, row_bytes = self.bank_layer_shapes[name][layer_id]
+            out.append(flat.as_strided((flat.size(0), rows, row_bytes), (flat.stride(0), row_bytes, 1)))
+        return tuple(out)
 
     def _build_copy_plan(self) -> None:
         self._build_fused_copy_plan()
@@ -499,6 +543,9 @@ class OffloadMoeCache:
         self._copy_dst_ptrs_host: list[int] = []
         self._copy_src_ptrs_host: list[list[int]] = []
         self._copy_feat_bytes_host: list[int] = []
+        # "gguf": per-layer [num_banks] row bytes, and the slot stride they land at
+        self._copy_layer_feat_bytes: list[torch.Tensor] | None = None
+        self._copy_dst_stride: torch.Tensor | None = None
         self._gather_bank_ids: list[int] = []
         self._gather_dst_ptrs: torch.Tensor | None = None
         self._gather_feat_bytes: torch.Tensor | None = None
@@ -508,10 +555,21 @@ class OffloadMoeCache:
 
         dst_ptrs, feats = [], []
         layer_src_ptrs = [[] for _ in range(self.num_layers)]
+        mixed = self.quant_format == "gguf"
+        layer_feats = [[] for _ in range(self.num_layers)]
         for per_layer, cache in self.banks:
-            feat = math.prod(per_layer[0].shape[1:]) * per_layer[0].element_size()
+            # a "gguf" slot is the widest layer's expert; every other bank's slot is its row
+            feat = cache[0].numel() * cache.element_size()
             if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
+                if mixed:
+                    raise RuntimeError(f"gguf MoE slot rows are {feat} B: the fused copy needs 16-byte multiples")
                 return  # leave fused disabled; copy_missing uses the per-bank path
+            if mixed:
+                for layer_id, source in enumerate(per_layer):
+                    lf = math.prod(source.shape[1:]) * source.element_size()
+                    if lf % 16:
+                        raise RuntimeError(f"gguf MoE layer {layer_id} rows are {lf} B, not a 16-byte multiple")
+                    layer_feats[layer_id].append(lf)
             for layer_id, source in enumerate(per_layer):
                 if layer_id in self._unpinned_layers or self._skips_movement(layer_id):
                     # unregistered layer: no device alias exists, and the row is never consumed
@@ -538,6 +596,11 @@ class OffloadMoeCache:
         self._copy_dst_ptrs_host = dst_ptrs
         self._copy_src_ptrs_host = layer_src_ptrs
         self._copy_feat_bytes_host = feats
+        if mixed:
+            self._copy_layer_feat_bytes = [
+                torch.tensor(f, dtype=torch.int64, device=self.device) for f in layer_feats
+            ]
+            self._copy_dst_stride = self._copy_feat_bytes
         # hit-D2D gather serves only the big banks; small banks are whole-layer
         # H2D entries (see _SMALL_BANK_FEAT_BYTES), so their rows never need D2D.
         self._gather_bank_ids = [i for i, f in enumerate(feats) if f >= _SMALL_BANK_FEAT_BYTES]
@@ -600,10 +663,7 @@ class OffloadMoeCache:
             torch.cuda.empty_cache()
         # 3. Reallocate the slot cache from the retained host sources.
         for name in self.bank_schema:
-            head = self.bank_sources[name][0]
-            self.bank_caches[name] = torch.empty(
-                (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
-            )
+            self.bank_caches[name] = self._alloc_slot_cache(name, cache_size)
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
         # 4. Reallocate cache_size-shaped bookkeeping; reset the slot map (cold start).
@@ -1730,6 +1790,11 @@ class OffloadMoeCache:
                 )
             # the only copy a non-pinned layer ever needs is the non-overlap prefill materialize, which schedules the whole layer into slots [0, num_experts) with position == expert id -- a plain synchronous pageable H2D copy
             # never CUDA-graph captured: prefill is not captured, and decode never reaches this branch (it routes to the CPU executor)
+            if self.quant_format == "gguf":
+                for view, per_layer in zip(self.layer_bank_views(layer_id, self.num_experts),
+                                           (p for p, _ in self.banks)):
+                    view.copy_(per_layer[layer_id])
+                return
             for per_layer, cache in self.banks:
                 cache[: self.num_experts].copy_(per_layer[layer_id])
             return
@@ -1740,16 +1805,20 @@ class OffloadMoeCache:
             # bank). evict_slots/src_indices/num_indices are shared across banks;
             # src_indices holds layer-local expert rows, resolved against this layer's
             # source pointers (layer_id is a static int per captured graph node).
+            mixed = self._copy_layer_feat_bytes is not None
             fast_index_copy_multi_jit(
                 self._copy_dst_ptrs,
                 self._copy_src_ptrs[layer_id],
-                self._copy_feat_bytes,
+                self._copy_layer_feat_bytes[layer_id] if mixed else self._copy_feat_bytes,
                 self.evict_slots,
                 self.src_indices,
                 self.num_indices,
+                dst_stride_bytes=self._copy_dst_stride if mixed else None,
             )
             return
 
+        if self.quant_format == "gguf":
+            raise RuntimeError("gguf MoE banks need the fused copy (FREETOKEN_FUSED_COPY=0?)")
         from freetoken.kernel import fast_index_copy_jit
 
         for per_layer, cache in self.banks:

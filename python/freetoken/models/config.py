@@ -313,6 +313,10 @@ class ModelConfig:
     # ggml type of the GGUF embedding table. Per-tensor, not metadata: Google's own
     # Gemma-4 GGUF stores token_embd as Q6_K while other repacks use Q4_0.
     gguf_embed_quant: int | None = None
+    # Per MoE layer ``(gate_up ggml type, down ggml type)`` of GGUF routed experts, for
+    # checkpoints whose layers store their experts in different quants (unsloth's UD mixes:
+    # most layers IQ3_XXS / IQ4_NL, a few Q8_0 downs). Set with ``expert_quant="gguf"``.
+    gguf_expert_types: Tuple[Tuple[int, int], ...] | None = None
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,

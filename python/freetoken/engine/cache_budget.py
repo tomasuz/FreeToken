@@ -25,7 +25,9 @@ def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
     # with cache_size), so they are intentionally excluded from the per-slot growth term.
     # tensor[0].numel() is the per-row element count (one expert slot); see the matching
     # slot-byte idiom in kvcache/linear_state_pool.py and kvcache/dsv4_paged_pool.py.
-    return sum(t[0][0].numel() * t[0].element_size() for t in sources.values())
+    # A slot must hold the widest layer's expert: layers may store experts in different
+    # ggml types (a GGUF "gguf" bank), so layer 0 is not necessarily representative.
+    return sum(max(t[0].numel() * t.element_size() for t in per_layer) for per_layer in sources.values())
 
 
 def net_cache_budget_bytes(
