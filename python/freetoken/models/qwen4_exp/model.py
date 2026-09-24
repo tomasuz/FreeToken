@@ -21,12 +21,14 @@ import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
-from freetoken.utils import nvtx_annotate
+from freetoken.utils import init_logger, nvtx_annotate
 
 from .attention import Qwen4ExpAttention
 from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -164,12 +166,19 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
             return 0
 
-        if engine_config.ple_backend == "disk":
+        from freetoken.models.gguf.reader import is_gguf_path
+
+        gguf = is_gguf_path(engine_config.model_path)
+        if gguf and engine_config.ple_backend != "disk":
+            # the GGUF table is one packed tensor (26.8 GiB IQ4_NL in unsloth's UD-Q3_K_XL);
+            # pinning it would compete with the expert banks for host RAM, so read it by rows
+            logger.info_rank0("qwen4exp GGUF: serving the PLE table from disk (--ple-backend disk)")
+        if gguf or engine_config.ple_backend == "disk":
             from freetoken.utils import download_hf_weight
 
             from .ple_disk import DiskRowTable, resolve_row_source
 
-            folder = download_hf_weight(engine_config.model_path)
+            folder = engine_config.model_path if gguf else download_hf_weight(engine_config.model_path)
             # one WAIT node per captured graph: the flag protocol supports a single consume
             assert len(ple_layers) == 1, "disk PLE backend expects exactly one PLE layer"
             emb, args = ple_layers[0].ple_embedding, ple_layers[0].args

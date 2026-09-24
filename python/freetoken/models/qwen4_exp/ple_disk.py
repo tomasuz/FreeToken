@@ -48,6 +48,14 @@ class PleRowSource:
     row_bytes: int
     row_stride: int
     scale: float
+    # values per row and how they are packed: None = one fp8-e4m3 byte per value (the
+    # safetensors checkpoints), else a ggml block type the lookup dequantizes on the GPU
+    row_elems: int | None = None
+    ggml_type: int | None = None
+
+    @property
+    def elems(self) -> int:
+        return self.row_bytes if self.row_elems is None else self.row_elems
 
     @property
     def total_rows(self) -> int:
@@ -93,9 +101,28 @@ def source_from_safetensors(folder: str) -> PleRowSource:
     return PleRowSource(paths, [f for f, _ in order], [b for _, b in order], rows, cols, cols, float(scale))
 
 
-def resolve_row_source(folder: str) -> PleRowSource:
-    """Pick the row source for a checkpoint; the seam where a repacked format would plug in."""
-    return source_from_safetensors(folder)
+def source_from_gguf(model_path: str) -> PleRowSource:
+    """Map a llama.cpp qwen4exp GGUF's ``per_layer_token_embd`` in place: one extent, rows
+    packed back to back in their ggml block type (IQ4_NL in unsloth's UD quants)."""
+    from freetoken.models.gguf.reader import gguf_tensor_location
+
+    from .gguf import PLE_TABLE_TENSOR
+
+    loc = gguf_tensor_location(model_path, PLE_TABLE_TENSOR)
+    rows, elems = loc.shape  # torch order: [rows, row width]
+    if loc.rows != rows or loc.nbytes != rows * loc.row_bytes:
+        raise ValueError(f"{PLE_TABLE_TENSOR}: {loc.nbytes} B do not tile {rows} rows of {loc.row_bytes} B")
+    return PleRowSource([loc.path], [0], [loc.offset], rows, loc.row_bytes, loc.row_bytes, 1.0,
+                        row_elems=elems, ggml_type=loc.ggml_type)
+
+
+def resolve_row_source(model_path: str) -> PleRowSource:
+    """Pick the row source for a checkpoint: a llama.cpp GGUF file, or a safetensors folder."""
+    from freetoken.models.gguf.reader import is_gguf_path
+
+    if is_gguf_path(model_path):
+        return source_from_gguf(model_path)
+    return source_from_safetensors(model_path)
 
 
 class DiskRowTable:
@@ -113,7 +140,9 @@ class DiskRowTable:
         from freetoken.kernel import _ple_store
 
         self.num_rows = source.total_rows
-        self.head_dim = source.row_bytes  # fp8: one byte per element
+        self.head_dim = source.elems
+        self._row_bytes = source.row_bytes
+        self._ggml_type = source.ggml_type
         self.dtype = dtype
         self.heads = int(hash_constants["num_ngram_heads"])
         self.scale = source.scale
@@ -139,7 +168,7 @@ class DiskRowTable:
             use_io_uring=os.getenv(_IO_URING_ENV, "1") != "0",
         )
         self._device = torch.device("cuda", torch.cuda.current_device())
-        self._token_bytes = self.heads * self.head_dim
+        self._token_bytes = self.heads * self._row_bytes
         # allocated up front: pinned alloc inside stream capture is illegal; one replay consumes it at a time
         self._graph_pinned = alloc_pinned_tensor(max_graph_rows * self._token_bytes, dtype=torch.uint8)
         self._graph_pinned.zero_()  # padded decode lanes read whatever sits here
@@ -257,7 +286,15 @@ class DiskRowTable:
         )
         nbytes = rows * self._token_bytes
         dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
-        values = dev[:nbytes].view(torch.float8_e4m3fn).to(self.dtype)
+        if self._ggml_type is None:
+            values = dev[:nbytes].view(torch.float8_e4m3fn).to(self.dtype)
+        else:
+            from freetoken.kernel.gguf import ggml_dequantize
+
+            n = rows * self.heads
+            values = ggml_dequantize(
+                dev[:nbytes].view(n, self._row_bytes), self._ggml_type, n, self.head_dim, self.dtype
+            )
         if self.scale != 1.0:
             values = values * self.scale
         values = values.view(*row_ids.shape[:-1], -1)

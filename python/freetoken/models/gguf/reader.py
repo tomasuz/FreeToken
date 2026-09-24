@@ -228,7 +228,7 @@ def gguf_tensor_location(model_path: str, name: str) -> GgufTensorLocation:
             torch_shape, rows, row_bytes = _row_geometry(t)
             return GgufTensorLocation(
                 path=path,
-                offset=int(reader.data_offset) + int(t.data_offset),
+                offset=int(t.data_offset),  # gguf-py already makes it absolute
                 nbytes=int(t.n_bytes),
                 shape=torch_shape,
                 ggml_type=int(t.tensor_type),
