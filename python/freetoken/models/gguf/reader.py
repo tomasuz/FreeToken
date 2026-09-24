@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import functools
 import os
+import re
 import struct
 from dataclasses import dataclass
 from typing import Any, Iterator
@@ -21,10 +22,34 @@ import torch
 
 
 def is_gguf_path(model_path: str) -> bool:
-    """A single ``.gguf`` file (the only GGUF layout FreeToken loads directly)."""
+    """A ``.gguf`` file: a whole model, or one part of a split one (``-00001-of-000NN.gguf``)."""
     return isinstance(model_path, str) and os.path.isfile(model_path) and model_path.endswith(
         ".gguf"
     )
+
+
+# llama.cpp's gguf-split naming: ``<stem>-00001-of-00003.gguf``. The first part carries the
+# whole KV section; every part carries its own tensor infos and data.
+_SPLIT_RE = re.compile(r"^(?P<stem>.*)-(?P<no>\d{5})-of-(?P<count>\d{5})\.gguf$")
+
+
+@functools.cache
+def gguf_shard_paths(model_path: str) -> tuple[str, ...]:
+    """Every file of the model ``model_path`` names, first part first.
+
+    A plain file is its own single part. For a split model any part may be given; the
+    siblings are resolved by name and all must exist -- a missing part would otherwise
+    surface much later as a tensor the loader never saw.
+    """
+    m = _SPLIT_RE.match(model_path)
+    if m is None:
+        return (model_path,)
+    count = int(m.group("count"))
+    paths = tuple(f"{m.group('stem')}-{i:05d}-of-{count:05d}.gguf" for i in range(1, count + 1))
+    missing = [p for p in paths if not os.path.isfile(p)]
+    if missing:
+        raise FileNotFoundError(f"split GGUF {model_path}: missing parts {missing}")
+    return paths
 
 
 # Canonical name of the metadata-only GGUF that ``convert_checkpoint`` drops into an FTW
@@ -128,51 +153,102 @@ def _reader(model_path: str):
 
 @functools.cache
 def load_gguf_metadata(model_path: str) -> dict[str, Any]:
-    """All GGUF KV metadata as ``{field_name: python_value}`` (arrays -> lists)."""
-    reader = _reader(model_path)
+    """All GGUF KV metadata as ``{field_name: python_value}`` (arrays -> lists).
+
+    Of a split model only the first part carries the KV section, so it is read from there
+    whichever part ``model_path`` names."""
+    reader = _reader(gguf_shard_paths(model_path)[0])
     return {name: field.contents() for name, field in reader.fields.items()}
 
 
 def gguf_architecture(model_path: str) -> str:
-    arch = _field_value(_reader(model_path), "general.architecture")
+    arch = _field_value(_reader(gguf_shard_paths(model_path)[0]), "general.architecture")
     if arch is None:
         raise ValueError(f"GGUF file {model_path} has no general.architecture")
     return str(arch)
 
 
-def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
-    """Yield every tensor with its torch shape, ggml type, and packed block bytes."""
+def _row_geometry(t) -> tuple[tuple[int, ...], int, int]:
+    """``(torch_shape, rows, row_bytes)`` of a gguf-py tensor record."""
     import gguf
 
-    reader = _reader(model_path)
-    for t in reader.tensors:
-        ne = [int(s) for s in t.shape]  # ggml order, fastest dim first
-        torch_shape = tuple(reversed(ne))
-        block, type_size = gguf.GGML_QUANT_SIZES[t.tensor_type]
-        n_fast = ne[0]
-        if n_fast % block != 0:
-            raise ValueError(
-                f"{t.name}: fastest dim {n_fast} not a multiple of block {block} "
-                f"for {t.tensor_type.name}"
-            )
-        row_bytes = n_fast // block * type_size
-        rows = int(np.prod(ne[1:])) if len(ne) > 1 else 1
-        # gguf-py returns quantized tensors as raw uint8 but F32/F16 as typed arrays;
-        # normalize everything to a flat byte view before shaping into [rows, row_bytes].
-        flat = np.ascontiguousarray(t.data).reshape(-1).view(np.uint8)
-        raw = flat.reshape(rows, row_bytes)
-        yield GgufTensor(
-            name=t.name,
-            shape=torch_shape,
-            ggml_type=int(t.tensor_type),
-            rows=rows,
-            row_bytes=row_bytes,
-            _raw=raw,
+    ne = [int(s) for s in t.shape]  # ggml order, fastest dim first
+    block, type_size = gguf.GGML_QUANT_SIZES[t.tensor_type]
+    n_fast = ne[0]
+    if n_fast % block != 0:
+        raise ValueError(
+            f"{t.name}: fastest dim {n_fast} not a multiple of block {block} "
+            f"for {t.tensor_type.name}"
         )
+    rows = int(np.prod(ne[1:])) if len(ne) > 1 else 1
+    return tuple(reversed(ne)), rows, n_fast // block * type_size
+
+
+def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
+    """Yield every tensor with its torch shape, ggml type, and packed block bytes.
+
+    A split model is walked part by part, each part in the order it lists its tensors."""
+    for path in gguf_shard_paths(model_path):
+        for t in _reader(path).tensors:
+            torch_shape, rows, row_bytes = _row_geometry(t)
+            # gguf-py returns quantized tensors as raw uint8 but F32/F16 as typed arrays;
+            # normalize everything to a flat byte view before shaping into [rows, row_bytes].
+            flat = np.ascontiguousarray(t.data).reshape(-1).view(np.uint8)
+            raw = flat.reshape(rows, row_bytes)
+            yield GgufTensor(
+                name=t.name,
+                shape=torch_shape,
+                ggml_type=int(t.tensor_type),
+                rows=rows,
+                row_bytes=row_bytes,
+                _raw=raw,
+            )
+
+
+@dataclass(frozen=True)
+class GgufTensorLocation:
+    """Where one tensor's packed bytes sit on disk, for readers that bypass the mmap
+    (the disk-backed PLE table reads its rows straight from the file)."""
+
+    path: str
+    offset: int  # absolute file offset of the first byte
+    nbytes: int
+    shape: tuple[int, ...]  # torch order
+    ggml_type: int
+    rows: int
+    row_bytes: int
+
+
+def gguf_tensor_location(model_path: str, name: str) -> GgufTensorLocation:
+    for path in gguf_shard_paths(model_path):
+        reader = _reader(path)
+        for t in reader.tensors:
+            if t.name != name:
+                continue
+            torch_shape, rows, row_bytes = _row_geometry(t)
+            return GgufTensorLocation(
+                path=path,
+                offset=int(reader.data_offset) + int(t.data_offset),
+                nbytes=int(t.n_bytes),
+                shape=torch_shape,
+                ggml_type=int(t.tensor_type),
+                rows=rows,
+                row_bytes=row_bytes,
+            )
+    raise KeyError(f"{model_path}: no tensor named {name!r}")
 
 
 def gguf_tensor_names(model_path: str) -> set[str]:
-    return {t.name for t in _reader(model_path).tensors}
+    return {t.name for path in gguf_shard_paths(model_path) for t in _reader(path).tensors}
+
+
+def gguf_tensor_type(model_path: str, name: str) -> int:
+    """ggml type of one named tensor, looked up across every part."""
+    for path in gguf_shard_paths(model_path):
+        for t in _reader(path).tensors:
+            if t.name == name:
+                return int(t.tensor_type)
+    raise KeyError(f"{model_path}: no tensor named {name!r}")
 
 
 __all__ = [
@@ -180,10 +256,14 @@ __all__ = [
     "FTW_METADATA_GGUF",
     "OUTPUT_WEIGHT_PRESENT_KV",
     "gguf_config_source",
+    "gguf_shard_paths",
     "write_metadata_gguf",
     "GgufTensor",
+    "GgufTensorLocation",
     "load_gguf_metadata",
     "gguf_architecture",
     "iter_gguf_tensors",
+    "gguf_tensor_location",
     "gguf_tensor_names",
+    "gguf_tensor_type",
 ]

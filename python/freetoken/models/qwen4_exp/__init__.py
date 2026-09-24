@@ -10,6 +10,7 @@ Contracts shared across modules (do not rename):
 """
 
 from .config import parse_config
+from .gguf import iter_gguf_weights, parse_gguf_config
 from .model import Qwen4ExpForCausalLM
 from .weight import (
     ftw_side_files,
@@ -29,5 +30,7 @@ __all__ = [
     "iter_weights",
     "load_ple_table",
     "parse_config",
+    "parse_gguf_config",
+    "iter_gguf_weights",
     "iter_expert_pieces",
 ]

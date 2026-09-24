@@ -128,6 +128,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
         packed_modules_mapping=_QWEN4_EXP_PACKED,
     ),
+    # llama.cpp qwen4exp GGUF (e.g. unsloth's UD quants): same model classes, GGUF config
+    # and weight readers; experts from the offload cache's banks, PLE table read from the file.
+    "Qwen4ExpGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen4_exp",
+        "Qwen4ExpForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the
     # loader handles the compressed-tensors NVFP4 layout.
