@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import torch
 import triton
+from triton.runtime.errors import OutOfResources
 import triton.language as tl
 
 
@@ -224,6 +225,10 @@ def _qsa_merge_splitk_kernel(
     )
 
 
+# (profile block_n, warps, block_m, head_dim, device) -> the [(block_n, num_stages)] that fit
+_FIT: dict[tuple, list[tuple[int, int]]] = {}
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -277,66 +282,89 @@ def qsa_sparse_paged_attention(
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
 
-    num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
-    # Avoid empty splits when the selection width is smaller than the profile.
-    max_useful_splits = 1 << (num_tiles.bit_length() - 1)
-    num_splits = min(max_useful_splits, target_splits)
+    def launch(block_n: int, num_stages: int) -> tuple[int, torch.Tensor, torch.Tensor]:
+        num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
+        # Avoid empty splits when the selection width is smaller than the profile.
+        max_useful_splits = 1 << (num_tiles.bit_length() - 1)
+        num_splits = min(max_useful_splits, target_splits)
 
-    # Split=1 writes output directly and compiles out all workspace accesses.
-    if num_splits == 1:
-        partial_output = out
-        partial_lse = out
+        # Split=1 writes output directly and compiles out all workspace accesses.
+        if num_splits == 1:
+            partial_output = out
+            partial_lse = out
+        else:
+            # FP32 partials preserve accuracy when merging independently normalized
+            # splits.
+            partial_output = torch.empty(
+                (num_splits, *q.shape), dtype=torch.float32, device=q.device
+            )
+            partial_lse = torch.empty(
+                (num_splits, q.shape[0], q.shape[1]),
+                dtype=torch.float32,
+                device=q.device,
+            )
+
+        partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
+        _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+            partial_output,
+            partial_lse,
+            out,
+            q.stride(0),
+            q.stride(1),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            v_cache.stride(0),
+            v_cache.stride(1),
+            v_cache.stride(2),
+            logical_indices.stride(0),
+            block_table.stride(0),
+            out.stride(0),
+            out.stride(1),
+            q.shape[0],
+            k_cache.shape[0],
+            block_table.shape[0],
+            TOPK=logical_indices.shape[1],
+            PAGE_SIZE=k_cache.shape[1],
+            PAGE_TABLE_WIDTH=block_table.shape[1],
+            GROUP_SIZE=group_size,
+            HEAD_DIM=q.shape[2],
+            NUM_QUERY_HEADS=q.shape[1],
+            NUM_SPLITS=num_splits,
+            NUM_TILES=num_tiles,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            num_warps=partial_warps,
+            num_stages=num_stages,
+        )
+        return num_splits, partial_output, partial_lse
+
+    # The profiles were tuned on GB300's 227 KiB of shared memory; an RDNA4 work group has 64
+    # KiB, and the wide prefill tile at head_dim 256 wanted 65792 bytes. Step down -- fewer
+    # pipeline stages first, then narrower tiles -- until the kernel fits, and remember the fit
+    # per shape and device. A kernel that does not fit fails before anything is enqueued, so
+    # the retry is safe under stream capture too.
+    fit_key = (block_n, partial_warps, block_m, head_dim, q.device.index)
+    tries = _FIT.get(fit_key)
+    if tries is None:
+        tries = [(block_n, 2), (block_n, 1)] + [(bn, 1) for bn in (block_n // 2, block_n // 4) if bn >= 16]
+    last = None
+    for block_n_try, stages in tries:
+        try:
+            num_splits, partial_output, partial_lse = launch(block_n_try, stages)
+        except OutOfResources as exc:
+            last = exc
+            continue
+        _FIT[fit_key] = [(block_n_try, stages)]
+        break
     else:
-        # FP32 partials preserve accuracy when merging independently normalized
-        # splits.
-        partial_output = torch.empty(
-            (num_splits, *q.shape), dtype=torch.float32, device=q.device
-        )
-        partial_lse = torch.empty(
-            (num_splits, q.shape[0], q.shape[1]),
-            dtype=torch.float32,
-            device=q.device,
-        )
-
-    partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
-    _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
-        q,
-        k_cache,
-        v_cache,
-        logical_indices,
-        block_table,
-        token_to_req,
-        partial_output,
-        partial_lse,
-        out,
-        q.stride(0),
-        q.stride(1),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        k_cache.stride(2),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        v_cache.stride(2),
-        logical_indices.stride(0),
-        block_table.stride(0),
-        out.stride(0),
-        out.stride(1),
-        q.shape[0],
-        k_cache.shape[0],
-        block_table.shape[0],
-        TOPK=logical_indices.shape[1],
-        PAGE_SIZE=k_cache.shape[1],
-        PAGE_TABLE_WIDTH=block_table.shape[1],
-        GROUP_SIZE=group_size,
-        HEAD_DIM=q.shape[2],
-        NUM_QUERY_HEADS=q.shape[1],
-        NUM_SPLITS=num_splits,
-        NUM_TILES=num_tiles,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        num_warps=partial_warps,
-        num_stages=2,
-    )
+        raise last
     if num_splits == 1:
         return out
 
