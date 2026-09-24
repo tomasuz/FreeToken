@@ -110,7 +110,7 @@ class DetokenizeManager:
 
         new_text = read_str[len(surr_str) :]
         # Streaming chunk: update the decode status
-        if len(new_text) > 0 and not new_text.endswith(""):
+        if len(new_text) > 0 and not new_text.endswith("\ufffd"):
             output_str = s.decoded_str + new_text
             s.decoded_str = output_str
             s.surr_offset = s.read_offset
