@@ -106,6 +106,27 @@ def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
     )
 
 
+def zero_slot_tails(view: torch.Tensor, slots: torch.Tensor, num: torch.Tensor, start: int, nbytes: int) -> None:
+    """Zero bytes ``[start, start + nbytes)`` of the first ``num[0]`` slots of ``slots`` in
+    the ``[slots, width]`` uint8 region ``view``. One program per plan entry, fixed grid (the
+    count stays on the device), so it is CUDA-graph capturable."""
+    grid = (slots.numel(),)
+    _zero_slot_tails_kernel[grid](
+        view, slots, num, view.stride(0), start, NBYTES=nbytes, BLOCK=1024,
+    )
+
+
+@triton.jit
+def _zero_slot_tails_kernel(base_ptr, slots_ptr, num_ptr, width, start, NBYTES: tl.constexpr, BLOCK: tl.constexpr):
+    i = tl.program_id(0)
+    if i < tl.load(num_ptr):
+        slot = tl.load(slots_ptr + i).to(tl.int64)
+        row = base_ptr + slot * width + start
+        off = tl.arange(0, BLOCK)
+        for c in tl.static_range(0, NBYTES, BLOCK):
+            tl.store(row + c + off, tl.zeros((BLOCK,), dtype=tl.uint8), mask=c + off < NBYTES)
+
+
 def materialize_layer(cache, layer_id: int) -> None:
     _materialize_layer_gpu(cache, layer_id)
 

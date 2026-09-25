@@ -674,7 +674,7 @@ class OffloadMoELayer(MoELayer):
             gate_up_type, down_type = cache.gguf_layer_types[self.layer_id]
             return fused_experts_gguf(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation,
-                gate_up_type, down_type=down_type,
+                gate_up_type, down_type=down_type, num_experts=self.num_experts,
             )
         if fmt in GGUF_EXPERT_FORMATS:
             # Native GGUF experts (any ggml quant the borrowed kernels dispatch):

@@ -11,11 +11,31 @@ materialized layer positions (prefill).
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from freetoken.layers.activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
 _ACT = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
+
+# From this many tokens on, the experts run as llama.cpp's grouped MMQ (kernel/ggml_mmq)
+# where it serves the types: 6-8x the per-row MMVQ at a 300-token prefill on the RX 9060 XT.
+# Below it (decode, MTP verify) MMVQ stays. 0 turns MMQ off.
+_MMQ_MIN_TOKENS = int(os.getenv("FREETOKEN_GGUF_MMQ_MIN_TOKENS", "8") or 0)
+
+
+def _mmq_usable(num_tokens: int, *types: int) -> bool:
+    if not _MMQ_MIN_TOKENS or num_tokens < _MMQ_MIN_TOKENS or not torch.cuda.is_available():
+        return False
+    if torch.cuda.is_current_stream_capturing():
+        return False  # ctypes launches with host-side scratch sizing; never inside a graph
+    from freetoken.kernel import ggml_mmq
+
+    try:
+        return all(ggml_mmq.supports(t) for t in types)
+    except Exception:  # noqa: BLE001 -- no toolchain / build failure: MMVQ still serves
+        return False
 
 
 def fused_experts_gguf(
@@ -29,6 +49,7 @@ def fused_experts_gguf(
     act_fn=None,
     *,
     down_type: int | None = None,
+    num_experts: int | None = None,
 ) -> torch.Tensor:
     """``act_fn`` overrides the activation implementation for callers that cannot use the
     compiled one -- a worker process on a device Triton has no backend for, say. ``None``
@@ -36,7 +57,9 @@ def fused_experts_gguf(
 
     ``down_type`` is the down projection's ggml type when it differs from gate/up's
     (unsloth's UD quants: IQ3_XXS gate/up over an IQ4_NL or Q8_0 down); ``None`` means the
-    same. The banks may be strided views -- a slot cache sized for the widest layer."""
+    same. The banks may be strided views -- a slot cache sized for the widest layer.
+    ``num_experts`` (the distinct experts the routing can reach; defaults to the slot count)
+    only tunes the grouped MMQ's tile size."""
     from freetoken.kernel.gguf import ggml_moe_a8_vec
 
     if act_fn is None:
@@ -50,6 +73,18 @@ def fused_experts_gguf(
     top_k = topk_ids.shape[1]
     qt = int(ggml_type)
     qt_down = qt if down_type is None else int(down_type)
+
+    if _mmq_usable(num_tokens, qt, qt_down):
+        from freetoken.kernel.ggml_mmq import mmq_moe
+
+        k_in = hidden_states.shape[1]
+        ids = topk_ids.to(torch.int32)
+        n_exp = num_experts or gate_up_q.shape[0]
+        gate_up = mmq_moe(gate_up_q, qt, k_in, hidden_states.view(num_tokens, 1, k_in), ids, n_exp)
+        inter = act_fn(gate_up.view(num_tokens * top_k, n2).to(hidden_states.dtype))
+        out = mmq_moe(down_q, qt_down, inter.shape[1], inter.view(num_tokens, top_k, -1), ids, n_exp)
+        out = out * topk_weights.reshape(num_tokens, top_k, 1).to(out.dtype)
+        return out.sum(dim=1).to(hidden_states.dtype)
 
     # gate_up: [num_tokens*top_k, 2I] -> activation -> [num_tokens*top_k, I]
     gate_up = ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens)

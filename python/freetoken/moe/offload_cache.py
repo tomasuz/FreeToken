@@ -26,6 +26,12 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 # whole layer is tiny) and are excluded from the hit gather, so every per-run
 # entry the batch sees is >= this size.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
+# llama.cpp's MMQ reads the last row of an expert up to its 512-element padded length, so up
+# to ~544 B (Q8_0) past the expert's end; that read is multiplied by zero activations, which is
+# harmless only if the bytes decode to finite blocks. Every "gguf" slot region is followed by
+# this many zero bytes, and a slot whose expert is narrower than the slot keeps this many zero
+# bytes after it (see _plan_gguf_parts / zero_slot_tails).
+_GGUF_SLOT_TAIL_BYTES = 4096
 # "gguf" slot classes: a slot region per row width instead of one at the widest (0 = off).
 _GGUF_SLOT_CLASSES = os.getenv("FREETOKEN_GGUF_SLOT_CLASSES", "1").strip().lower() not in {"0", "false", "no", "off"}
 
@@ -206,6 +212,7 @@ class OffloadMoeCache:
         # with its own slot region at its own width and its own slice of the LRU arrays.
         # None = one region at the widest layer's width (the pre-classes layout).
         self._parts: list[dict] | None = None
+        self._tail_zero: list[list] = []
         self._layer_part: list[int] | None = None
         # LRU slots actually allocated; differs from cache_size (the engine's budget, in
         # widest-layer slots) only when slot classes turn one budget into more slots.
@@ -521,6 +528,19 @@ class OffloadMoeCache:
     def _layer_widths(self, layer_id: int) -> tuple[int, ...]:
         return tuple(math.prod(self.bank_layer_shapes[n][layer_id]) for n in self.bank_schema)
 
+    def _align_slot_width(self, width: int, layers, bank: int) -> int:
+        """Round a region's slot width up so the slot stride is a whole number of blocks of
+        every ggml type its layers store in ``bank`` (the MMQ kernels take the stride in
+        blocks: IQ4_XS and IQ3_XXS layers sharing a region need a multiple of 136 and 98),
+        and a multiple of 16 bytes for the fused copy."""
+        from freetoken.gguf_quant import BLOCK_SHAPE
+
+        unit = 16
+        if self.gguf_layer_types:
+            for l in layers:
+                unit = math.lcm(unit, BLOCK_SHAPE[self.gguf_layer_types[l][bank]][1])
+        return -(-width // unit) * unit
+
     def _plan_gguf_parts(self, budget_slots: int) -> list[dict]:
         """Group the layers by row width and size each group's slot region.
 
@@ -544,8 +564,17 @@ class OffloadMoeCache:
             groups = [list(range(self.num_layers))]
         parts = []
         for layers in groups:
-            w = tuple(max(widths[l][i] for l in layers) for i in range(len(self.bank_schema)))
-            parts.append({"layers": tuple(layers), "widths": w})
+            w = []
+            tails = []
+            for i in range(len(self.bank_schema)):
+                own = {widths[l][i] for l in layers}
+                # one row width: an overread lands in the next slot, an expert of the same
+                # type (or the zero gap after the region). Mixed: every expert keeps a zero
+                # tail inside its own slot, so no overread reaches another type's bytes.
+                margin = 0 if len(own) == 1 else _GGUF_SLOT_TAIL_BYTES
+                w.append(self._align_slot_width(max(own) + margin, layers, i))
+                tails.append(len(own) > 1)
+            parts.append({"layers": tuple(layers), "widths": tuple(w), "mixed": tuple(tails)})
         # equal slots per layer, then lift any region under the num_experts floor and give
         # the others what is left
         per_layer_bytes = sum(len(p["layers"]) * sum(p["widths"]) for p in parts)
@@ -576,15 +605,26 @@ class OffloadMoeCache:
                 self._layer_part[l] = i
         self.lru_slots = sum(p["size"] for p in parts)
         for b, name in enumerate(self.bank_schema):
-            total = sum(p["size"] * p["widths"][b] for p in parts)
-            flat = torch.empty((total,), dtype=torch.uint8, device=self.device)
+            # zeroed, each region followed by _GGUF_SLOT_TAIL_BYTES that are never written:
+            # never-filled slots and what follows a region's last slot decode as zero blocks
+            total = sum(p["size"] * p["widths"][b] + _GGUF_SLOT_TAIL_BYTES for p in parts)
+            flat = torch.zeros((total,), dtype=torch.uint8, device=self.device)
             self.bank_caches[name] = flat
             offset = 0
             for p in parts:
                 p.setdefault("views", {})[name] = flat[offset : offset + p["size"] * p["widths"][b]].view(
                     p["size"], p["widths"][b]
                 )
-                offset += p["size"] * p["widths"][b]
+                offset += p["size"] * p["widths"][b] + _GGUF_SLOT_TAIL_BYTES
+        # banks of mixed-width regions whose layer leaves room in the slot: after every copy
+        # the bytes after its expert are zeroed (a wider expert may have lived there before)
+        self._tail_zero = [[] for _ in range(self.num_layers)]
+        for p in parts:
+            for l in p["layers"]:
+                for b, name in enumerate(self.bank_schema):
+                    lf = math.prod(self.bank_layer_shapes[name][l])
+                    if p["mixed"][b] and lf < p["widths"][b]:
+                        self._tail_zero[l].append((p["views"][name], lf))
         if len(parts) > 1:
             desc = ", ".join(
                 f"{len(p['layers'])} layers x {p['size'] // len(p['layers'])} slots of "
@@ -1942,6 +1982,11 @@ class OffloadMoeCache:
                 self.num_indices,
                 dst_stride_bytes=self._copy_layer_dst_stride[layer_id] if mixed else None,
             )
+            if mixed and self._tail_zero[layer_id]:
+                from freetoken.moe.offload_kernels import zero_slot_tails
+
+                for view, start in self._tail_zero[layer_id]:
+                    zero_slot_tails(view, self.evict_slots, self.num_indices, start, _GGUF_SLOT_TAIL_BYTES)
             return
 
         if self.quant_format == "gguf":
