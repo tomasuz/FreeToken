@@ -11,6 +11,7 @@ materialized layer positions (prefill).
 
 from __future__ import annotations
 
+import functools
 import os
 
 import torch
@@ -23,6 +24,8 @@ _ACT = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_m
 # where it serves the types: 6-8x the per-row MMVQ at a 300-token prefill on the RX 9060 XT.
 # Below it (decode, MTP verify) MMVQ stays. 0 turns MMQ off.
 _MMQ_MIN_TOKENS = int(os.getenv("FREETOKEN_GGUF_MMQ_MIN_TOKENS", "8") or 0)
+# llama.cpp's MMVQ takes at most this many tokens per launch (MMVQ_MAX_BATCH_SIZE)
+_MMVQ_MAX_TOKENS = 8
 
 
 def _mmq_usable(num_tokens: int, *types: int) -> bool:
@@ -36,6 +39,25 @@ def _mmq_usable(num_tokens: int, *types: int) -> bool:
         return all(ggml_mmq.supports(t) for t in types)
     except Exception:  # noqa: BLE001 -- no toolchain / build failure: MMVQ still serves
         return False
+
+
+# llama.cpp's current MMVQ (kernel/ggml_mmq) for 2-8 tokens (MTP verify), per projection where
+# it measured faster on the RX 9060 XT (x 10 of Qwen3.8's experts): every down type (IQ4_NL
+# 50 vs 73 us at two tokens, Q8_0 70 vs 107) and gate/up fused with its activation except
+# IQ3_XXS, where the older kernel stays ahead (144 vs 180 us). One token keeps the older
+# kernels: the kernel-level gain there (~0.6 ms a step) is eaten by the f32/int32 conversions
+# around the call, measured 53.1 vs 52.0 ms/token end to end.
+_NEW_MMVQ = os.getenv("FREETOKEN_GGUF_NEW_MMVQ", "1").strip().lower() not in {"0", "false", "no", "off"}
+_OLD_MMVQ_GATE_UP_TYPES = frozenset({18})  # IQ3_XXS
+
+
+@functools.cache
+def _new_mmvq_serves(ggml_type: int) -> bool:
+    if not _NEW_MMVQ or not torch.cuda.is_available():
+        return False
+    from freetoken.kernel import ggml_mmq
+
+    return ggml_mmq.supports(ggml_type)
 
 
 def fused_experts_gguf(
@@ -86,15 +108,35 @@ def fused_experts_gguf(
         out = out * topk_weights.reshape(num_tokens, top_k, 1).to(out.dtype)
         return out.sum(dim=1).to(hidden_states.dtype)
 
-    # gate_up: [num_tokens*top_k, 2I] -> activation -> [num_tokens*top_k, I]
-    gate_up = ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens)
-    inter = act_fn(gate_up)
-    # down: each of the num_tokens*top_k intermediate rows uses its own expert id.
-    out = ggml_moe_a8_vec(inter, down_q, topk_ids, 1, qt_down, h, num_tokens * top_k)
+    small = 2 <= num_tokens <= _MMVQ_MAX_TOKENS
+    if (
+        small and activation == "silu" and qt not in _OLD_MMVQ_GATE_UP_TYPES
+        and _new_mmvq_serves(qt)
+    ):
+        from freetoken.kernel.ggml_mmq import GLU_SWIGLU, mmvq
+
+        # one launch: silu(x @ gate) * (x @ up), gate rows then up rows in each slot
+        i = n2 // 2
+        k_in = hidden_states.shape[1]
+        inter = mmvq(
+            gate_up_q[:, i:], qt, k_in, hidden_states.view(num_tokens, 1, k_in),
+            topk_ids.to(torch.int32), gate=gate_up_q[:, :i], glu_op=GLU_SWIGLU,
+        ).view(num_tokens * top_k, i).to(hidden_states.dtype)
+    else:
+        # gate_up: [num_tokens*top_k, 2I] -> activation -> [num_tokens*top_k, I]
+        gate_up = ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens)
+        inter = act_fn(gate_up)
+    if small and _new_mmvq_serves(qt_down):
+        from freetoken.kernel.ggml_mmq import mmvq
+
+        out = mmvq(down_q, qt_down, inter.shape[1], inter.view(num_tokens, top_k, -1), topk_ids.to(torch.int32))
+    else:
+        # down: each of the num_tokens*top_k intermediate rows uses its own expert id.
+        out = ggml_moe_a8_vec(inter, down_q, topk_ids, 1, qt_down, h, num_tokens * top_k)
     out = out.reshape(num_tokens, top_k, h) * topk_weights.reshape(num_tokens, top_k, 1).to(
         out.dtype
     )
-    return out.sum(dim=1)
+    return out.sum(dim=1).to(hidden_states.dtype)
 
 
 def fused_experts_gguf_q4_0(

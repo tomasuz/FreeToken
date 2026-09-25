@@ -531,6 +531,10 @@ def convert_qwen4exp_to_gguf(model, cfg: "ModelConfig") -> None:
 
     plan = packing_plan(cfg)
     layers = model.model.layers.op_list
+    if plan:
+        from freetoken.kernel import ggml_mmq
+
+        ggml_mmq.prepare()  # build/load llama.cpp's MMQ/MMVQ now, not inside a graph capture
     for path, qt in plan.items():
         parts = path.split(".")
         if parts[:2] == ["model", "layers"]:
