@@ -30,6 +30,8 @@ logger = init_logger(__name__)
 
 # the widest verify (pending tokens + draft); past it a step runs without a draft
 MAX_T = int(os.getenv("FREETOKEN_MTP_MAX_T", "4"))
+# drafts per step: the head chained on its own residual after the first
+N_DRAFTS = int(os.getenv("FREETOKEN_MTP_DRAFTS", "2"))
 
 
 class Qwen4MTPMixin:
@@ -107,12 +109,12 @@ class Qwen4MTPMixin:
         stat = {"forwards": 0, "committed": 0, "verified": 0, "accepted": 0, "tokens": 0}
         t0 = time.monotonic()
         logger.info_rank0(f"[mtp4] speculative decode engaged uid={req.uid} cached_len={req.cached_len}")
-        draft = None
+        drafts: list[int] = []
         with self.engine_stream_ctx:
             self.engine.stream.wait_stream(self.stream)
             try:
                 while True:
-                    done, draft = self._mtp4_step(req, draft, stat)
+                    done, drafts = self._mtp4_step(req, drafts, stat)
                     self._flush_abort_acks()
                     if done:
                         break
@@ -213,33 +215,41 @@ class Qwen4MTPMixin:
         self._mtp4_vg = graphs
         return graphs
 
-    def _mtp4_draft(self, req: Req, R: torch.Tensor, next_tokens: list[int], first_pos: int) -> int:
+    def _mtp4_draft(self, R: torch.Tensor, next_tokens: list[int], first_pos: int, n: int) -> list[int]:
         """Feed (R[j], next_tokens[j]) at positions first_pos+j to the head; the argmax of the
-        last row drafts the token after the newest one."""
+        last row drafts the token after the newest one, and each further draft chains the
+        head on its own residual and the draft before it."""
         graphs = self._mtp4_graphs()
         head = getattr(graphs, "head", None) if graphs is not None else None
-        if head is not None and len(next_tokens) in head.graphs:
-            return head.run(R, next_tokens, first_pos)
         model = self.engine.model
-        ids = torch.tensor(next_tokens, dtype=torch.int64).to(self.device, non_blocking=True)
-        pos = torch.arange(first_pos, first_pos + len(next_tokens), dtype=torch.int64, device=self.device)
-        b = Batch(reqs=[self.engine.dummy_req], phase="decode")
-        with self.engine.ctx.forward_batch(b):
-            logits, _ = model.mtp_forward(R.to(torch.bfloat16), ids, pos)
-        return int(logits[-1].argmax())
+        drafts: list[int] = []
+        pos = first_pos + len(next_tokens) - 1  # position of the newest token
+        rows, ids = R, next_tokens
+        for _ in range(n):
+            if head is not None and len(ids) in head.graphs:
+                d, R_last = head.run(rows, ids, pos - len(ids) + 1)
+            else:
+                ids_t = torch.tensor(ids, dtype=torch.int64).to(self.device, non_blocking=True)
+                p_t = torch.arange(pos - len(ids) + 1, pos + 1, dtype=torch.int64, device=self.device)
+                b = Batch(reqs=[self.engine.dummy_req], phase="decode")
+                with self.engine.ctx.forward_batch(b):
+                    logits, R_out = model.mtp_forward(rows.to(torch.bfloat16), ids_t, p_t)
+                d, R_last = int(logits[-1].argmax()), R_out[-1:]
+            drafts.append(d)
+            rows, ids, pos = R_last, [d], pos + 1
+        return drafts
 
-    # ---------------------------------------------------------------- steps
-    def _mtp4_step(self, req: Req, draft: int | None, stat: dict):
-        """One verify (or a plain step when there is no draft). Returns (finished, next draft)."""
+    def _mtp4_step(self, req: Req, drafts: list[int], stat: dict):
+        """One verify of ``drafts`` after the pending tokens (a plain step when there are
+        none). Returns (finished, the next drafts)."""
         C = req.cached_len
         pending = req.input_ids[C:].tolist()
         n_p = len(pending)
-        if draft is not None and n_p + 1 > MAX_T:
-            draft = None
-        tokens = pending + ([draft] if draft is not None else [])
+        drafts = drafts[: max(0, MAX_T - n_p)]
+        tokens = pending + drafts
         T = len(tokens)
         live = self._mtp4_live_slot(req)
-        if draft is not None:
+        if drafts:
             self._mtp4_snapshot(live, restore=False)
         try:
             t0 = time.perf_counter()
@@ -251,23 +261,24 @@ class Qwen4MTPMixin:
             per_t[T] = (n + 1, tot + dt)
             stat["forwards"] += 1
             stat["tokens"] += T
-            real = top[n_p - 1]
-            if draft is not None:
-                stat["verified"] += 1
-            if draft is not None and real == draft:
-                stat["accepted"] += 1
-                seq = pending + [draft, top[n_p]]
-                new, rows, kept = [draft, top[n_p]], T, C + T
-            elif draft is not None:
+            m = 0  # accepted drafts: the base's own argmax agrees with each in turn
+            while m < len(drafts) and top[n_p - 1 + m] == drafts[m]:
+                m += 1
+            stat["verified"] += len(drafts)
+            stat["accepted"] += m
+            new = drafts[:m] + [top[n_p - 1 + m]]
+            seq = pending + new
+            rows = n_p + m  # processed rows whose (residual, next token) pairs are real
+            if m == len(drafts):
+                kept = C + T
+            else:
+                # the live state is past a wrong token: back to before the verify; the
+                # accepted tokens stay pending and ride along with the next one
                 self._mtp4_snapshot(live, restore=True)
                 self.cache_manager.free_tail_pages(req, keep_len=C)
-                seq = pending + [real]
-                new, rows, kept = [real], n_p, C
-            else:
-                seq = pending + [real]
-                new, rows, kept = [real], n_p, C + n_p
+                kept = C
         except Exception:
-            if draft is not None:
+            if drafts:
                 self._mtp4_snapshot(live, restore=True)
             if req.device_len > req.input_ids.numel():
                 self.cache_manager.free_tail_pages(req, keep_len=C)
@@ -277,14 +288,14 @@ class Qwen4MTPMixin:
         committed = self._mtp_emit(req, new, kept_processed=kept, n_pending=req.input_ids.numel() + len(new) - kept)
         stat["committed"] += committed
         if req in self.finished_reqs or req not in self.decode_manager.running_reqs:
-            return True, None
+            return True, []
         # rows 0..n_p-2 fed the head last step (identical pairs); only newer rows are new
         lo = max(n_p - 1, 0)
         nxt = seq[1 : rows + 1]
         t0 = time.perf_counter()
-        draft = self._mtp4_draft(req, R[lo:rows], nxt[lo:], C + lo + 1)
+        drafts = self._mtp4_draft(R[lo:rows], nxt[lo:], C + lo + 1, N_DRAFTS)
         stat["t_head"] = stat.get("t_head", 0.0) + time.perf_counter() - t0
-        return False, draft
+        return False, drafts
 
     def _mtp4_flush(self, req: Req) -> None:
         """Process all pending tokens but the newest (no commit): the ordinary decode

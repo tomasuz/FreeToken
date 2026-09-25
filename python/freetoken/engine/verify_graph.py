@@ -170,11 +170,11 @@ class VerifyGraphs:
 
 
 class HeadGraphs:
-    """The MTP head's draft forward, captured for the 1 and 2 rows a step feeds it (see
-    ``scheduler/mtp4.py``: a reject adds one pair, an accept two). Eager it is ~7 ms of
-    launches for a few hundred microseconds of work."""
+    """The MTP head's draft forward, captured for the 1..3 rows a step feeds it (see
+    ``scheduler/mtp4.py``: one pair per accepted draft plus one). Eager it is ~7 ms of
+    launches."""
 
-    def __init__(self, engine: "Engine", rows=(1, 2)) -> None:
+    def __init__(self, engine: "Engine", rows=(1, 2, 3)) -> None:
         model = engine.model
         cfg = model._config
         self.engine = engine
@@ -187,6 +187,7 @@ class HeadGraphs:
         self.pos = torch.zeros(n, dtype=torch.int64, device=dev)
         self.graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         self.logits: Dict[int, torch.Tensor] = {}
+        self.residual: Dict[int, torch.Tensor] = {}
 
     def capture(self) -> None:
         engine = self.engine
@@ -200,17 +201,20 @@ class HeadGraphs:
                 model.mtp_forward(self.R[:n], self.ids[:n], self.pos[:n])  # warm
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g, pool=pool, stream=stream):
-                    logits, _ = model.mtp_forward(self.R[:n], self.ids[:n], self.pos[:n])
+                    logits, R = model.mtp_forward(self.R[:n], self.ids[:n], self.pos[:n])
                 self.graphs[n] = g
                 self.logits[n] = logits
+                self.residual[n] = R
         torch.cuda.synchronize(engine.device)
         # the warm runs wrote dummy rows into the attention ring and the head's slot cache
         model._mtp.head.self_attn.reset_ring()
         model._mtp.cache.reset()
         logger.info_rank0(f"MTP head graphs captured for {list(self.rows)} row(s)")
 
-    def run(self, R: torch.Tensor, next_tokens: list[int], first_pos: int) -> int:
-        """Argmax draft of the last row, as ``_mtp4_draft`` computes it eagerly."""
+    def run(self, R: torch.Tensor, next_tokens: list[int], first_pos: int):
+        """(argmax draft of the last row, the head residual of that row [1, hc*H]), as
+        ``_mtp4_draft`` computes them eagerly. The residual lives in the graph pool: use it
+        before the next replay."""
         n = len(next_tokens)
         self.R[:n].copy_(R)
         self.ids[:n].copy_(torch.tensor(next_tokens, dtype=torch.int64), non_blocking=True)
@@ -219,7 +223,7 @@ class HeadGraphs:
         if hasattr(cache, "refresh_placement"):
             cache.refresh_placement()
         self.graphs[n].replay()
-        return int(self.logits[n][-1].argmax())
+        return int(self.logits[n][-1].argmax()), self.residual[n][-1:]
 
 
 __all__ = ["HeadGraphs", "VerifyGraphs"]

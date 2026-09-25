@@ -56,6 +56,9 @@ _ARCH = "qwen4exp"
 MTP_WINDOW = int(os.getenv("FREETOKEN_MTP_WINDOW", "64"))
 # slots of the head's own expert cache (5 MiB each for Q8_0 experts)
 MTP_CACHE_SLOTS = int(os.getenv("FREETOKEN_MTP_CACHE_SLOTS", "96"))
+# experts per draft row: the head's routing is flat enough that its top 4 keep the
+# acceptance (0.876 vs 0.878 at top 10 on Qwen3.8) at 40% of the expert traffic
+MTP_TOPK = int(os.getenv("FREETOKEN_MTP_TOPK", "4"))
 
 
 class _MTPAttention(Qwen4ExpAttention):
@@ -139,7 +142,7 @@ class Qwen4ExpMTPHead(BaseOP):
         attn.o_proj = GGUFLinear(attn.qo_attn_dim, H, GGML_Q8_0)
         self.mlp_hyper_connection = GatedResidual(config)
         _swap_hc_to_gguf(self.mlp_hyper_connection)
-        mtp_cfg = dataclasses.replace(config, num_experts=num_experts)
+        mtp_cfg = dataclasses.replace(config, num_experts=num_experts, num_experts_per_tok=min(MTP_TOPK, config.num_experts_per_tok))
         self.mlp = Qwen4ExpMoE(mtp_cfg, layer_id=0, prefix="mtp.mlp")
         sh = self.mlp.shared_expert
         inter = config.shared_expert_intermediate_size
@@ -279,6 +282,7 @@ def build_mtp_cache(device, experts: int, types: tuple[int, int], banks, slots: 
 
 __all__ = [
     "MTP_CACHE_SLOTS",
+    "MTP_TOPK",
     "MTP_WINDOW",
     "Qwen4ExpMTPHead",
     "build_mtp_cache",
