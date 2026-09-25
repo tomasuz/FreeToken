@@ -546,6 +546,8 @@ class OffloadMoELayer(MoELayer):
             )
             cache.release_prefill_layer(self.layer_id)
             return out
+        if cache.quant_format == "gguf":
+            return self._prefill_by_ensure(cache, hidden_states, topk_weights, topk_ids)
         cache.materialize_layer(self.layer_id)
         cache.copy_missing()
         return self._expert_gemm(
@@ -556,6 +558,40 @@ class OffloadMoELayer(MoELayer):
             views=cache.bank_views(self.num_experts),
             n=self.num_experts,
             alphas=cache.alphas_for_layer(self.layer_id),
+            is_prefill=True,
+        )
+
+    def _prefill_by_ensure(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Prefill through the slot cache: only the experts this chunk routes to, and of
+        those only the ones not already cached, cross PCIe.
+
+        Materializing the layer instead copies every expert of it, cached or not: on
+        Qwen3.8 GGUF that is 26 GiB per prefill however short the prompt (~2 s at PCIe 3.0
+        x16), where a short prompt needs a fraction of the layer and much of that is still
+        in the cache from decode. Not graph-captured (the id set is data-dependent), which
+        prefill never is.
+        """
+        uniq = torch.unique(topk_ids)  # <= num_experts distinct ids, so the region holds them
+        slots = uniq.to(torch.int32, copy=True)  # a copy: ensure_experts rewrites it in place
+        cache.ensure_experts(self.layer_id, slots)
+        cache.copy_missing()
+        lut = torch.empty((self.num_experts,), dtype=slots.dtype, device=slots.device)
+        lut[uniq.long()] = slots
+        slot_ids = lut[topk_ids.long()].to(topk_ids.dtype)
+        return self._expert_gemm(
+            cache,
+            hidden_states,
+            topk_weights,
+            slot_ids,
+            views=cache.bank_views(),
+            n=None,
+            alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=True,
         )
 
@@ -633,7 +669,7 @@ class OffloadMoELayer(MoELayer):
             from freetoken.moe.fused_q4_0 import fused_experts_gguf
 
             gate_up, down = views
-            if gate_up.dim() == 2:
+            if gate_up.dim() != 3:  # slot regions, not a resident layer's own banks
                 gate_up, down = cache.layer_bank_views(self.layer_id, n)
             gate_up_type, down_type = cache.gguf_layer_types[self.layer_id]
             return fused_experts_gguf(
