@@ -15,6 +15,7 @@ immediate combine::
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -34,6 +35,10 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from freetoken.core import Batch
     from freetoken.models.config import ModelConfig
+
+
+# Experts predicted per token for the decode prefetch (0 turns it off).
+_PREFETCH_K = int(os.getenv("FREETOKEN_MOE_PREFETCH_K", "12") or 0)
 
 
 def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseOP:
@@ -73,11 +78,33 @@ class Qwen4ExpDecoderLayer(BaseOP):
             PLELayer(config, layer_id, prefix=f"{prefix}.ple") if layer_id in config.qwen4_args.ple_layer_ids else None
         )
 
+    def _prefetch_experts(self, hidden: torch.Tensor) -> None:
+        """Guess this layer's experts from the residual it starts from and let the offload
+        cache copy the misses in while the layer attends.
+
+        The guess runs the MLP hyper-connection mix and the router on the pre-attention
+        streams: the attention block moves the streams little enough that its top-12 holds
+        90% of the real top-10 on Qwen3.8 (measured over a 120-token decode, all layers).
+        """
+        experts = getattr(self.mlp, "experts", None)
+        cache = getattr(experts, "offload_cache", None)
+        if cache is None or not cache.prefetch_supported(self._layer_id):
+            return
+        k = min(_PREFETCH_K, cache.num_experts)
+
+        def predict() -> torch.Tensor:
+            x, _ = self.mlp_hyper_connection.mix(hidden)
+            return torch.topk(self.mlp.gate.forward(x), k, dim=-1).indices
+
+        cache.prefetch_begin(self._layer_id, hidden, predict, hidden.shape[0] * k)
+
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
         if self.ple is not None:
             with phase("ple"):
                 hidden = hidden + self.ple.forward(hidden, batch)
+        if _PREFETCH_K and batch.is_decode:
+            self._prefetch_experts(hidden)
         with phase("hc.mix"):
             block_input, inject = self.attn_hyper_connection.mix(hidden)
         if self._is_linear:

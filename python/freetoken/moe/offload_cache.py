@@ -200,6 +200,15 @@ class OffloadMoeCache:
         self.gguf_layer_types: list[tuple[int, int]] | None = None
         # "gguf" only: each bank's per-layer [rows, row_bytes] (the slot is the widest).
         self.bank_layer_shapes: dict[str, list[tuple[int, ...]]] = {}
+        # decode prefetch (prefetch_begin): side stream, per-layer events, plan buffers
+        self._pf_stream = None
+        self._pf_plan_ev: list = []
+        self._pf_data_ev: list = []
+        self._pf_out: torch.Tensor | None = None
+        self._pf_src: torch.Tensor | None = None
+        self._pf_dst: torch.Tensor | None = None
+        self._pf_num: torch.Tensor | None = None
+        self._pf_keep: dict[int, tuple] = {}
         if self.quant_format == "gguf" and (self.prefill_overlap or self.prefill_hit_d2d):
             # Both move whole layers or hit rows at one fixed width; materialize +
             # copy_missing are the paths that honor a width per layer.
@@ -1771,6 +1780,113 @@ class OffloadMoeCache:
             "oracle_hit_at_slots": oracle_hit,
             "norm_entropy": norm_ent,
         }
+
+    # ------------------------------------------------------------------
+    # Decode prefetch: a layer's predicted experts, fetched while it attends.
+    # ------------------------------------------------------------------
+
+    def prefetch_supported(self, layer_id: int) -> bool:
+        """Whether ``layer_id`` goes through the slot cache on the fused copy, the one path
+        :meth:`prefetch_begin` can stage into."""
+        return (
+            self._copy_fused_ok
+            and self.device.type == "cuda"
+            and not self.is_resident_layer(layer_id)
+            and not self.is_cpu_layer(layer_id)
+            and layer_id not in self.inplace_layer_ids
+            and layer_id not in self._unpinned_layers
+            and not self.split_helpers(layer_id)
+        )
+
+    # predicted ids one prefetch can take: the plan buffers are allocated once, since a
+    # captured graph keeps the addresses it saw
+    _PF_CAPACITY = 256
+
+    def prefetch_begin(self, layer_id: int, fork: torch.Tensor, predict, count: int) -> None:
+        """Make ``predict()``'s expert ids for ``layer_id`` resident on a side stream.
+
+        ``predict`` runs on the side stream once ``fork`` (the tensor it reads) is ready,
+        and returns ``count`` expert ids (a larger ``count`` than the plan buffers hold
+        skips the prefetch). Their misses get slots through the same LRU as the
+        real routing and are copied in while the main stream computes whatever precedes
+        this layer's routing; :meth:`prefetch_join_plan` (before that routing's
+        ``ensure_experts``) and :meth:`prefetch_join_data` (before the expert GEMM) are
+        the two points the main stream waits on. A wrong prediction costs only the PCIe
+        time of its copy and an evicted slot; the real ``ensure_experts`` still fetches
+        whatever the prediction missed.
+        """
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+        from freetoken.moe.offload_kernels import lru_ensure
+
+        if count > self._PF_CAPACITY:
+            return
+        if self._pf_stream is None:
+            # high priority: the prediction's small kernels must not queue behind the layer's
+            # GEMVs, or the copy starts after the window it was meant to hide in has closed
+            prio = int(os.environ.get("FT_PF_PRIO", "-1"))  # DEBUG knob (necommitinti)
+            self._pf_stream = torch.cuda.Stream(device=self.device, priority=prio)
+            n = self.num_layers
+            self._pf_plan_ev = [torch.cuda.Event() for _ in range(n)]
+            self._pf_data_ev = [torch.cuda.Event() for _ in range(n)]
+            cap = self._PF_CAPACITY
+            self._pf_out = torch.empty((cap,), dtype=torch.int32, device=self.device)
+            self._pf_src = torch.empty((min(cap, self.cache_size),), dtype=torch.int32, device=self.device)
+            self._pf_dst = torch.empty_like(self._pf_src)
+            self._pf_num = torch.zeros((1,), dtype=torch.int64, device=self.device)
+        main = torch.cuda.current_stream(self.device)
+        side = self._pf_stream
+        on_main = os.environ.get("FT_PF_MAIN", "1") == "1"  # DEBUG knob (necommitinti)
+        def _plan():
+            ids = predict().reshape(-1).to(torch.int32)
+            k = ids.numel()
+            assert k == count, (k, count)
+            plan = min(k, self.cache_size)
+            src, dst = self._pf_src[:plan], self._pf_dst[:plan]
+            lru_ensure(
+                ids, self.slot_for_id.view(-1), self.id_of_slot, self.usage, self.step,
+                self._pf_out[:k], src, dst, self._pf_num, stats=None,
+                id_base=layer_id * self.num_experts,
+            )
+            return ids, src, dst
+        if on_main:
+            ids, src, dst = _plan()
+            self._pf_plan_ev[layer_id].record(main)
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            if not on_main:
+                ids, src, dst = _plan()
+                self._pf_plan_ev[layer_id].record(side)
+            mixed = self._copy_layer_feat_bytes is not None
+            if os.environ.get("FT_PF_DBG") != "nocopy":  # DEBUG (necommitinti)
+              fast_index_copy_multi_jit(
+                self._copy_dst_ptrs,
+                self._copy_src_ptrs[layer_id],
+                self._copy_layer_feat_bytes[layer_id] if mixed else self._copy_feat_bytes,
+                dst,
+                src,
+                self._pf_num,
+                dst_stride_bytes=self._copy_dst_stride if mixed else None,
+                # one block per bank still fills PCIe 3.0 x16 (1.34 vs 1.32 ms for 8 rows
+                # of 2 MiB on the RX 9060 XT) and, unlike the default 8, leaves the CUs to
+                # the layer it hides behind: 8 blocks slowed that compute by ~20%
+                blocks_per_bank=1,
+            )
+            self._pf_data_ev[layer_id].record(side)
+        # the side stream's temporaries must outlive its kernels: freed only at the join
+        self._pf_keep[layer_id] = (fork, ids)
+
+    def prefetch_join_plan(self, layer_id: int) -> None:
+        """Order the main stream's ``ensure_experts`` after the prefetch's LRU update."""
+        if layer_id in self._pf_keep:
+            torch.cuda.current_stream(self.device).wait_event(self._pf_plan_ev[layer_id])
+
+    def prefetch_join_data(self, layer_id: int) -> None:
+        """Order the expert GEMM after the prefetched rows have landed."""
+        if self._pf_keep.pop(layer_id, None) is not None:
+            if os.environ.get("FT_PF_DBG") == "nowait":  # DEBUG (necommitinti)
+                torch.cuda.current_stream(self.device).wait_event(self._pf_plan_ev[layer_id])
+                return
+            torch.cuda.current_stream(self.device).wait_event(self._pf_data_ev[layer_id])
 
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"

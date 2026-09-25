@@ -352,11 +352,13 @@ class OffloadMoELayer(MoELayer):
                 cache, helpers, hidden_states, topk_weights, topk_ids
             )
         with phase("moe.ensure"):
+            cache.prefetch_join_plan(self.layer_id)
             cache.ensure_experts(self.layer_id, topk_ids)
             if cache.collect_miss_hist:
                 cache.record_miss_hist(self.layer_id)
         with phase("moe.fetch"):
             cache.copy_missing()
+            cache.prefetch_join_data(self.layer_id)
         with phase("moe.gemm"):
             return self._expert_gemm(
                 cache,
