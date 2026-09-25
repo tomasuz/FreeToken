@@ -25,11 +25,13 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     tensor. ``out_indices`` aliases the input, preserving the in-place rewrite every
     downstream GEMM depends on.
     """
+    # a slot-class region: its slice of the LRU arrays, and slot ids local to it
+    base, size = cache.lru_part(layer_id)
     lru_ensure(
         expert_ids,
         cache.slot_for_id.view(-1),
-        cache.id_of_slot,
-        cache.usage,
+        cache.id_of_slot[base : base + size],
+        cache.usage[base : base + size],
         cache.step,
         expert_ids,
         cache.src_indices,
@@ -218,18 +220,19 @@ def _ensure_experts_hybrid_cpu(
 
 
 def _materialize_layer_gpu(cache, layer_id: int) -> None:
-    block = triton.next_power_of_2(max(cache.num_experts, cache.cache_size))
+    base, size = cache.lru_part(layer_id)
+    block = triton.next_power_of_2(max(cache.num_experts, size))
     _materialize_layer_kernel[(1,)](
         cache.slot_for_id,
-        cache.id_of_slot,
-        cache.usage,
+        cache.id_of_slot[base : base + size],
+        cache.usage[base : base + size],
         cache.step,
         cache.evict_slots,
         cache.src_indices,
         cache.num_indices,
         layer_id,
         cache.num_experts,
-        cache.cache_size,
+        size,
         BLOCK=block,
     )
 
@@ -237,7 +240,7 @@ def _materialize_layer_gpu(cache, layer_id: int) -> None:
 def _reset_cache_gpu(cache) -> None:
     block = 256
     total_ids = cache.num_layers * cache.num_experts
-    grid = (triton.cdiv(max(total_ids, cache.cache_size), block),)
+    grid = (triton.cdiv(max(total_ids, cache.lru_slots), block),)
     _reset_cache_kernel[grid](
         cache.slot_for_id,
         cache.id_of_slot,
@@ -247,7 +250,7 @@ def _reset_cache_gpu(cache) -> None:
         cache.num_indices,
         total_ids,
         cache.num_experts,
-        cache.cache_size,
+        cache.lru_slots,
         BLOCK=block,
     )
 

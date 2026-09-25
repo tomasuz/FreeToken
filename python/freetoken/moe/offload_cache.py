@@ -26,6 +26,8 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 # whole layer is tiny) and are excluded from the hit gather, so every per-run
 # entry the batch sees is >= this size.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
+# "gguf" slot classes: a slot region per row width instead of one at the widest (0 = off).
+_GGUF_SLOT_CLASSES = os.getenv("FREETOKEN_GGUF_SLOT_CLASSES", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 from freetoken.utils import init_logger
 
@@ -200,6 +202,14 @@ class OffloadMoeCache:
         self.gguf_layer_types: list[tuple[int, int]] | None = None
         # "gguf" only: each bank's per-layer [rows, row_bytes] (the slot is the widest).
         self.bank_layer_shapes: dict[str, list[tuple[int, ...]]] = {}
+        # "gguf" slot classes (_setup_gguf_parts): layers grouped by row width, each group
+        # with its own slot region at its own width and its own slice of the LRU arrays.
+        # None = one region at the widest layer's width (the pre-classes layout).
+        self._parts: list[dict] | None = None
+        self._layer_part: list[int] | None = None
+        # LRU slots actually allocated; differs from cache_size (the engine's budget, in
+        # widest-layer slots) only when slot classes turn one budget into more slots.
+        self.lru_slots = self.cache_size
         if self.quant_format == "gguf" and (self.prefill_overlap or self.prefill_hit_d2d):
             # Both move whole layers or hit rows at one fixed width; materialize +
             # copy_missing are the paths that honor a width per layer.
@@ -486,31 +496,126 @@ class OffloadMoeCache:
             self.bank_sources[name] = list(per_layer)
             if self.quant_format == "gguf":
                 self.bank_layer_shapes[name] = [tuple(t.shape[1:]) for t in per_layer]
-            self.bank_caches[name] = self._alloc_slot_cache(name, self.cache_size)
+            else:
+                self.bank_caches[name] = self._alloc_slot_cache(name, self.cache_size)
+        if self.quant_format == "gguf":
+            self._alloc_gguf_slots(self.cache_size)
+            if self.id_of_slot.numel() != self.lru_slots:
+                # nothing has been cached yet: the LRU state just follows the slot count
+                self.id_of_slot = torch.full((self.lru_slots,), -1, dtype=torch.int32, device=self.device)
+                self.usage = torch.zeros((self.lru_slots,), dtype=torch.int64, device=self.device)
+                plan_slots = max(self.num_experts, self.lru_slots)
+                self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+                self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
 
     def _alloc_slot_cache(self, name: str, cache_size: int) -> torch.Tensor:
-        """One bank's GPU slot cache: ``[cache_size, *row shape]`` in the bank dtype, or for
-        "gguf" banks ``[cache_size, widest layer's bytes]`` uint8, read per layer through
-        :meth:`layer_bank_views`."""
-        if self.quant_format == "gguf":
-            widest = max(math.prod(shape) for shape in self.bank_layer_shapes[name])
-            return torch.empty((cache_size, widest), dtype=torch.uint8, device=self.device)
+        """One bank's GPU slot cache: ``[cache_size, *row shape]`` in the bank dtype ("gguf"
+        banks go through :meth:`_alloc_gguf_slots` instead)."""
         head = self.bank_sources[name][0]
         return torch.empty((cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device)
 
+    def _layer_widths(self, layer_id: int) -> tuple[int, ...]:
+        return tuple(math.prod(self.bank_layer_shapes[n][layer_id]) for n in self.bank_schema)
+
+    def _plan_gguf_parts(self, budget_slots: int) -> list[dict]:
+        """Group the layers by row width and size each group's slot region.
+
+        ``budget_slots`` is the engine's budget in widest-layer slots, i.e. that many times
+        the widest expert in bytes. One region at the widest width wastes what every
+        narrower layer leaves of a slot (unsloth's UD mixes: 43 of 48 Qwen3.8 layers use
+        2.08 MiB of a 3.32 MiB slot), so the most common width gets a region of its own
+        and the rest share one at their widest. Every layer is given the same number of
+        slots; a region holds at least ``num_experts`` (prefill materializes a whole
+        layer into it).
+        """
+        widths = [self._layer_widths(l) for l in range(self.num_layers)]
+        widest = tuple(max(w[i] for w in widths) for i in range(len(self.bank_schema)))
+        budget = budget_slots * sum(widest)
+        common = max(set(widths), key=widths.count)
+        groups = [[l for l in range(self.num_layers) if widths[l] == common]]
+        rest = [l for l in range(self.num_layers) if widths[l] != common]
+        if rest:
+            groups.append(rest)
+        if not _GGUF_SLOT_CLASSES or len(groups) == 1:
+            groups = [list(range(self.num_layers))]
+        parts = []
+        for layers in groups:
+            w = tuple(max(widths[l][i] for l in layers) for i in range(len(self.bank_schema)))
+            parts.append({"layers": tuple(layers), "widths": w})
+        # equal slots per layer, then lift any region under the num_experts floor and give
+        # the others what is left
+        per_layer_bytes = sum(len(p["layers"]) * sum(p["widths"]) for p in parts)
+        per_layer = budget // per_layer_bytes
+        floored = [p for p in parts if len(p["layers"]) * per_layer < self.num_experts]
+        for p in floored:
+            p["size"] = self.num_experts
+        free = [p for p in parts if p not in floored]
+        if free:
+            left = budget - sum(p["size"] * sum(p["widths"]) for p in floored)
+            per_layer = left // sum(len(p["layers"]) * sum(p["widths"]) for p in free)
+            for p in free:
+                p["size"] = max(self.num_experts, len(p["layers"]) * per_layer)
+        base = 0
+        for p in parts:
+            p["base"] = base
+            base += p["size"]
+        return parts
+
+    def _alloc_gguf_slots(self, budget_slots: int) -> None:
+        """Allocate the "gguf" slot regions: one flat uint8 buffer per bank, a region per
+        slot class inside it, each read at its class width (:meth:`layer_bank_views`)."""
+        parts = self._plan_gguf_parts(budget_slots)
+        self._parts = parts
+        self._layer_part = [0] * self.num_layers
+        for i, p in enumerate(parts):
+            for l in p["layers"]:
+                self._layer_part[l] = i
+        self.lru_slots = sum(p["size"] for p in parts)
+        for b, name in enumerate(self.bank_schema):
+            total = sum(p["size"] * p["widths"][b] for p in parts)
+            flat = torch.empty((total,), dtype=torch.uint8, device=self.device)
+            self.bank_caches[name] = flat
+            offset = 0
+            for p in parts:
+                p.setdefault("views", {})[name] = flat[offset : offset + p["size"] * p["widths"][b]].view(
+                    p["size"], p["widths"][b]
+                )
+                offset += p["size"] * p["widths"][b]
+        if len(parts) > 1:
+            desc = ", ".join(
+                f"{len(p['layers'])} layers x {p['size'] // len(p['layers'])} slots of "
+                f"{sum(p['widths']) / 2**20:.2f} MiB" for p in parts
+            )
+            logger.info_rank0(
+                f"MoE gguf slot classes: {desc} = {self.lru_slots} slots "
+                f"(one widest-width region would hold {budget_slots})"
+            )
+
+    def lru_part(self, layer_id: int) -> tuple[int, int]:
+        """``(base, size)`` of the slot region ``layer_id`` lives in (the whole cache
+        without slot classes)."""
+        if self._parts is None:
+            return 0, self.lru_slots
+        p = self._parts[self._layer_part[layer_id]]
+        return p["base"], p["size"]
+
     def layer_bank_views(self, layer_id: int, n: int | None = None) -> tuple[torch.Tensor, ...]:
-        """:meth:`bank_views` as ``layer_id`` reads them. For "gguf" banks each slot row is
-        viewed as that layer's ``[rows, row_bytes]`` (rows packed at the slot's start, slots
-        a widest-layer apart); every other format's views are already the layer's."""
-        views = self.bank_views(n)
+        """:meth:`bank_views` as ``layer_id`` reads them. For "gguf" banks each slot of the
+        layer's region is viewed as that layer's ``[rows, row_bytes]`` (rows packed at the
+        slot's start, slots a region-width apart), indexed by region-local slot; every
+        other format's views are already the layer's."""
         if self.quant_format != "gguf":
-            return views
+            return self.bank_views(n)
+        part = self._parts[self._layer_part[layer_id]]
         out = []
-        for name, flat in zip(self.bank_schema, views):
+        for name in self.bank_schema:
+            flat = part["views"][name]
+            if n is not None:
+                flat = flat[:n]
             rows, row_bytes = self.bank_layer_shapes[name][layer_id]
             out.append(flat.as_strided((flat.size(0), rows, row_bytes), (flat.stride(0), row_bytes, 1)))
         return tuple(out)
@@ -545,7 +650,8 @@ class OffloadMoeCache:
         self._copy_feat_bytes_host: list[int] = []
         # "gguf": per-layer [num_banks] row bytes, and the slot stride they land at
         self._copy_layer_feat_bytes: list[torch.Tensor] | None = None
-        self._copy_dst_stride: torch.Tensor | None = None
+        self._copy_layer_dst_ptrs: list[torch.Tensor] | None = None
+        self._copy_layer_dst_stride: list[torch.Tensor] | None = None
         self._gather_bank_ids: list[int] = []
         self._gather_dst_ptrs: torch.Tensor | None = None
         self._gather_feat_bytes: torch.Tensor | None = None
@@ -557,13 +663,21 @@ class OffloadMoeCache:
         layer_src_ptrs = [[] for _ in range(self.num_layers)]
         mixed = self.quant_format == "gguf"
         layer_feats = [[] for _ in range(self.num_layers)]
-        for per_layer, cache in self.banks:
-            # a "gguf" slot is the widest layer's expert; every other bank's slot is its row
-            feat = cache[0].numel() * cache.element_size()
-            if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
-                if mixed:
-                    raise RuntimeError(f"gguf MoE slot rows are {feat} B: the fused copy needs 16-byte multiples")
-                return  # leave fused disabled; copy_missing uses the per-bank path
+        for b, (per_layer, cache) in enumerate(self.banks):
+            if mixed:
+                # a "gguf" slot is its region's width (its slot class); the flat bank buffer
+                # holds the regions back to back
+                for part in self._parts:
+                    view = part["views"][self.bank_schema[b]]
+                    if view.stride(0) % 16 or view.data_ptr() % 16:
+                        raise RuntimeError(
+                            f"gguf MoE slot rows are {view.stride(0)} B: the fused copy needs 16-byte multiples"
+                        )
+                feat = max(part["widths"][b] for part in self._parts)
+            else:
+                feat = cache[0].numel() * cache.element_size()
+                if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
+                    return  # leave fused disabled; copy_missing uses the per-bank path
             if mixed:
                 for layer_id, source in enumerate(per_layer):
                     lf = math.prod(source.shape[1:]) * source.element_size()
@@ -600,7 +714,16 @@ class OffloadMoeCache:
             self._copy_layer_feat_bytes = [
                 torch.tensor(f, dtype=torch.int64, device=self.device) for f in layer_feats
             ]
-            self._copy_dst_stride = self._copy_feat_bytes
+            # per layer: its region's base address and slot width, one entry per bank
+            part_dst = [
+                torch.tensor([part["views"][n].data_ptr() for n in self.bank_schema], dtype=torch.int64, device=self.device)
+                for part in self._parts
+            ]
+            part_stride = [
+                torch.tensor(list(part["widths"]), dtype=torch.int64, device=self.device) for part in self._parts
+            ]
+            self._copy_layer_dst_ptrs = [part_dst[self._layer_part[l]] for l in range(self.num_layers)]
+            self._copy_layer_dst_stride = [part_stride[self._layer_part[l]] for l in range(self.num_layers)]
         # hit-D2D gather serves only the big banks; small banks are whole-layer
         # H2D entries (see _SMALL_BANK_FEAT_BYTES), so their rows never need D2D.
         self._gather_bank_ids = [i for i, f in enumerate(feats) if f >= _SMALL_BANK_FEAT_BYTES]
@@ -662,15 +785,19 @@ class OffloadMoeCache:
             torch.cuda.synchronize(self.device)
             torch.cuda.empty_cache()
         # 3. Reallocate the slot cache from the retained host sources.
-        for name in self.bank_schema:
-            self.bank_caches[name] = self._alloc_slot_cache(name, cache_size)
+        if self.quant_format == "gguf":
+            self._alloc_gguf_slots(cache_size)
+        else:
+            self.lru_slots = cache_size
+            for name in self.bank_schema:
+                self.bank_caches[name] = self._alloc_slot_cache(name, cache_size)
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
         # 4. Reallocate cache_size-shaped bookkeeping; reset the slot map (cold start).
         self.slot_for_id.fill_(-1)
-        self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=self.device)
-        self.usage = torch.zeros((cache_size,), dtype=torch.int64, device=self.device)
-        plan_slots = max(self.num_experts, cache_size)
+        self.id_of_slot = torch.full((self.lru_slots,), -1, dtype=torch.int32, device=self.device)
+        self.usage = torch.zeros((self.lru_slots,), dtype=torch.int64, device=self.device)
+        plan_slots = max(self.num_experts, self.lru_slots)
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.step.zero_()
@@ -1753,7 +1880,7 @@ class OffloadMoeCache:
         valid = total > 0
         if int(valid.sum()) == 0:
             return {}
-        slots_per_layer = self.cache_size / self.num_layers
+        slots_per_layer = self.lru_slots / self.num_layers
         C = max(1, int(round(slots_per_layer)))
         sorted_f, _ = torch.sort(freq, dim=1, descending=True)
         oracle_hit = (sorted_f[:, :C].sum(dim=1)[valid] / total[valid]).mean().item()
@@ -1807,13 +1934,13 @@ class OffloadMoeCache:
             # source pointers (layer_id is a static int per captured graph node).
             mixed = self._copy_layer_feat_bytes is not None
             fast_index_copy_multi_jit(
-                self._copy_dst_ptrs,
+                self._copy_layer_dst_ptrs[layer_id] if mixed else self._copy_dst_ptrs,
                 self._copy_src_ptrs[layer_id],
                 self._copy_layer_feat_bytes[layer_id] if mixed else self._copy_feat_bytes,
                 self.evict_slots,
                 self.src_indices,
                 self.num_indices,
-                dst_stride_bytes=self._copy_dst_stride if mixed else None,
+                dst_stride_bytes=self._copy_layer_dst_stride[layer_id] if mixed else None,
             )
             return
 
