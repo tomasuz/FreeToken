@@ -1340,6 +1340,15 @@ class Engine:
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        if use_graph and _GRAPH_HOST_WAIT:
+            # Measured on ROCm (RX 9060 XT, Qwen3.8 offload decode): host work queued while a
+            # replay is still running -- sampling, the next step's staging -- stretched the
+            # replay itself from ~60 to ~120 ms. Letting the replay finish first costs the few
+            # ms of host work it would have hidden. After the host ctx on purpose: its exit may
+            # be what releases a graph waiting on a host flag.
+            done = torch.cuda.Event()
+            done.record(self.stream)
+            done.synchronize()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1424,6 +1433,19 @@ def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
         return None, None
     ident = gpu_identity(torch.cuda.current_device() if index is None else index)
     return ident["name"], ident["uuid"]
+
+
+def _graph_host_wait() -> bool:
+    """``FREETOKEN_GRAPH_HOST_WAIT``: 1/0 forces it, unset or ``auto`` means on under ROCm."""
+    mode = os.getenv("FREETOKEN_GRAPH_HOST_WAIT", "auto").strip().lower()
+    if mode in ("1", "true", "on"):
+        return True
+    if mode in ("0", "false", "off"):
+        return False
+    return torch.version.hip is not None
+
+
+_GRAPH_HOST_WAIT = _graph_host_wait()
 
 
 def _ensure_expandable_segments() -> None:
