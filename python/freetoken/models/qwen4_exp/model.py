@@ -133,6 +133,9 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        if getattr(batch, "mtp_capture", False):
+            # the MTP head drafts from the wide residual of every processed position
+            self._mtp_residual = hidden
         with phase("hc.final"):
             out = self.hyper_connection_mixer.mix(hidden)[0]
         step_done()
@@ -285,6 +288,11 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         batch = get_global_ctx().batch
         h = self.model.forward(batch.input_ids, batch)
         with phase("lm_head"):
+            if getattr(batch, "mtp_capture", False):
+                # an MTP verify scores every row, not just each request's last
+                head = getattr(self.lm_head, "head", None)
+                assert head is not None, "MTP verify needs the GGUF LM head"
+                return head.forward(h)
             return self.lm_head.forward(h)
 
 
