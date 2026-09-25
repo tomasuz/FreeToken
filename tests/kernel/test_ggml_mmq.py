@@ -55,3 +55,56 @@ def test_mmq_moe_matches_dequantized_matmul(ggml_type, shared_row):
     assert torch.isfinite(out).all()
     # MMQ quantizes the activations to q8_1, as llama.cpp does
     assert ((out - ref).norm() / ref.norm()).item() < 0.02
+
+
+@pytest.mark.parametrize("tokens", [1, 3])
+@pytest.mark.parametrize("fused_gate", [False, True])
+def test_mmvq_experts_match_dequantized_matmul(tokens, fused_gate):
+    from freetoken.kernel import ggml_mmq
+    from freetoken.kernel.gguf import ggml_dequantize
+
+    if not ggml_mmq.available():
+        pytest.skip("no hipcc / not ROCm")
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    ggml_type, experts, rows, k, slots, used = 20, 8, 128, 640, 12, 4  # IQ4_NL
+    w = [_blocks(2 * rows, k, ggml_type, dev) for _ in range(experts)]  # gate rows, then up rows
+    row_bytes = w[0].shape[1]
+    width = 2 * rows * row_bytes
+    region = torch.zeros(slots * width + 4096, dtype=torch.uint8, device=dev)
+    slot_of = torch.randperm(slots)[:experts].to(dev)
+    for e in range(experts):
+        region[int(slot_of[e]) * width : int(slot_of[e] + 1) * width] = w[e].reshape(-1)
+    both = region[: slots * width].view(slots, width).as_strided((slots, 2 * rows, row_bytes), (width, row_bytes, 1))
+    expert_ids = torch.stack([torch.randperm(experts)[:used] for _ in range(tokens)]).to(dev)
+    ids = slot_of[expert_ids].to(torch.int32)
+    x = torch.randn(tokens, 1, k, device=dev)
+    if fused_gate:
+        out = ggml_mmq.mmvq(both[:, rows:], ggml_type, k, x, ids, gate=both[:, :rows])
+    else:
+        out = ggml_mmq.mmvq(both[:, :rows], ggml_type, k, x, ids)
+    ref = torch.empty_like(out)
+    for e in range(experts):
+        we = ggml_dequantize(w[e], ggml_type, 2 * rows, k, torch.float32)
+        t, u = (expert_ids == e).nonzero(as_tuple=True)
+        g = x[t, 0] @ we[:rows].T
+        ref[t, u] = torch.nn.functional.silu(g) * (x[t, 0] @ we[rows:].T) if fused_gate else g
+    assert torch.isfinite(out).all()
+    assert ((out - ref).norm() / ref.norm()).item() < 0.02
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 5])
+def test_mmvq_dense_matches_dequantized_matmul(tokens):
+    from freetoken.kernel import ggml_mmq
+    from freetoken.kernel.gguf import ggml_dequantize
+
+    if not ggml_mmq.available():
+        pytest.skip("no hipcc / not ROCm")
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    rows, k = 320, 2560
+    w = _blocks(rows, k, 8, dev)  # Q8_0
+    x = torch.randn(tokens, k, device=dev)
+    out = ggml_mmq.mmvq(w, 8, k, x)
+    ref = x @ ggml_dequantize(w, 8, rows, k, torch.float32).T
+    assert ((out - ref).norm() / ref.norm()).item() < 0.02

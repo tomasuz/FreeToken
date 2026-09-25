@@ -105,6 +105,7 @@ def _lib() -> ctypes.CDLL:
     if not so.exists():
         hipcc = _hipcc()
         units = [(_SRC / "ft_mmq.cu", out / "ft_mmq.o"),
+                 (_SRC / "ft_mmvq.cu", out / "ft_mmvq.o"),
                  (_SRC / "src" / "ggml-cuda" / "quantize.cu", out / "quantize.o"),
                  (_SRC / "src" / "ggml-cuda" / "mmid.cu", out / "mmid.o")]
         for t in _TYPES:
@@ -124,6 +125,8 @@ def _lib() -> ctypes.CDLL:
         os.replace(tmp, so)
     lib = ctypes.CDLL(str(so))
     i64, vp = ctypes.c_int64, ctypes.c_void_p
+    lib.ft_mmq_init.argtypes = []
+    lib.ft_mmq_init.restype = ctypes.c_int
     lib.ft_mmq_supports.argtypes = [ctypes.c_int]
     lib.ft_mmq_supports.restype = ctypes.c_int
     lib.ft_mmq_moe_workspace.argtypes = [ctypes.c_int, i64, i64, i64, i64, i64]
@@ -131,11 +134,29 @@ def _lib() -> ctypes.CDLL:
     lib.ft_mmq_moe.argtypes = [vp, ctypes.c_int, i64, i64, i64, i64, i64, i64,
                                vp, i64, i64, vp, i64, i64, vp, vp, ctypes.c_size_t, vp]
     lib.ft_mmq_moe.restype = ctypes.c_int
+    lib.ft_mmvq_workspace.argtypes = [i64, i64]
+    lib.ft_mmvq_workspace.restype = ctypes.c_size_t
+    lib.ft_mmvq.argtypes = [vp, vp, ctypes.c_int, ctypes.c_int, i64, i64, i64, i64, i64,
+                            vp, i64, vp, i64, i64, vp, vp, ctypes.c_size_t, vp]
+    lib.ft_mmvq.restype = ctypes.c_int
     return lib
 
 
+@functools.cache
+def prepare() -> bool:
+    """Build/load the library and query the device now, outside any graph capture.
+    False (never raises) when the kernels are unavailable here."""
+    if not available():
+        return False
+    try:
+        return _lib().ft_mmq_init() > 0
+    except Exception as exc:  # noqa: BLE001 -- the old kernels still serve
+        logger.warning(f"ggml_mmq unavailable, keeping the older GGUF kernels: {exc}")
+        return False
+
+
 def supports(ggml_type: int) -> bool:
-    return available() and bool(_lib().ft_mmq_supports(int(ggml_type)))
+    return prepare() and bool(_lib().ft_mmq_supports(int(ggml_type)))
 
 
 def mmq_moe(
@@ -175,4 +196,68 @@ def mmq_moe(
     return out
 
 
-__all__ = ["available", "mmq_moe", "supports"]
+# ggml_glu_op values (ggml.h) for mmvq's fused gate
+GLU_SWIGLU = 2
+GLU_GEGLU = 1
+# the most tokens one MMVQ launch takes (MMVQ_MAX_BATCH_SIZE)
+MMVQ_MAX_TOKENS = 8
+
+
+def mmvq(
+    weight: torch.Tensor,
+    ggml_type: int,
+    k: int,
+    x: torch.Tensor,
+    ids: torch.Tensor | None = None,
+    *,
+    gate: torch.Tensor | None = None,
+    glu_op: int = GLU_SWIGLU,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """llama.cpp's quantized mat-vec over at most 8 tokens.
+
+    Dense (``ids`` None): ``weight`` ``[rows, row_bytes]``, ``x`` ``[tokens, k]`` ->
+    f32 ``[tokens, rows]``. Experts: ``weight`` ``[slots, rows, row_bytes]`` (strided slots
+    allowed), ``x`` ``[tokens, 1 | used, k]``, ``ids`` int32 ``[tokens, used]`` -> f32
+    ``[tokens, used, rows]``. ``gate`` (same shape and strides as ``weight``) fuses a gate
+    projection: the result is ``act(x @ gate) * (x @ weight)``. Graph-capturable: no host sync,
+    every buffer a torch allocation on the current stream.
+    """
+    lib = _lib()
+    assert weight.dtype == torch.uint8 and weight.stride(-1) == 1, weight.shape
+    x = x.to(torch.float32).contiguous()
+    tokens = x.shape[0]
+    assert tokens <= MMVQ_MAX_TOKENS, tokens
+    if gate is not None:
+        assert gate.shape == weight.shape and gate.stride() == weight.stride()
+    if ids is None:
+        assert weight.dim() == 2 and x.dim() == 2 and x.shape[1] == k
+        rows, slots, slot_stride, ne11, used = weight.shape[0], 1, weight.stride(0) * weight.shape[0], 1, 1
+        shape = (tokens, rows)
+        rows_y = tokens
+    else:
+        assert weight.dim() == 3 and x.dim() == 3 and x.shape[2] == k
+        slots, rows = weight.shape[0], weight.shape[1]
+        slot_stride = weight.stride(0)
+        used = ids.shape[1]
+        ne11 = x.shape[1]
+        ids = ids.to(torch.int32).contiguous()
+        shape = (tokens, used, rows)
+        rows_y = tokens * ne11
+    row_stride = weight.stride(-2)
+    ws_bytes = lib.ft_mmvq_workspace(k, rows_y)
+    ws = torch.empty((ws_bytes,), dtype=torch.uint8, device=x.device)
+    if out is None:
+        out = torch.empty(shape, dtype=torch.float32, device=x.device)
+    rc = lib.ft_mmvq(
+        weight.data_ptr(), gate.data_ptr() if gate is not None else None, int(glu_op), int(ggml_type),
+        k, rows, row_stride, slot_stride, slots, x.data_ptr(), ne11,
+        ids.data_ptr() if ids is not None else None, tokens, used,
+        out.data_ptr(), ws.data_ptr(), ws_bytes, torch.cuda.current_stream(x.device).cuda_stream,
+    )
+    if rc != 0:
+        raise RuntimeError(f"ft_mmvq failed ({rc}): type {ggml_type}, strides {weight.stride()}")
+    return out
+
+
+__all__ = ["GLU_GEGLU", "GLU_SWIGLU", "MMVQ_MAX_TOKENS", "available", "mmq_moe", "mmvq", "prepare", "supports"]

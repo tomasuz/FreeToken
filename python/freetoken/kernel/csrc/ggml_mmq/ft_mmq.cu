@@ -222,6 +222,12 @@ static size_t ft_q8_bytes(ggml_type type, int64_t K, int64_t rows_y, int64_t ne1
 
 extern "C" {
 
+// Device query + launch-attribute setup happen on first use; calling this before a CUDA graph
+// capture keeps those host calls out of the capture.
+int ft_mmq_init(void) {
+    return ggml_cuda_info().device_count;
+}
+
 // 1 if ft_mmq_moe serves ``type``.
 int ft_mmq_supports(int type) {
     size_t ts;
