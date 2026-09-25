@@ -15,6 +15,7 @@ immediate combine::
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -34,6 +35,21 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from freetoken.core import Batch
     from freetoken.models.config import ModelConfig
+
+
+# Experts guessed per token for the next layer's prefetch (0: off), and where the guess is
+# taken: after this layer's attention ("post_attn") or before it ("pre_attn", a longer
+# window for the copy, a staler residual for the guess).
+_PREFETCH_K = int(os.getenv("FREETOKEN_MOE_PREFETCH_K", "0") or 0)
+_PREFETCH_AT = os.getenv("FREETOKEN_MOE_PREFETCH_AT", "post_attn")
+_PREFETCH_DEBUG = os.getenv("FREETOKEN_MOE_PREFETCH_DEBUG", "")  # "predict_only": cost of the guess alone
+
+
+class _LayerRef:
+    __slots__ = ("op",)
+
+    def __init__(self, op) -> None:
+        self.op = op
 
 
 def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseOP:
@@ -73,11 +89,43 @@ class Qwen4ExpDecoderLayer(BaseOP):
             PLELayer(config, layer_id, prefix=f"{prefix}.ple") if layer_id in config.qwen4_args.ple_layer_ids else None
         )
 
+    # the next decoder layer, behind a plain holder: the BaseOP tree and the MoE-layer walk
+    # (which also enters lists and tuples) must not reach it twice
+    _next: "_LayerRef | None" = None
+
+    def prefetch_from(self, hidden: torch.Tensor) -> None:
+        """Guess this layer's experts from an earlier residual and let the offload cache
+        copy the misses in on a side stream while the previous layer still computes.
+
+        The guess is this layer's own MLP mix and router applied to the earlier streams:
+        the residual moves little across one block, so its top-k holds most of the real
+        routing (from the pre-attention streams of the same layer, a top-12 held 90% of
+        the real top-10 on Qwen3.8).
+        """
+        experts = getattr(self.mlp, "experts", None)
+        cache = getattr(experts, "offload_cache", None)
+        if cache is None or not cache.prefetch_supported(self._layer_id):
+            return
+        k = min(_PREFETCH_K, cache.num_experts, cache.prefetch_budget(self._layer_id) // hidden.shape[0])
+        if k <= 0:
+            return
+        with phase("prefetch"):
+            x, _ = self.mlp_hyper_connection.mix(hidden)
+            ids = torch.topk(self.mlp.gate.forward(x), k, dim=-1).indices
+            if _PREFETCH_DEBUG != "predict_only":
+                cache.prefetch_begin(self._layer_id, ids)
+
+    def _prefetch_next(self, hidden: torch.Tensor, batch: Batch) -> None:
+        if self._next is not None and (batch.is_decode or getattr(batch, "mtp_verify", False)):
+            self._next.op.prefetch_from(hidden)
+
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
         if self.ple is not None:
             with phase("ple"):
                 hidden = hidden + self.ple.forward(hidden, batch)
+        if _PREFETCH_K and _PREFETCH_AT == "pre_attn":
+            self._prefetch_next(hidden, batch)
         with phase("hc.mix"):
             block_input, inject = self.attn_hyper_connection.mix(hidden)
         if self._is_linear:
@@ -88,6 +136,8 @@ class Qwen4ExpDecoderLayer(BaseOP):
                 block_output = self.self_attn.forward(block_input, batch)
         with phase("hc.combine"):
             hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
+        if _PREFETCH_K and _PREFETCH_AT == "post_attn":
+            self._prefetch_next(hidden, batch)
         with phase("hc.mix"):
             block_input, inject = self.mlp_hyper_connection.mix(hidden)
         with phase("mlp"):
@@ -110,6 +160,9 @@ class Qwen4ExpModel(BaseOP):
             ]
         )
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer")
+        layers = self.layers.op_list
+        for layer, nxt in zip(layers, layers[1:]):
+            layer._next = _LayerRef(nxt)
         # plain tuple (not an OP child), so it never shows up in the state dict
         self._ple = tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)
 

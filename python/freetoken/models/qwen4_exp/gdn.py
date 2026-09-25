@@ -123,6 +123,24 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
 
+    def _verify_rows(self, conv_in, a, b, fla, pool, li: int, dtype) -> torch.Tensor:
+        """An MTP verify: the T rows are ONE request's consecutive tokens. Run them through
+        the decode kernels in order -- the conv update a row at a time, the recurrence as one
+        varlen sequence ``cu_seqlens = [0, T]`` -- so the numbers match plain decode's and the
+        path is capturable at any T (the chunk kernel plans its chunks on the host)."""
+        T = conv_in.shape[0]
+        slot = fla.cache_indices[:1]
+        mixed = torch.cat([self._conv_decode(conv_in[t : t + 1], slot, pool) for t in range(T)])
+        qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = qf.reshape(1, T, self.num_k_heads, self.head_k_dim).to(dtype)
+        k = kf.reshape(1, T, self.num_k_heads, self.head_k_dim).to(dtype)
+        v = vf.reshape(1, T, self.num_v_heads, self.head_v_dim).to(dtype)
+        return gdn_decode_fla(
+            q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
+            state_source=pool.recurrent_states[li], indices=slot,
+            cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         batch = ctx.batch
@@ -151,7 +169,9 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
+        if getattr(batch, "mtp_verify", False):
+            core_out = self._verify_rows(conv_in, a, b, fla, pool, li, dtype)
+        elif batch.is_decode:
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).

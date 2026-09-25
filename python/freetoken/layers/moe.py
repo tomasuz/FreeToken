@@ -357,6 +357,7 @@ class OffloadMoELayer(MoELayer):
                 cache.record_miss_hist(self.layer_id)
         with phase("moe.fetch"):
             cache.copy_missing()
+            cache.prefetch_join(self.layer_id)
         with phase("moe.gemm"):
             return self._expert_gemm(
                 cache,

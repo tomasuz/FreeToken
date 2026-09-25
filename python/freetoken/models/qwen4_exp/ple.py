@@ -689,7 +689,19 @@ class PLELayer(BaseOP):
         return F.silu(out.index_select(1, out_index).transpose(0, 1))
 
     def _prefill_indices(self, lens: List[int], device: torch.device):
-        """Columns of the packed history: this forward's outputs, the state block, the next state block."""
+        """Columns of the packed history: this forward's outputs, the state block, the next state block.
+
+        Memoized for the short shapes an MTP verify uses: its captured graph must not hold a
+        host->device copy of a staging tensor that is freed after the capture."""
+        key = (tuple(lens), device)
+        if len(lens) == 1 and lens[0] <= 8:
+            memo = self.__dict__.setdefault("_indices_memo", {})
+            if key not in memo:
+                memo[key] = self._build_prefill_indices(lens, device)
+            return memo[key]
+        return self._build_prefill_indices(lens, device)
+
+    def _build_prefill_indices(self, lens: List[int], device: torch.device):
         state_len = self.state_len
         counts = torch.tensor(lens, dtype=torch.int64)
         cu = torch.cat([counts.new_zeros(1), counts.cumsum(0)])

@@ -212,6 +212,15 @@ class OffloadMoeCache:
         self.gguf_layer_types: list[tuple[int, int]] | None = None
         # "gguf" only: each bank's per-layer [rows, row_bytes] (the slot is the widest).
         self.bank_layer_shapes: dict[str, list[tuple[int, ...]]] = {}
+        # decode prefetch (prefetch_begin): side stream, per-layer events, plan buffers
+        self._pf_stream = None
+        self._pf_data_ev: list = []
+        self._pf_out: torch.Tensor | None = None
+        self._pf_src: torch.Tensor | None = None
+        self._pf_dst: torch.Tensor | None = None
+        self._pf_num: torch.Tensor | None = None
+        self._pf_keep: dict[int, torch.Tensor] = {}
+        self._pf_fetched = torch.zeros((1,), dtype=torch.int64, device=self.device)
         # "gguf" slot classes (_setup_gguf_parts): layers grouped by row width, each group
         # with its own slot region at its own width and its own slice of the LRU arrays.
         # None = one region at the widest layer's width (the pre-classes layout).
@@ -1813,6 +1822,7 @@ class OffloadMoeCache:
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
         self.miss_hist.zero_()
+        self._pf_fetched.zero_()
 
     def record_miss_hist(self, layer_id: int) -> None:
         """Count this layer-step's fetch into :attr:`miss_hist` (``FREETOKEN_MISS_HIST``)."""
@@ -1881,6 +1891,7 @@ class OffloadMoeCache:
             "fetch_rate": (fetched / missing) if missing else 0.0,
             # prefill hit-D2D split: expert rows served from the cache (D2D) vs all
             # rows prefetched into the double buffer since the last reset.
+            "prefetched_per_layer": (int(self._pf_fetched.item()) / calls) if calls else 0.0,
             "prefill_hit_rows": self.prefill_hit_rows,
             "prefill_rows": self.prefill_total_rows,
         }
@@ -1944,6 +1955,105 @@ class OffloadMoeCache:
             "oracle_hit_at_slots": oracle_hit,
             "norm_entropy": norm_ent,
         }
+
+    # ------------------------------------------------------------------
+    # Decode prefetch: a layer's predicted experts, fetched while the one before it runs.
+    # ------------------------------------------------------------------
+
+    # predicted ids one prefetch can take: the plan buffers are allocated once, since a
+    # captured graph keeps the addresses it saw
+    _PF_CAPACITY = 256
+
+    def prefetch_supported(self, layer_id: int) -> bool:
+        """Whether ``layer_id`` goes through the slot cache on the fused copy, the one path
+        :meth:`prefetch_begin` can stage into."""
+        return (
+            self._copy_fused_ok
+            and self.device.type == "cuda"
+            and not self.is_resident_layer(layer_id)
+            and not self.is_cpu_layer(layer_id)
+            and layer_id not in self.inplace_layer_ids
+            and layer_id not in self._unpinned_layers
+            and not self.split_helpers(layer_id)
+        )
+
+    def prefetch_budget(self, layer_id: int) -> int:
+        """Most ids one prefetch of ``layer_id`` may plan: half its slot region, so the real
+        routing that follows can never evict a slot the prefetch is still writing."""
+        return min(self._PF_CAPACITY, self.lru_part(layer_id)[1] // 2)
+
+    def prefetch_begin(self, layer_id: int, ids: torch.Tensor) -> None:
+        """Make the expert ids ``ids`` of ``layer_id`` resident, copying the misses on a side
+        stream while the main stream keeps computing.
+
+        The LRU plan runs on the main stream (it shares the step counter and the id map
+        with every other ensure); only the copy forks off. The layer's own
+        ``ensure_experts`` then finds the predicted experts resident, and
+        :meth:`prefetch_join` -- before its expert GEMM -- waits for their bytes. A wrong
+        guess costs its PCIe time and a slot; the real routing still fetches whatever the
+        guess missed. At most :meth:`prefetch_budget` ids, else the prefetch is skipped.
+        """
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+        from freetoken.moe.offload_kernels import lru_ensure
+
+        ids = ids.reshape(-1).to(torch.int32)
+        k = ids.numel()
+        if k > self.prefetch_budget(layer_id):
+            return
+        if self._pf_stream is None:
+            # high priority: the copy must start inside the window it hides in, not queue
+            # behind the layer's GEMVs
+            self._pf_stream = torch.cuda.Stream(device=self.device, priority=-1)
+            n = self.num_layers
+            self._pf_data_ev = [torch.cuda.Event() for _ in range(n)]
+            # two plan sets, by layer parity: layer l+1's copy may still be reading its plan
+            # when the main stream plans layer l+2; it is joined before layer l+3 plans
+            cap = self._PF_CAPACITY
+            i32 = dict(dtype=torch.int32, device=self.device)
+            self._pf_out = torch.empty((2, cap), **i32)
+            self._pf_src = torch.empty((2, cap), **i32)
+            self._pf_dst = torch.empty((2, cap), **i32)
+            self._pf_num = torch.zeros((2, 1), dtype=torch.int64, device=self.device)
+        base, size = self.lru_part(layer_id)
+        par = layer_id % 2
+        src, dst, num = self._pf_src[par, :k], self._pf_dst[par, :k], self._pf_num[par]
+        lru_ensure(
+            ids, self.slot_for_id.view(-1), self.id_of_slot[base : base + size],
+            self.usage[base : base + size], self.step, self._pf_out[par, :k], src, dst,
+            num, stats=None, id_base=layer_id * self.num_experts,
+        )
+        if self.collect_stats:
+            self._pf_fetched += num
+        main = torch.cuda.current_stream(self.device)
+        side = self._pf_stream
+        side.wait_stream(main)
+        mixed = self._copy_layer_feat_bytes is not None
+        with torch.cuda.stream(side):
+            fast_index_copy_multi_jit(
+                self._copy_layer_dst_ptrs[layer_id] if mixed else self._copy_dst_ptrs,
+                self._copy_src_ptrs[layer_id],
+                self._copy_layer_feat_bytes[layer_id] if mixed else self._copy_feat_bytes,
+                dst,
+                src,
+                num,
+                dst_stride_bytes=self._copy_layer_dst_stride[layer_id] if mixed else None,
+                # one block per bank still fills PCIe 3.0 x16 and, unlike the default 8,
+                # leaves the CUs to the compute it hides behind (8 slowed it by ~20%)
+                blocks_per_bank=1,
+            )
+            if mixed and self._tail_zero[layer_id]:
+                from freetoken.moe.offload_kernels import zero_slot_tails
+
+                for view, start in self._tail_zero[layer_id]:
+                    zero_slot_tails(view, dst, num, start, _GGUF_SLOT_TAIL_BYTES)
+            self._pf_data_ev[layer_id].record(side)
+        # the ids tensor must outlive the side stream's kernels: dropped at the join
+        self._pf_keep[layer_id] = ids
+
+    def prefetch_join(self, layer_id: int) -> None:
+        """Order the expert GEMM after the prefetched rows of ``layer_id`` have landed."""
+        if self._pf_keep.pop(layer_id, None) is not None:
+            torch.cuda.current_stream(self.device).wait_event(self._pf_data_ev[layer_id])
 
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"

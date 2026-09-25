@@ -158,7 +158,12 @@ class Qwen4MTPMixin:
         fi = self._prepare_batch(b)
         b.input_ids = self.token_pool[fi.input_tuple]
         b.mtp_capture = True
+        b.mtp_verify = True
         model = self.engine.model
+        graphs = self._mtp4_graphs()
+        if graphs is not None and T in graphs.graphs:
+            logits, R = graphs.run(b, req, self._mtp4_live_slot(req), tokens)
+            return logits.argmax(dim=-1).to("cpu").tolist(), R
         # the host side (PLE n-gram rows) reads the ids of every processed position, the
         # draft's included: show it the draft for the length of the forward
         n_old = req.input_ids.numel()
@@ -173,9 +178,48 @@ class Qwen4MTPMixin:
         top = logits.argmax(dim=-1).to("cpu").tolist()
         return top, model.model._mtp_residual
 
+    def _mtp4_graphs(self):
+        """The captured verify forwards (engine/verify_graph.py), captured on first use; None
+        when graphs are off (no decode graphs, or FREETOKEN_MTP_GRAPH=0) or capture failed."""
+        graphs = getattr(self, "_mtp4_vg", None)
+        if graphs is not None:
+            return graphs or None
+        self._mtp4_vg = False
+        if os.environ.get("FREETOKEN_MTP_GRAPH", "1") in ("0", "false", "off", "no"):
+            return None
+        if not self.engine.graph_runner.max_graph_bs:
+            return None
+        from freetoken.engine.verify_graph import HeadGraphs, VerifyGraphs
+
+        try:
+            graphs = VerifyGraphs(self.engine, sizes=range(2, MAX_T + 1))
+            graphs.capture()
+        except Exception:  # noqa: BLE001 -- eager verify still works
+            import traceback
+
+            traceback.print_exc()
+            logger.exception("[mtp4] verify graph capture failed; verifying eagerly")
+            return None
+        try:
+            head = HeadGraphs(self.engine)
+            head.capture()
+            graphs.head = head
+        except Exception:  # noqa: BLE001 -- the eager head still drafts
+            import traceback
+
+            traceback.print_exc()
+            logger.exception("[mtp4] MTP head graph capture failed; drafting eagerly")
+            graphs.head = None
+        self._mtp4_vg = graphs
+        return graphs
+
     def _mtp4_draft(self, req: Req, R: torch.Tensor, next_tokens: list[int], first_pos: int) -> int:
         """Feed (R[j], next_tokens[j]) at positions first_pos+j to the head; the argmax of the
         last row drafts the token after the newest one."""
+        graphs = self._mtp4_graphs()
+        head = getattr(graphs, "head", None) if graphs is not None else None
+        if head is not None and len(next_tokens) in head.graphs:
+            return head.run(R, next_tokens, first_pos)
         model = self.engine.model
         ids = torch.tensor(next_tokens, dtype=torch.int64).to(self.device, non_blocking=True)
         pos = torch.arange(first_pos, first_pos + len(next_tokens), dtype=torch.int64, device=self.device)
@@ -200,7 +244,11 @@ class Qwen4MTPMixin:
         try:
             t0 = time.perf_counter()
             top, R = self._mtp4_run(req, tokens)
-            stat["t_verify"] = stat.get("t_verify", 0.0) + time.perf_counter() - t0
+            dt = time.perf_counter() - t0
+            stat["t_verify"] = stat.get("t_verify", 0.0) + dt
+            per_t = stat.setdefault("per_T", {})
+            n, tot = per_t.get(T, (0, 0.0))
+            per_t[T] = (n + 1, tot + dt)
             stat["forwards"] += 1
             stat["tokens"] += T
             real = top[n_p - 1]
