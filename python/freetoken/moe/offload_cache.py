@@ -187,6 +187,10 @@ class OffloadMoeCache:
     # bank layout from the expert kernel (a BankSpec per role); when given it replaces the _BANK_SCHEMAS lookup and the slot cap comes from max_slots
     layout: dict | None = None
     max_slots: int | None = None
+    # Fewest slots a cache (and each "gguf" slot region) may have. None = num_experts: a
+    # prefill that materializes a whole layer needs that many. A cache that is only ever
+    # filled through ensure_experts (the MTP head's) needs just its largest routed id set.
+    slot_floor: int | None = None
 
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0}
@@ -577,17 +581,18 @@ class OffloadMoeCache:
             parts.append({"layers": tuple(layers), "widths": tuple(w), "mixed": tuple(tails)})
         # equal slots per layer, then lift any region under the num_experts floor and give
         # the others what is left
+        floor = self.num_experts if self.slot_floor is None else self.slot_floor
         per_layer_bytes = sum(len(p["layers"]) * sum(p["widths"]) for p in parts)
         per_layer = budget // per_layer_bytes
-        floored = [p for p in parts if len(p["layers"]) * per_layer < self.num_experts]
+        floored = [p for p in parts if len(p["layers"]) * per_layer < floor]
         for p in floored:
-            p["size"] = self.num_experts
+            p["size"] = floor
         free = [p for p in parts if p not in floored]
         if free:
             left = budget - sum(p["size"] * sum(p["widths"]) for p in floored)
             per_layer = left // sum(len(p["layers"]) * sum(p["widths"]) for p in free)
             for p in free:
-                p["size"] = max(self.num_experts, len(p["layers"]) * per_layer)
+                p["size"] = max(floor, len(p["layers"]) * per_layer)
         base = 0
         for p in parts:
             p["base"] = base
@@ -783,8 +788,9 @@ class OffloadMoeCache:
         pre-teardown check, so an invalid target rejects with the old cache intact
         (no destructive free first).
         """
-        if cache_size < self.num_experts:
-            raise ValueError(f"cache_size {cache_size} < num_experts {self.num_experts}")
+        floor = self.num_experts if self.slot_floor is None else self.slot_floor
+        if cache_size < floor:
+            raise ValueError(f"cache_size {cache_size} < slot floor {floor}")
         if self.max_slots is not None and cache_size > self.max_slots:
             raise ValueError(
                 f"moe_cache_size={cache_size} exceeds the expert kernel's slot limit of {self.max_slots}; "

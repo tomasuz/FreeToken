@@ -921,6 +921,8 @@ class Engine:
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
+        if getattr(config, "mtp", False) and _gguf_mtp_head(config, config.model_config):
+            self.model.init_mtp(config.mtp_model_path, self.device)
         return cache
 
     def _resolve_hybrid_fetch(self, config: EngineConfig, cache) -> None:
@@ -1433,6 +1435,12 @@ def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
         return None, None
     ident = gpu_identity(torch.cuda.current_device() if index is None else index)
     return ident["name"], ident["uuid"]
+
+
+def _gguf_mtp_head(config, model_config) -> bool:
+    """--mtp with a separate MTP GGUF on a model that builds such a head itself."""
+    path = getattr(config, "mtp_model_path", None) or ""
+    return path.endswith(".gguf") and getattr(model_config, "qwen4_args", None) is not None
 
 
 def _graph_host_wait() -> bool:
@@ -2202,7 +2210,12 @@ def _adjust_config(config: EngineConfig):
     # head (mtp_num_hidden_layers). Flipping mtp_enabled here (on the SAME ModelConfig instance
     # the engine builds the model and KV pool from) makes the model construct its head, the KV
     # group carry one extra full-attention slab and the weight load pull the mtp.* tensors.
-    if getattr(config, "mtp", False):
+    if getattr(config, "mtp", False) and _gguf_mtp_head(config, model_config):
+        # qwen4exp: llama.cpp ships the head as its own GGUF, and the model builds it with its
+        # own expert cache and attention ring (Qwen4ExpForCausalLM.init_mtp) -- none of the
+        # qwen3_5 head wiring (extra KV slab, mtp.* tensors) applies
+        logger.info_rank0(f"MTP draft head: {config.mtp_model_path}")
+    elif getattr(config, "mtp", False):
         mtp_layers = getattr(model_config, "mtp_num_layers", 0)
         if mtp_layers <= 0:
             raise ValueError(

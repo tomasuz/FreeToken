@@ -158,6 +158,56 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
             convert_qwen4exp_to_gguf(self, config)
 
+    # ----- MTP draft head (llama.cpp's separate MTP GGUF; see mtp.py) -----------------
+    _mtp = None
+
+    def init_mtp(self, mtp_path: str, device: torch.device) -> None:
+        """Build the MTP head from ``mtp_path`` with its own expert cache. Kept out of the
+        BaseOP tree: the engine's base expert cache and base state dict never see it."""
+        import types
+
+        from .mtp import (
+            MTP_CACHE_SLOTS,
+            Qwen4ExpMTPHead,
+            build_mtp_cache,
+            mtp_expert_banks,
+            mtp_layer_and_experts,
+            mtp_state_dict,
+        )
+
+        layer, experts, expert_types = mtp_layer_and_experts(mtp_path)
+        prev = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)
+        try:
+            with torch.device(device):
+                head = Qwen4ExpMTPHead(self._config, experts)
+        finally:
+            torch.set_default_dtype(prev)
+        want = head.state_dict()
+        sd = {}
+        for key, t in mtp_state_dict(mtp_path, layer).items():
+            sd[key] = t.to(device=device, dtype=want[key].dtype)
+        head.load_state_dict(sd)
+        head.self_attn.alloc_ring(device, torch.bfloat16)
+        cfg = self._config
+        banks = mtp_expert_banks(mtp_path, layer, experts, cfg.moe_intermediate_size, cfg.hidden_size, expert_types)
+        top_k = cfg.num_experts_per_tok
+        cache = build_mtp_cache(device, experts, expert_types, banks, max(MTP_CACHE_SLOTS, 4 * top_k))
+        head.mlp.experts.offload_cache = cache
+        self._mtp = types.SimpleNamespace(head=head, cache=cache, banks=banks)
+        mib = sum(v.numel() for v in cache.bank_caches.values()) / 2**20
+        logger.info_rank0(f"MTP head from {mtp_path}: {experts} experts, {cache.lru_slots} cached ({mib:.0f} MiB)")
+
+    @property
+    def has_mtp_head(self) -> bool:
+        return self._mtp is not None
+
+    def mtp_forward(self, R_prev: torch.Tensor, next_ids: torch.Tensor, positions: torch.Tensor):
+        """``(draft logits, head residual)`` for each (base residual at p, token at p+1)."""
+        lm = self.lm_head
+        head_linear = getattr(lm, "head", lm)  # GGUFLMHead wraps a GGUFLinear: all rows
+        return self._mtp.head.forward(R_prev, next_ids, positions, self.model.embed_tokens, head_linear)
+
     def load_host_tables(self, engine_config) -> int:
         """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""
         ple_layers = self.model.ple_layers
