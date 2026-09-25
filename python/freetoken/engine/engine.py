@@ -919,6 +919,13 @@ class Engine:
         assert len(layers) == config.model_config.num_moe_layers
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
+        elif cache.quant_format == "gguf" and os.environ.get("FREETOKEN_GGUF_CPU_ASSIST", "0") == "1":
+            # GGUF offload decode with the CPU computing the non-resident experts
+            cache.cpu_assist = self._init_cpu_moe_executor(config, cache, layers, attach=False)
+            logger.info_rank0(
+                f"GGUF CPU assist: {cache.cpu_assist.num_threads} CPU threads compute the "
+                f"experts the slot cache does not hold ({cache.cpu_assist.isa})"
+            )
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
         if getattr(config, "mtp", False) and _gguf_mtp_head(config, config.model_config):
@@ -1093,7 +1100,7 @@ class Engine:
             )
         return executors
 
-    def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
+    def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers, *, attach: bool = True):
         """Build the persistent CPU MoE executor (decode-time expert compute).
 
         Must run before CUDA graph capture: the worker pool has to be live for the
@@ -1126,8 +1133,10 @@ class Engine:
             # FIXME: the None branch serves GGUF q4_0 banks, which have no quant method yet; drop it once GGUF joins the quant path
             fmt=sample.quant_method.cpu_format if sample.quant_method is not None else None,
         )
-        cache.set_cpu_executor(executor)
+        if attach:
+            cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
+        return executor
 
     def _sync_get_memory(self) -> Tuple[int, int]:
         """Get the min and max free memory across TP ranks."""

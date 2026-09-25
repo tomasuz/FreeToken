@@ -186,6 +186,9 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        cache = getattr(get_global_ctx(), "moe_offload_cache", None)
+        if cache is not None and getattr(cache, "cpu_assist", None) is not None:
+            cache.assist_join()  # background admissions land before the next step
         if getattr(batch, "mtp_capture", False):
             # the MTP head drafts from the wide residual of every processed position
             self._mtp_residual = hidden

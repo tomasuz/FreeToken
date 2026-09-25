@@ -221,6 +221,11 @@ class OffloadMoeCache:
         self._pf_num: torch.Tensor | None = None
         self._pf_keep: dict[int, torch.Tensor] = {}
         self._pf_fetched = torch.zeros((1,), dtype=torch.int64, device=self.device)
+        # CPU assist (gguf decode): the CPU executor that computes the non-resident experts
+        # while the GPU computes the cached ones; admissions copy in the background
+        self.cpu_assist = None
+        self._adm_plan: tuple | None = None
+        self._adm_pending = False
         # "gguf" slot classes (_setup_gguf_parts): layers grouped by row width, each group
         # with its own slot region at its own width and its own slice of the LRU arrays.
         # None = one region at the widest layer's width (the pre-classes layout).
@@ -2049,6 +2054,76 @@ class OffloadMoeCache:
             self._pf_data_ev[layer_id].record(side)
         # the ids tensor must outlive the side stream's kernels: dropped at the join
         self._pf_keep[layer_id] = ids
+
+    def assist_lookup(self, layer_id: int, expert_ids: torch.Tensor) -> torch.Tensor:
+        """The region-local slot of each routed expert of ``layer_id``, or -1 where it is
+        not resident. A pure read: nothing is admitted or bumped."""
+        flat = expert_ids.to(torch.int64) + layer_id * self.num_experts
+        return self.slot_for_id.view(-1).index_select(0, flat.reshape(-1)).view(expert_ids.shape)
+
+    def assist_admit(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        """Record this step's routing of ``layer_id`` in the LRU -- bumping the resident
+        experts, giving the rest slots -- and copy the newcomers in on the side stream
+        without waiting: this step computes them on the CPU, so only a later step reads
+        them, after :meth:`assist_join` at the end of this forward.
+
+        Each layer has its own plan buffers, so no plan is overwritten while its copy may
+        still be queued. The resident experts this step's GEMM reads carry this call's
+        step stamp, which is what keeps them out of the eviction."""
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+        from freetoken.moe.offload_kernels import lru_ensure
+
+        ids = expert_ids.reshape(-1).to(torch.int32, copy=True)
+        k = ids.numel()
+        base, size = self.lru_part(layer_id)
+        if k > min(self._PF_CAPACITY, size // 2):
+            return
+        if self._adm_plan is None:
+            cap = self._PF_CAPACITY
+            i32 = dict(dtype=torch.int32, device=self.device)
+            n = self.num_layers
+            self._adm_plan = (
+                torch.empty((n, cap), **i32), torch.empty((n, cap), **i32),
+                torch.empty((n, cap), **i32), torch.zeros((n, 1), dtype=torch.int64, device=self.device),
+            )
+            if self._pf_stream is None:
+                self._pf_stream = torch.cuda.Stream(device=self.device, priority=-1)
+        out, src, dst, num = (t[layer_id] for t in self._adm_plan)
+        lru_ensure(
+            ids, self.slot_for_id.view(-1), self.id_of_slot[base : base + size],
+            self.usage[base : base + size], self.step, out[:k], src[:k], dst[:k], num,
+            stats=self.lru_stats[layer_id] if self.collect_stats else None,
+            id_base=layer_id * self.num_experts,
+        )
+        main = torch.cuda.current_stream(self.device)
+        side = self._pf_stream
+        side.wait_stream(main)
+        mixed = self._copy_layer_feat_bytes is not None
+        with torch.cuda.stream(side):
+            fast_index_copy_multi_jit(
+                self._copy_layer_dst_ptrs[layer_id] if mixed else self._copy_dst_ptrs,
+                self._copy_src_ptrs[layer_id],
+                self._copy_layer_feat_bytes[layer_id] if mixed else self._copy_feat_bytes,
+                dst[:k], src[:k], num,
+                dst_stride_bytes=self._copy_layer_dst_stride[layer_id] if mixed else None,
+                blocks_per_bank=1,  # leave the CUs to the GEMMs it runs beside
+            )
+            if mixed and self._tail_zero[layer_id]:
+                from freetoken.moe.offload_kernels import zero_slot_tails
+
+                for view, start in self._tail_zero[layer_id]:
+                    zero_slot_tails(view, dst[:k], num, start, _GGUF_SLOT_TAIL_BYTES)
+        self._pf_keep[("adm", layer_id)] = ids
+        self._adm_pending = True
+
+    def assist_join(self) -> None:
+        """End of a forward: the background admissions must land before the next step
+        reads their slots."""
+        if self._adm_pending:
+            torch.cuda.current_stream(self.device).wait_stream(self._pf_stream)
+            self._adm_pending = False
+            for key in [k for k in self._pf_keep if isinstance(k, tuple)]:
+                del self._pf_keep[key]
 
     def prefetch_join(self, layer_id: int) -> None:
         """Order the expert GEMM after the prefetched rows of ``layer_id`` have landed."""
