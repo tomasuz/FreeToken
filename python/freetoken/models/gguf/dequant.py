@@ -36,6 +36,7 @@ from freetoken.gguf_quant import (  # noqa: F401
     GGML_Q5_K,
     GGML_Q6_K,
     GGML_Q8_0,
+    GGML_IQ4_NL,
     GGUF_EXPERT_FORMATS,
     row_bytes,
 )
@@ -99,9 +100,35 @@ def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     return y.reshape(-1).to(out_dtype)
 
 
+def dequant_q8_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q8_0: per 32-elem block = fp16 scale ``d`` + 32 int8; ``w = d*q``."""
+    raw = raw.reshape(-1, 34)
+    d = _f16_scales(raw, 0, 2)  # [N,1]
+    q = raw[:, 2:34].contiguous().view(torch.int8).to(torch.float32)  # [N,32]
+    return (q * d).reshape(-1).to(out_dtype)
+
+
+# ggml-common.h kvalues_iq4nl: the 16-entry non-linear codebook of IQ4_NL / IQ4_XS
+_KVALUES_IQ4NL = (-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113)
+
+
+def dequant_iq4_nl(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """IQ4_NL: per 32-elem block = fp16 scale ``d`` + 16 packed nibbles indexing the
+    ``kvalues_iq4nl`` codebook; ``w = d*kvalues[q]``. Nibble order as Q4_0: byte ``j``
+    holds element ``j`` low and ``j+16`` high."""
+    raw = raw.reshape(-1, 18)
+    d = _f16_scales(raw, 0, 2)  # [N,1]
+    qs = raw[:, 2:18].to(torch.int64)  # [N,16]
+    lut = torch.tensor(_KVALUES_IQ4NL, dtype=torch.float32, device=raw.device)
+    q = torch.cat([lut[qs & 0x0F], lut[qs >> 4]], dim=1)  # [N,32]
+    return (q * d).reshape(-1).to(out_dtype)
+
+
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
     GGML_Q6_K: dequant_q6_k,
+    GGML_Q8_0: dequant_q8_0,
+    GGML_IQ4_NL: dequant_iq4_nl,
 }
 
 

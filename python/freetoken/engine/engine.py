@@ -883,6 +883,11 @@ class Engine:
             layout=layout,
             max_slots=max_slots,
         )
+        if cache.quant_format == "gguf":
+            # per-layer ggml types of a GGUF checkpoint that mixes expert quants
+            cache.gguf_layer_types = list(config.model_config.gguf_expert_types or ())
+            if len(cache.gguf_layer_types) != config.model_config.num_moe_layers:
+                raise ValueError("gguf experts: model config carries no per-layer expert types")
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
         cache.inplace_layer_ids = frozenset(inplace_layers)

@@ -282,7 +282,8 @@ def _gguf_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     # The bank shape is the same for every ggml quant; only row_bytes differs, so the
     # tag on the config selects both the schema and the byte sizer.
     tag = str(getattr(model_config, "expert_quant", "q4_0"))
-    if tag not in GGUF_EXPERT_FORMATS:
+    # "gguf": ggml types differ by layer (model_config.gguf_expert_types), one schema all the same
+    if tag not in GGUF_EXPERT_FORMATS and tag != "gguf":
         raise ValueError(
             f"expert_quant {tag!r} is not a native GGUF quant; "
             f"known: {', '.join(sorted(GGUF_EXPERT_FORMATS))}"
@@ -300,6 +301,7 @@ _PROVIDERS = {
 # every native GGUF quant shares one provider; the tag picks the row_bytes sizer.
 for _tag in GGUF_EXPERT_FORMATS:
     _PROVIDERS.setdefault(_tag, _gguf_banks)
+_PROVIDERS["gguf"] = _gguf_banks
 
 
 def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None) -> ExpertBanks:

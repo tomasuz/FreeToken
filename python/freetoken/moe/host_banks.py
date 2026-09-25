@@ -489,6 +489,42 @@ def alloc_layer_banks(
     }
 
 
+def alloc_varying_layer_banks(
+    layer_specs: list[dict[str, tuple[tuple[int, ...], torch.dtype]]],
+) -> dict[str, list[HostBank]]:
+    """:func:`alloc_layer_banks` for banks whose row shape differs by layer: one spec dict
+    per layer (same names in each). GGUF checkpoints mixing expert quants across layers
+    (unsloth's UD quants) need it -- a layer's row bytes follow its own ggml type."""
+    if not layer_specs:
+        return {}
+    names = tuple(layer_specs[0])
+    assert all(tuple(s) == names for s in layer_specs), "every layer must name the same banks"
+    num_layers = len(layer_specs)
+    shared_layers = [l for l in range(num_layers) if _layer_backing(l) == "shared"]
+    if shared_layers:
+        widest = {
+            name: max((layer_specs[l][name] for l in shared_layers),
+                      key=lambda spec: math.prod(spec[0]) * torch.empty((), dtype=spec[1]).element_size())
+            for name in names
+        }
+        _check_shared_capacity(widest, len(shared_layers))
+    return {
+        name: [
+            HostBank(
+                layer_specs[layer_id][name][0],
+                layer_specs[layer_id][name][1],
+                backing=_layer_backing(layer_id),
+                shared_name=(
+                    shared_bank_name(_shared_bank_tag, name, layer_id)
+                    if _layer_backing(layer_id) == "shared" else None
+                ),
+            )
+            for layer_id in range(num_layers)
+        ]
+        for name in names
+    }
+
+
 class _ResidencyPlan:
     """Per-layer ``HostResidency`` labels, ambiently visible to the bank settle points.
 

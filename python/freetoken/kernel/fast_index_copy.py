@@ -158,6 +158,7 @@ def fast_index_copy_multi_jit(
     src_indices: torch.Tensor,
     num_indices: torch.Tensor | None = None,
     *,
+    dst_stride_bytes: torch.Tensor | None = None,
     num_threads: int = 1024,
     blocks_per_bank: int = 8,
 ) -> None:
@@ -176,13 +177,18 @@ def fast_index_copy_multi_jit(
     once by the caller (the per-bank slot-cache base addr, host-source base addr, and
     per-row byte size). Every bank's per-row byte size must be a multiple of 16, and the
     base addresses 16-byte aligned (true for contiguous torch allocations of these banks).
+
+    ``dst_stride_bytes`` (int64 [num_banks], optional) spaces the destination rows apart by
+    more than they are long: a slot cache sized for the widest layer of a model whose layers
+    store experts in different ggml types. Absent, rows are packed (stride == ``feat_bytes``).
     """
     if _skip_fast_index_copy_enabled():
         return
     module = _jit_fast_index_copy_multi_module(
         num_threads=num_threads, blocks_per_bank=blocks_per_bank
     )
-    module.launch(dst_ptrs, src_ptrs, feat_bytes, dst_indices, src_indices, num_indices)
+    module.launch(dst_ptrs, src_ptrs, feat_bytes, dst_indices, src_indices, num_indices,
+                  dst_stride_bytes)
 
 
 def update_copy_flag_jit(sync_flag: torch.Tensor, delta: int) -> None:

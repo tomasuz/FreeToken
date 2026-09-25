@@ -21,6 +21,16 @@ GGML_Q3_K = 11
 GGML_Q4_K = 12
 GGML_Q5_K = 13
 GGML_Q6_K = 14
+# i-quants: dequantize and the MMVQ / MoE-vector kernels handle them, the MMQ kernels do not
+GGML_IQ2_XXS = 16
+GGML_IQ2_XS = 17
+GGML_IQ3_XXS = 18
+GGML_IQ1_S = 19
+GGML_IQ4_NL = 20
+GGML_IQ3_S = 21
+GGML_IQ2_S = 22
+GGML_IQ4_XS = 23
+GGML_IQ1_M = 29
 GGML_BF16 = 30
 
 # (block numel, bytes per block) per ggml type.
@@ -38,6 +48,15 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_Q4_K: (256, 144),
     GGML_Q5_K: (256, 176),
     GGML_Q6_K: (256, 210),
+    GGML_IQ2_XXS: (256, 66),
+    GGML_IQ2_XS: (256, 74),
+    GGML_IQ3_XXS: (256, 98),
+    GGML_IQ1_S: (256, 50),
+    GGML_IQ4_NL: (32, 18),
+    GGML_IQ3_S: (256, 110),
+    GGML_IQ2_S: (256, 82),
+    GGML_IQ4_XS: (256, 136),
+    GGML_IQ1_M: (256, 56),
 }
 
 GGML_NAME = {
@@ -54,6 +73,15 @@ GGML_NAME = {
     GGML_Q4_K: "Q4_K",
     GGML_Q5_K: "Q5_K",
     GGML_Q6_K: "Q6_K",
+    GGML_IQ2_XXS: "IQ2_XXS",
+    GGML_IQ2_XS: "IQ2_XS",
+    GGML_IQ3_XXS: "IQ3_XXS",
+    GGML_IQ1_S: "IQ1_S",
+    GGML_IQ4_NL: "IQ4_NL",
+    GGML_IQ3_S: "IQ3_S",
+    GGML_IQ2_S: "IQ2_S",
+    GGML_IQ4_XS: "IQ4_XS",
+    GGML_IQ1_M: "IQ1_M",
 }
 
 # Native GGUF routed-expert / weight formats: the ggml quants every entry point in
