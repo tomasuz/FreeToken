@@ -8,8 +8,8 @@ second download. Two halves:
   safetensors origin produce the same :class:`ModelConfig`. The few facts llama.cpp's
   qwen4exp graph hard-codes instead of storing (sigmoid GDN output gate, silu MoE, the
   indexer's single key head) are pinned here and cross-checked against the tensor shapes.
-* :func:`iter_gguf_weights` -- every dense (non-expert) tensor dequantized to bf16 under the
-  FreeToken state-dict name, with llama.cpp's conversion (``conversion/qwen.py``
+* :func:`iter_gguf_weights` -- every dense (non-expert) tensor under the FreeToken state-dict
+  name, block-quantized projections kept packed for the GGUF kernels and the rest in bf16, with llama.cpp's conversion (``conversion/qwen.py``
   ``Qwen3NextModel`` / ``_LinearAttentionVReorderBase`` and ``conversion/qwen4exp.py``)
   undone: the GDN value heads go back from ggml's tiled order to HF's grouped one,
   ``ssm_a = -exp(A_log)`` is inverted, the ``+1`` baked into the zero-centred norms is taken
@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Iterator
 
 import torch
 
+from freetoken.layers import BaseOP
 from freetoken.models.gguf.dequant import GGML_F32, GGML_NAME, dequantize
 
 if TYPE_CHECKING:
@@ -197,9 +198,24 @@ def parse_gguf_config(shim: "GgufConfigShim") -> "ModelConfig":
 
     cfg = parse_config(_hf_like_config(shim))
     # The routed experts stream from the offload cache as their native ggml bytes, each
-    # layer at its own type; everything dense was dequantized at load (iter_gguf_weights).
+    # layer at its own type; the dense weights stay packed where a GGUF kernel reads their
+    # type (see _packed_type) and are dequantized to bf16 otherwise.
     return dataclasses.replace(
-        cfg, expert_quant="gguf", gguf_expert_types=_expert_types(shim.model_path, cfg.num_layers)
+        cfg,
+        expert_quant="gguf",
+        gguf_expert_types=_expert_types(shim.model_path, cfg.num_layers),
+        gguf_dense_types=_dense_types(shim.model_path),
+    )
+
+
+def _dense_types(model_path: str) -> tuple[tuple[str, int], ...]:
+    from freetoken.models.gguf.reader import _reader, gguf_shard_paths
+
+    return tuple(
+        (t.name, int(t.tensor_type))
+        for p in gguf_shard_paths(model_path)
+        for t in _reader(p).tensors
+        if not t.name.endswith(_EXPERT_SUFFIXES) and t.name != PLE_TABLE_TENSOR
     )
 
 
@@ -395,6 +411,153 @@ _TOP_LEVEL = {
 _TOP_LEVEL_PLUS_ONE = {"output_hc_norm.weight": "model.hyper_connection_mixer.hc_norm.weight"}
 
 
+
+# --------------------------------------------------------------------------------------
+# Dense weights kept packed
+# --------------------------------------------------------------------------------------
+# A block-quantized projection stays in its GGUF layout (a GGUFLinear) instead of being
+# dequantized to bf16: half the VRAM, which the offload cache turns into expert slots, and
+# half the bytes each decode step reads. Keyed by module path under ``model.layers.N``,
+# parts in row order; a module is packed only when all its parts share one kernel type.
+_PACKED_LINEAR = {
+    "self_attn.qkv_proj": ("attn_q.weight", "attn_k.weight", "attn_v.weight"),
+    "self_attn.o_proj": ("attn_output.weight",),
+    "linear_attn.out_proj": ("ssm_out.weight",),
+    "mlp.shared_expert.gate_up_proj": ("ffn_gate_shexp.weight", "ffn_up_shexp.weight"),
+    "mlp.shared_expert.down_proj": ("ffn_down_shexp.weight",),
+    "attn_hyper_connection.input_mix_weight_up": ("hc_attn_up.weight",),
+    "mlp_hyper_connection.input_mix_weight_up": ("hc_ffn_up.weight",),
+    "ple.key_proj": ("ple_key.weight",),
+    "ple.value_proj": ("ple_value.weight",),
+}
+# Fusions of a packable head and an unquantized tail (F32 in the GGUF): the head becomes a
+# GGUFLinear, the few tail rows a dense matrix, and the op concatenates the two outputs.
+_PACKED_SPLIT = {
+    "linear_attn.in_proj": (("attn_qkv.weight", "attn_gate.weight"), ("ssm_beta.weight", "ssm_alpha.weight")),
+    "attn_hyper_connection.input_mix_weight_down_block_inject": (("hc_attn_down.weight",), ("hc_attn_inject.weight",)),
+    "mlp_hyper_connection.input_mix_weight_down_block_inject": (("hc_ffn_down.weight",), ("hc_ffn_inject.weight",)),
+}
+_PACKED_TOP = {
+    "model.hyper_connection_mixer.input_mix_weight_down": "output_hc_down.weight",
+    "model.hyper_connection_mixer.input_mix_weight_up": "output_hc_up.weight",
+    "model.embed_tokens": "token_embd.weight",
+    "lm_head": "output.weight",
+}
+
+
+def _packed_type(types: dict[str, int], names) -> int | None:
+    """The one GGUF-kernel type all ``names`` share, or None (missing, mixed, unquantized)."""
+    from freetoken.layers.gguf import _QUANTS
+
+    found = {types.get(n) for n in names}
+    if len(found) != 1:
+        return None
+    t = found.pop()
+    return t if t in _QUANTS else None
+
+
+def packing_plan(cfg: "ModelConfig") -> dict[str, int]:
+    """``{module path: ggml type}`` of every module whose weight stays packed."""
+    if not cfg.gguf_dense_types:
+        return {}
+    types = dict(cfg.gguf_dense_types)
+    plan: dict[str, int] = {}
+    for layer in range(cfg.num_layers):
+        for mod, parts in _PACKED_LINEAR.items():
+            t = _packed_type(types, [f"blk.{layer}.{p}" for p in parts])
+            if t is not None:
+                plan[f"model.layers.{layer}.{mod}"] = t
+        for mod, (head, _tail) in _PACKED_SPLIT.items():
+            t = _packed_type(types, [f"blk.{layer}.{p}" for p in head])
+            if t is not None:
+                plan[f"model.layers.{layer}.{mod}"] = t
+    for mod, name in _PACKED_TOP.items():
+        t = _packed_type(types, [name])
+        if t is not None:
+            plan[mod] = t
+    return plan
+
+
+# Up to this many tokens the dense tail is a multiply-reduce (the decode and MTP-verify sizes).
+_SMALL_BATCH = 8
+
+
+class PackedSplitLinear(BaseOP):
+    """``cat([packed(x), x @ dense.T], -1)``: a GGUF block-quantized head over most output
+    rows and a small dense tail for the rows the GGUF keeps unquantized."""
+
+    def __init__(self, in_features: int, packed_rows: int, dense_rows: int, quant_type: int):
+        from freetoken.layers.gguf import GGUFLinear
+
+        self.packed = GGUFLinear(in_features, packed_rows, quant_type)
+        self.dense = torch.empty(dense_rows, in_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[0] <= _SMALL_BATCH:
+            # a handful of output rows is a poor GEMM shape for rocBLAS: 45 us for the 4
+            # block-inject rows of a 10240-wide input, 9 us as a broadcast multiply-reduce
+            tail = (x.unsqueeze(1) * self.dense).sum(-1)
+        else:
+            tail = torch.nn.functional.linear(x, self.dense)
+        return torch.cat([self.packed.forward(x), tail], dim=-1)
+
+
+class GGUFLMHead(BaseOP):
+    """Untied LM head over a packed GGUF ``output.weight`` (``ParallelLMHead``'s contract, TP=1)."""
+
+    def __init__(self, vocab_size: int, hidden_size: int, quant_type: int):
+        from freetoken.layers.gguf import GGUFLinear
+
+        self.head = GGUFLinear(hidden_size, vocab_size, quant_type)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.core import get_global_ctx
+
+        batch = get_global_ctx().batch
+        if batch.is_prefill:
+            x = x[batch.attn_metadata.get_last_indices(batch.size)].contiguous()
+        return self.head.forward(x)
+
+
+def _split_tail_rows(cfg: "ModelConfig", mod: str) -> int:
+    if mod == "linear_attn.in_proj":
+        return 2 * cfg.linear_attention_group().num_value_heads  # beta | alpha
+    return cfg.qwen4_args.hc_count  # the block-inject rows
+
+
+def convert_qwen4exp_to_gguf(model, cfg: "ModelConfig") -> None:
+    """In place: swap every module of :func:`packing_plan` for its packed GGUF op."""
+    from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear
+
+    plan = packing_plan(cfg)
+    layers = model.model.layers.op_list
+    for path, qt in plan.items():
+        parts = path.split(".")
+        if parts[:2] == ["model", "layers"]:
+            owner, rel = layers[int(parts[2])], parts[3:]
+        else:
+            owner, rel = model, parts
+        for attr in rel[:-1]:
+            owner = getattr(owner, attr)
+        attr = rel[-1]
+        rel_path = ".".join(rel)
+        if path == "model.embed_tokens":
+            new = GGUFEmbedding(cfg.vocab_size, cfg.hidden_size, qt)
+        elif path == "lm_head":
+            assert not cfg.tie_word_embeddings, "qwen4exp GGUF: a tied head has no output.weight"
+            new = GGUFLMHead(cfg.vocab_size, cfg.hidden_size, qt)
+        else:
+            out_features, in_features = getattr(owner, attr).weight.shape
+            if rel_path in _PACKED_SPLIT:
+                tail = _split_tail_rows(cfg, rel_path)
+                # the hc fusion's zero pad rows (16-row GEMM alignment) are not carried over
+                head = out_features - tail if rel_path == "linear_attn.in_proj" else cfg.qwen4_args.hc_lowrank
+                new = PackedSplitLinear(in_features, head, tail, qt)
+            else:
+                new = GGUFLinear(in_features, out_features, qt)
+        setattr(owner, attr, new)
+
+
 def _transform(suffix: str, t, vh: _VHeads) -> torch.Tensor:
     """One GGUF part (``suffix`` after ``blk.N.``) back in HF layout, bf16."""
     if suffix == "attn_qkv.weight":
@@ -408,6 +571,26 @@ def _transform(suffix: str, t, vh: _VHeads) -> torch.Tensor:
     return _to_bf16(t)
 
 
+
+def _packed_rows(suffix: str, t, vh: _VHeads) -> torch.Tensor:
+    """One GGUF part as its packed ``[rows, row_bytes]`` bytes, back in HF layout. The value
+    head untiling moves whole rows (output features), or for ``ssm_out`` whole head-wide
+    column runs, which are whole quant blocks, so no block is ever split."""
+    from freetoken.gguf_quant import BLOCK_SHAPE
+
+    w = t.packed()
+    if suffix == "attn_qkv.weight":
+        qk = 2 * vh.k_heads * vh.key_dim
+        return torch.cat([w[:qk], vh.untile(w[qk:], 0, vh.value_dim)], dim=0)
+    if suffix == "attn_gate.weight":
+        return vh.untile(w, 0, vh.value_dim)
+    if suffix == "ssm_out.weight":
+        block, size = BLOCK_SHAPE[t.ggml_type]
+        assert vh.value_dim % block == 0, (vh.value_dim, block)
+        return vh.untile(w, 1, vh.value_dim // block * size)
+    return w
+
+
 def iter_gguf_weights(
     model_path: str,
     device,
@@ -417,9 +600,9 @@ def iter_gguf_weights(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield ``(state_dict_name, tensor)`` for every non-expert Qwen3.8 parameter.
 
-    Quantized dense weights are dequantized to bf16, F32 ones stay F32 (the dense model stays
-    the safetensors one);
-    the routed experts stay packed in the offload cache's banks and the PLE table on disk.
+    Block-quantized dense weights a GGUF kernel reads stay packed as ``.qweight`` (see
+    :func:`packing_plan`); the rest are dequantized to bf16, F32 ones stay F32. The routed
+    experts stay packed in the offload cache's banks and the PLE table on disk.
     """
     from freetoken.distributed import get_tp_info
     from freetoken.models.gguf.reader import iter_gguf_tensors, load_gguf_metadata
@@ -437,11 +620,28 @@ def iter_gguf_weights(
     vh = _VHeads(cfg)
     ple_ids = set(cfg.qwen4_args.ple_layer_ids)
     buf: dict[tuple[int, str], dict[int, torch.Tensor]] = {}
+    plan = packing_plan(cfg)
+    # part suffix -> (module, index, part count, role) for the packed modules
+    packed_part: dict[str, tuple[str, int, int, str]] = {}
+    for mod, parts in _PACKED_LINEAR.items():
+        for i, part in enumerate(parts):
+            packed_part[part] = (mod, i, len(parts), "qweight")
+    for mod, (head, tail) in _PACKED_SPLIT.items():
+        for i, part in enumerate(head):
+            packed_part[part] = (mod, i, len(head), "packed.qweight")
+        for i, part in enumerate(tail):
+            packed_part[part] = (mod, i, len(tail), "dense")
+    pbuf: dict[tuple[int, str, str], dict[int, torch.Tensor]] = {}
+    top_key = {"model.embed_tokens": "model.embed_tokens.qweight", "lm_head": "lm_head.head.qweight"}
 
     for t in iter_gguf_tensors(model_path):
         name = t.name
         if name in _TOP_LEVEL:
-            yield _TOP_LEVEL[name], _to_bf16(t)
+            mod = _TOP_LEVEL[name].removesuffix(".weight")
+            if mod in plan:
+                yield top_key.get(mod, f"{mod}.qweight"), t.packed()
+            else:
+                yield _TOP_LEVEL[name], _to_bf16(t)
             continue
         if name in _TOP_LEVEL_PLUS_ONE:
             yield _TOP_LEVEL_PLUS_ONE[name], _to_f32(t) - 1
@@ -455,6 +655,18 @@ def iter_gguf_weights(
         if suffix in _EXPERT_SUFFIXES:
             continue
         base = f"model.layers.{layer}"
+
+        hit = packed_part.get(suffix)
+        if hit is not None and f"{base}.{hit[0]}" in plan:
+            mod, idx, count, role = hit
+            piece = _transform(suffix, t, vh) if role == "dense" else _packed_rows(suffix, t, vh)
+            slots = pbuf.setdefault((layer, mod, role), {})
+            slots[idx] = piece
+            if len(slots) == count:
+                del pbuf[(layer, mod, role)]
+                rows = [slots[i] for i in range(count)]
+                yield f"{base}.{mod}.{role}", rows[0] if count == 1 else torch.cat(rows, dim=0)
+            continue
 
         if suffix in _PLUS_ONE:
             yield f"{base}.{_PLUS_ONE[suffix]}", _to_f32(t) - 1
@@ -493,6 +705,7 @@ def iter_gguf_weights(
             raise ValueError(f"unmapped qwen4exp GGUF tensor: {name} ({GGML_NAME.get(t.ggml_type, t.ggml_type)})")
 
     assert not buf, f"incomplete fusions: {sorted(f'{layer}:{fused}' for layer, fused in buf)}"
+    assert not pbuf, f"incomplete packed fusions: {sorted(pbuf)}"
 
     # The PLE hash constants ride the KV section (int64-exact) instead of tensors.
     meta = load_gguf_metadata(model_path)
@@ -507,7 +720,11 @@ def iter_gguf_weights(
 
 
 __all__ = [
+    "GGUFLMHead",
     "PLE_TABLE_TENSOR",
+    "PackedSplitLinear",
+    "convert_qwen4exp_to_gguf",
+    "packing_plan",
     "dummy_q4_0_expert_sources",
     "iter_gguf_weights",
     "load_q4_0_expert_sources",

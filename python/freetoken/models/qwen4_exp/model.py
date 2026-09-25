@@ -22,6 +22,7 @@ from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import init_logger, nvtx_annotate
+from freetoken.utils.phase_timer import phase, step_done
 
 from .attention import Qwen4ExpAttention
 from .hc import GatedResidual
@@ -75,15 +76,24 @@ class Qwen4ExpDecoderLayer(BaseOP):
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
         if self.ple is not None:
-            hidden = hidden + self.ple.forward(hidden, batch)
-        block_input, inject = self.attn_hyper_connection.mix(hidden)
+            with phase("ple"):
+                hidden = hidden + self.ple.forward(hidden, batch)
+        with phase("hc.mix"):
+            block_input, inject = self.attn_hyper_connection.mix(hidden)
         if self._is_linear:
-            block_output = self.linear_attn.forward(block_input)
+            with phase("linear_attn"):
+                block_output = self.linear_attn.forward(block_input)
         else:
-            block_output = self.self_attn.forward(block_input, batch)
-        hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
-        block_input, inject = self.mlp_hyper_connection.mix(hidden)
-        return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
+            with phase("self_attn"):
+                block_output = self.self_attn.forward(block_input, batch)
+        with phase("hc.combine"):
+            hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
+        with phase("hc.mix"):
+            block_input, inject = self.mlp_hyper_connection.mix(hidden)
+        with phase("mlp"):
+            block_output = self.mlp.forward(block_input)
+        with phase("hc.combine"):
+            return self.mlp_hyper_connection.combine(hidden, block_output, inject)
 
 
 class Qwen4ExpModel(BaseOP):
@@ -123,7 +133,10 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
-        return self.hyper_connection_mixer.mix(hidden)[0]
+        with phase("hc.final"):
+            out = self.hyper_connection_mixer.mix(hidden)[0]
+        step_done()
+        return out
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
@@ -139,6 +152,11 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             prefix="lm_head",
         )
         super().__init__()
+        if config.gguf_dense_types:
+            # a GGUF checkpoint: its block-quantized projections run packed
+            from .gguf import convert_qwen4exp_to_gguf
+
+            convert_qwen4exp_to_gguf(self, config)
 
     def load_host_tables(self, engine_config) -> int:
         """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""
@@ -215,7 +233,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
-        return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+        h = self.model.forward(batch.input_ids, batch)
+        with phase("lm_head"):
+            return self.lm_head.forward(h)
 
 
 __all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel", "build_linear_mixer"]
