@@ -16,7 +16,7 @@ from freetoken.moe.offload_cache import OffloadMoeCache
 from freetoken.moe.placement import CostTracker, ExecutorCost, plan_miss_counts
 
 MS = 1e-3
-# GLM-4.5-Air on tm: a fetch over PCIe 3.0 x16, the GEMM this device owes regardless, and a
+# GLM-4.5-Air over PCIe 3.0 x16: a fetch, the GEMM this device owes regardless, and a
 # pool that is cheap per expert but costs a wake-up to hand anything to
 GPU = ExecutorCost("gpu", per_expert_seconds=0.72 * MS, fixed_seconds=0.34 * MS)
 CPU = ExecutorCost("cpu", per_expert_seconds=0.30 * MS, fixed_seconds=0.60 * MS)

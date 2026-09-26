@@ -38,7 +38,7 @@ def _doc(**over):
         "mamba": {"used_slots": 4, "total_slots": 8},
         "swa": None,
         "vram_bytes": 123,
-        "gpus": [{"index": 0, "name": 'AMD "RX" 9060 XT', "total_bytes": 17095983104}],
+        "gpus": [{"index": 0, "name": 'Example "GPU" 16GB', "total_bytes": 17095983104}],
         "throughput": {"decode_tps": 31.4, "prefill_tps": 52.8},
         "requests": {"active": 1, "completed": 17, "p95_ms": 2400, "ttft_mean_ms": 310,
                      "prompt_tokens_total": 12345, "completion_tokens_total": 67890},
@@ -126,7 +126,7 @@ def test_zero_total_does_not_divide_by_zero():
 
 def test_label_values_are_escaped():
     text = render_prometheus(_doc())
-    assert r'name="AMD \"RX\" 9060 XT"' in text
+    assert r'name="Example \"GPU\" 16GB"' in text
     assert 'moe="true"' in text
 
 

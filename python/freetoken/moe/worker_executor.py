@@ -189,7 +189,7 @@ class WorkerMoeExecutor:
             "slot_bs": share("slot_bs", (self._capacity,), torch.int64),
             # What the worker found it can actually serve, written before it reports up.
             # Reading a host bank in place needs the runtime to register those pages for the
-            # device, and that registration is a bounded, one-way budget (~6 GiB on gfx90c,
+            # device, and that registration is a bounded, one-way budget (~6 GiB on the iGPU measured,
             # not returned by hipHostUnregister). So "every layer" is an offer, not a
             # promise: the worker maps what fits and says which, and the placement divides
             # each step among whoever can actually take it.
@@ -581,7 +581,7 @@ class WorkerMoeExecutor:
 
         Offering a layer and being able to take it are different things: reading a bank in
         place needs its pages registered with the runtime for this device, and that budget
-        runs out (~6 GiB on gfx90c) long before the layers do. The worker discovers where
+        runs out (~6 GiB on the iGPU measured) long before the layers do. The worker discovers where
         that line falls -- it is a property of the device and the bank sizes, not something
         this side can compute -- and writes it here before reporting up. Nothing is pinned
         by this: the placement still divides every step among the executors that can take

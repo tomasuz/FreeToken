@@ -6,6 +6,8 @@
 // undeclared identifier 'min'". Supply the same device overloads clang would, only when
 // clang's header has not.
 #pragma once
+// Nothing is needed on CUDA (nvcc): llama.cpp builds there as it is.
+#if defined(GGML_USE_HIP)
 // vendors/hip.h sets this before its own <hip/hip_runtime.h>: llama.cpp brings its own
 // __shfl_*_sync, and HIP's (64-bit mask semantics) must stay out. Including the runtime
 // here first without it would switch them back on under llama.cpp's warp code.
@@ -19,3 +21,4 @@ template <class T> __device__ __forceinline__ T max(T a, T b) { return a > b ? a
 __device__ __forceinline__ int min(int a, int b) { return a < b ? a : b; }
 __device__ __forceinline__ int max(int a, int b) { return a > b ? a : b; }
 #endif
+#endif  // GGML_USE_HIP

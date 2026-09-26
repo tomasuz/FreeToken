@@ -298,7 +298,7 @@ def _max_decode_batch(config) -> int:
     cosmetic: every helper keeps ONE ANSWER REGION PER HANDSHAKE SLOT, sized
     ``max_batch x hidden``. Sizing those by the prefill chunk (512) made each slot cost
     4 MiB of pinned host memory, so raising the slot count to cover a 45-layer model
-    added ~470 MiB and the model stopped loading on a RAM-tight host (tm, 2026-09-18).
+    added ~470 MiB and the model stopped loading on a host tight on RAM.
     """
     return max(1, int(getattr(config, "cuda_graph_max_bs", None) or 0),
                int(getattr(config, "max_running_req", 1) or 1))
@@ -317,7 +317,7 @@ def _keep_hipblaslt_on_mixed_devices() -> None:
     visible device: hipBLASLt is preferred only if *all* of them are architectures that
     prefer it. An integrated GPU that is not on that list therefore takes hipBLASLt away
     from a discrete one that is -- and the discrete one is where the model runs. The cost
-    is not small. Measured on gfx1200 beside gfx90c, a [1,2048]x[2048,256] bf16 matmul
+    is not small. Measured on an RDNA4 discrete GPU beside a GCN5 integrated one, a [1,2048]x[2048,256] bf16 matmul
     takes 134 us on the fallback and 20 us on hipBLASLt, and decode -- which is almost
     entirely matmuls this shape -- ran 2.9x slower with the integrated GPU merely visible.
 
@@ -1352,7 +1352,7 @@ class Engine:
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
         if use_graph and _GRAPH_HOST_WAIT:
-            # Measured on ROCm (RX 9060 XT, Qwen3.8 offload decode): host work queued while a
+            # Measured on ROCm (a PCIe discrete GPU, Qwen3.8 offload decode): host work queued while a
             # replay is still running -- sampling, the next step's staging -- stretched the
             # replay itself from ~60 to ~120 ms. Letting the replay finish first costs the few
             # ms of host work it would have hidden. After the host ctx on purpose: its exit may

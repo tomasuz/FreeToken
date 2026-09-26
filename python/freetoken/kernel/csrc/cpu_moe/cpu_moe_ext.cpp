@@ -2111,7 +2111,7 @@ struct CpuMoeExecutor {
     // Hot wait: while tasks keep coming (one per MoE layer, ~0.5-1 ms apart in decode),
     // spin on the generation instead of sleeping on the condition variable. Waking a pool
     // of sleeping workers costs a futex round trip per thread -- measured as ~0.2 ms of a
-    // 0.29 ms task on the Ryzen 7 5700G, more than the expert rows themselves. Past
+    // 0.29 ms task on an 8-core desktop CPU, more than the expert rows themselves. Past
     // kHotWindow without a task the worker sleeps as before.
     using hot_clock = std::chrono::steady_clock;
     constexpr auto kHotWindow = std::chrono::milliseconds(5);

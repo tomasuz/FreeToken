@@ -20,8 +20,10 @@ rebuild; the file list is the transitive `#include` closure of `mmq.cuh`, `mmvq.
 `quantize.cu` and `mmid.cu`.
 
 The CPU side (added for the CPU MoE executor's GGUF experts) is the same commit's
-`ggml/src/ggml-cpu/quants.{c,h}`, `ggml-cpu/arch/x86/quants.c`, `ggml-cpu-impl.h`,
+`ggml/src/ggml-cpu/quants.{c,h}`, `ggml-cpu/arch/x86/quants.c`, `ggml-cpu/arch/arm/quants.c`,
+`ggml-cpu-impl.h`,
 `simd-mappings.h`, `arch-fallback.h`, `ggml-quants.{c,h}` and `include/ggml-cpu.h`, again
 unmodified. `ft_ggml_cpu.c` supplies the ggml.c symbols they reference and the lookup the
-executor uses; `freetoken/kernel/ggml_cpu.py` builds them with the host compiler
-(`-march=native`).
+executor uses (and the portable C versions and reference quantizers, for tests);
+`freetoken/kernel/ggml_cpu.py` builds the file for the host's CPU family (x86-64 or aarch64)
+with the host compiler (`-march=native` / `-mcpu=native`).

@@ -106,7 +106,7 @@ int ft_mmvq(const void * W, const void * gate, int glu_op, int type, int64_t K, 
         const int64_t s2 = n_used * rows;      // dst: next token
         const int64_t s12 = ne11 * s11;        // y: next token
         // Upstream sends one token to the generic kernel, whose RDNA tuning starves a short K
-        // (a 640-wide down projection runs 2.7x slower there on the RX 9060 XT); the
+        // (a 640-wide down projection runs 2.7x slower there on an RDNA4 GPU); the
         // dedicated MoE kernel it uses from two tokens on serves one token as well.
         const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
         const uint3 nchannels_y_fd = init_fastdiv_values(ne11);

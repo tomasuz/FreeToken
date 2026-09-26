@@ -114,18 +114,72 @@ class _MTPAttention(Qwen4ExpAttention):
         return self.o_proj.forward(gated)
 
 
-def _swap_hc_to_gguf(hc: GatedResidual) -> None:
-    """The MTP GGUF stores the hyper-connection projections as Q8_0, inject included."""
+# Each projection of the head: its module path and the GGUF tensors concatenated (in row
+# order) into its weight. Their ggml type comes from the file (llama.cpp's MTP GGUFs have
+# been Q8_0, but nothing requires it): a type the GGUF kernels serve stays packed, anything
+# else -- f16/bf16/f32, an i-quant, parts of different types -- is dequantized to a dense
+# bf16 weight, which for this one layer costs little memory.
+_SITES: dict[str, tuple[str, ...]] = {
+    "eh_proj": ("nextn.eh_proj.weight",),
+    "self_attn.qkv_proj": ("attn_q.weight", "attn_k.weight", "attn_v.weight"),
+    "self_attn.o_proj": ("attn_output.weight",),
+    "mlp.shared_expert.gate_up_proj": ("ffn_gate_shexp.weight", "ffn_up_shexp.weight"),
+    "mlp.shared_expert.down_proj": ("ffn_down_shexp.weight",),
+    "attn_hyper_connection.input_mix_weight_down_block_inject": ("hc_attn_down.weight", "hc_attn_inject.weight"),
+    "attn_hyper_connection.input_mix_weight_up": ("hc_attn_up.weight",),
+    "mlp_hyper_connection.input_mix_weight_down_block_inject": ("hc_ffn_down.weight", "hc_ffn_inject.weight"),
+    "mlp_hyper_connection.input_mix_weight_up": ("hc_ffn_up.weight",),
+    "hyper_connection_mixer.input_mix_weight_down": ("nextn.hc_head_down.weight",),
+    "hyper_connection_mixer.input_mix_weight_up": ("nextn.hc_head_up.weight",),
+}
+# the historical layout: every projection Q8_0
+Q8_SITES: dict[str, int | None] = {site: GGML_Q8_0 for site in _SITES}
+
+
+def mtp_site_types(tensor_types: dict[str, int], layer: int) -> dict[str, int | None]:
+    """Per projection: the ggml type it stays packed in, or None for a dense bf16 weight.
+    ``tensor_types`` maps GGUF tensor names to their ggml type."""
+    from freetoken.layers.gguf import _QUANTS
+
+    out: dict[str, int | None] = {}
+    for site, names in _SITES.items():
+        kinds = {tensor_types[f"blk.{layer}.{n}"] for n in names}
+        kind = kinds.pop() if len(kinds) == 1 else None
+        out[site] = kind if kind in _QUANTS else None
+    return out
+
+
+class _DenseLinear(BaseOP):
+    """A plain bf16 projection for a head weight the GGUF kernels do not serve packed."""
+
+    def __init__(self, in_features: int, out_features: int) -> None:
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = torch.empty(out_features, in_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(x, self.weight)
+
+
+def _linear(in_features: int, out_features: int, kind: int | None) -> BaseOP:
+    return GGUFLinear(in_features, out_features, kind) if kind is not None else _DenseLinear(in_features, out_features)
+
+
+def _swap_hc_to_gguf(hc: GatedResidual, prefix: str, types: dict[str, int | None]) -> None:
+    """The MTP GGUF stores the hyper-connection projections quantized, inject included."""
     width = hc.hidden_size * hc.hc_count
     if hc.use_combine:
-        hc.input_mix_weight_down_block_inject = GGUFLinear(width, hc.lowrank + hc.hc_count, GGML_Q8_0)
+        site = f"{prefix}.input_mix_weight_down_block_inject"
+        hc.input_mix_weight_down_block_inject = _linear(width, hc.lowrank + hc.hc_count, types[site])
     else:
-        hc.input_mix_weight_down = GGUFLinear(width, hc.lowrank, GGML_Q8_0)
-    hc.input_mix_weight_up = GGUFLinear(hc.lowrank, width, GGML_Q8_0)
+        hc.input_mix_weight_down = _linear(width, hc.lowrank, types[f"{prefix}.input_mix_weight_down"])
+    hc.input_mix_weight_up = _linear(hc.lowrank, width, types[f"{prefix}.input_mix_weight_up"])
 
 
 class Qwen4ExpMTPHead(BaseOP):
-    def __init__(self, config: "ModelConfig", num_experts: int, window: int = MTP_WINDOW) -> None:
+    def __init__(self, config: "ModelConfig", num_experts: int, window: int = MTP_WINDOW,
+                 site_types: dict[str, int | None] | None = None) -> None:
+        types = site_types or Q8_SITES
         args = config.qwen4_args
         H = config.hidden_size
         self.hidden_size = H
@@ -133,23 +187,23 @@ class Qwen4ExpMTPHead(BaseOP):
         eps = config.rms_norm_eps
         self.enorm = GroupedPlusOneRMSNorm(H, eps, 1)
         self.hnorm = GroupedPlusOneRMSNorm(H * args.hc_count, eps, args.hc_count)
-        self.eh_proj = GGUFLinear(2 * H, H, GGML_Q8_0)
+        self.eh_proj = _linear(2 * H, H, types["eh_proj"])
         self.attn_hyper_connection = GatedResidual(config)
-        _swap_hc_to_gguf(self.attn_hyper_connection)
+        _swap_hc_to_gguf(self.attn_hyper_connection, "attn_hyper_connection", types)
         self.self_attn = _MTPAttention(config, window)
         attn = self.self_attn
-        attn.qkv_proj = GGUFLinear(H, sum(attn._qkv_split), GGML_Q8_0)
-        attn.o_proj = GGUFLinear(attn.qo_attn_dim, H, GGML_Q8_0)
+        attn.qkv_proj = _linear(H, sum(attn._qkv_split), types["self_attn.qkv_proj"])
+        attn.o_proj = _linear(attn.qo_attn_dim, H, types["self_attn.o_proj"])
         self.mlp_hyper_connection = GatedResidual(config)
-        _swap_hc_to_gguf(self.mlp_hyper_connection)
+        _swap_hc_to_gguf(self.mlp_hyper_connection, "mlp_hyper_connection", types)
         mtp_cfg = dataclasses.replace(config, num_experts=num_experts, num_experts_per_tok=min(MTP_TOPK, config.num_experts_per_tok))
         self.mlp = Qwen4ExpMoE(mtp_cfg, layer_id=0, prefix="mtp.mlp")
         sh = self.mlp.shared_expert
         inter = config.shared_expert_intermediate_size
-        sh.gate_up_proj = GGUFLinear(H, 2 * inter, GGML_Q8_0)
-        sh.down_proj = GGUFLinear(inter, H, GGML_Q8_0)
+        sh.gate_up_proj = _linear(H, 2 * inter, types["mlp.shared_expert.gate_up_proj"])
+        sh.down_proj = _linear(inter, H, types["mlp.shared_expert.down_proj"])
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False)
-        _swap_hc_to_gguf(self.hyper_connection_mixer)
+        _swap_hc_to_gguf(self.hyper_connection_mixer, "hyper_connection_mixer", types)
 
     def forward(self, R_prev: torch.Tensor, next_ids: torch.Tensor, positions: torch.Tensor,
                 embed, lm_head) -> tuple[torch.Tensor, torch.Tensor]:
@@ -192,43 +246,51 @@ def _dense(t, *, minus_one: bool = False) -> torch.Tensor:
     return w - 1 if minus_one else w
 
 
-def mtp_state_dict(path: str, layer: int) -> dict[str, torch.Tensor]:
-    """The head's state dict (keys relative to :class:`Qwen4ExpMTPHead`), expert banks aside."""
+def _dense_any(t) -> torch.Tensor:
+    """A GGUF tensor as f32 ``[rows, cols]``: on the CPU where the reference dequantizers
+    cover the type, else through the GPU kernels (the i-quants)."""
+    try:
+        return _dense(t)
+    except NotImplementedError:
+        from freetoken.kernel.gguf import ggml_dequantize
+
+        rows, cols = int(math.prod(int(x) for x in t.shape[1:])), int(t.shape[0])
+        return ggml_dequantize(_packed(t).cuda(), int(t.tensor_type), rows, cols, torch.float32).cpu()
+
+
+def mtp_state_dict(path: str, layer: int, site_types: dict[str, int | None] | None = None) -> dict[str, torch.Tensor]:
+    """The head's state dict (keys relative to :class:`Qwen4ExpMTPHead`), expert banks aside.
+    ``site_types`` as :func:`mtp_site_types` gives it (default: every projection Q8_0)."""
     T = _tensors(path)
     b = f"blk.{layer}."
-
-    def q8(name):
-        t = T[b + name]
-        assert int(t.tensor_type) == GGML_Q8_0, (name, t.tensor_type)
-        return _packed(t)
+    types = site_types or Q8_SITES
 
     sd = {
         "enorm.weight": _dense(T[b + "nextn.enorm.weight"], minus_one=True),
         "hnorm.weight": _dense(T[b + "nextn.hnorm.weight"], minus_one=True),
-        "eh_proj.qweight": q8("nextn.eh_proj.weight"),
-        "self_attn.qkv_proj.qweight": torch.cat(
-            [q8("attn_q.weight"), q8("attn_k.weight"), q8("attn_v.weight")], dim=0
-        ),
-        "self_attn.o_proj.qweight": q8("attn_output.weight"),
         "self_attn.q_norm.weight": _dense(T[b + "attn_q_norm.weight"], minus_one=True),
         "self_attn.k_norm.weight": _dense(T[b + "attn_k_norm.weight"], minus_one=True),
         "mlp.gate.weight": _dense(T[b + "ffn_gate_inp.weight"]),
-        "mlp.shared_expert.gate_up_proj.qweight": torch.cat(
-            [q8("ffn_gate_shexp.weight"), q8("ffn_up_shexp.weight")], dim=0
-        ),
-        "mlp.shared_expert.down_proj.qweight": q8("ffn_down_shexp.weight"),
         "mlp.shared_expert_gate.weight": _dense(T[b + "ffn_gate_inp_shexp.weight"]).reshape(1, -1),
         "hyper_connection_mixer.hc_norm.weight": _dense(T[b + "nextn.hc_head_norm.weight"], minus_one=True),
-        "hyper_connection_mixer.input_mix_weight_down.qweight": q8("nextn.hc_head_down.weight"),
-        "hyper_connection_mixer.input_mix_weight_up.qweight": q8("nextn.hc_head_up.weight"),
     }
     for mod, part in (("attn_hyper_connection", "hc_attn"), ("mlp_hyper_connection", "hc_ffn")):
         sd[f"{mod}.hc_norm.weight"] = _dense(T[b + f"{part}_norm.weight"], minus_one=True)
-        sd[f"{mod}.input_mix_weight_down_block_inject.qweight"] = torch.cat(
-            [q8(f"{part}_down.weight"), q8(f"{part}_inject.weight")], dim=0
-        )
-        sd[f"{mod}.input_mix_weight_up.qweight"] = q8(f"{part}_up.weight")
+    for site, names in _SITES.items():
+        parts = [T[b + n] for n in names]
+        kind = types[site]
+        if kind is not None:
+            for n, t in zip(names, parts):
+                assert int(t.tensor_type) == kind, (n, int(t.tensor_type), kind)
+            sd[f"{site}.qweight"] = torch.cat([_packed(t) for t in parts], dim=0)
+        else:
+            sd[f"{site}.weight"] = torch.cat([_dense_any(t) for t in parts], dim=0)
     return sd
+
+
+def mtp_tensor_types(path: str) -> dict[str, int]:
+    """Every tensor of the MTP GGUF and its ggml type."""
+    return {name: int(t.tensor_type) for name, t in _tensors(path).items()}
 
 
 def mtp_layer_and_experts(path: str) -> tuple[int, int, tuple[int, int]]:
@@ -281,6 +343,7 @@ def build_mtp_cache(device, experts: int, types: tuple[int, int], banks, slots: 
 
 
 __all__ = [
+    "Q8_SITES",
     "MTP_CACHE_SLOTS",
     "MTP_TOPK",
     "MTP_WINDOW",
@@ -288,5 +351,7 @@ __all__ = [
     "build_mtp_cache",
     "mtp_expert_banks",
     "mtp_layer_and_experts",
+    "mtp_site_types",
     "mtp_state_dict",
+    "mtp_tensor_types",
 ]

@@ -267,7 +267,7 @@ def test_glm_call_is_parsed_when_the_turn_ended_before_the_closing_tag():
 
     The closing </tool_call> the template asks for is never generated, so a parser that
     insists on the pair reports no calls at all while the text plainly holds a complete
-    one -- which is what tm served for both GLM-4.5-Air checkpoints until 2026-09-18.
+    one -- which is what both GLM-4.5-Air checkpoints produced.
     """
     parser = FunctionCallParser(TOOLS, tool_call_parser="glm47")
 
