@@ -2055,21 +2055,38 @@ class OffloadMoeCache:
         # the ids tensor must outlive the side stream's kernels: dropped at the join
         self._pf_keep[layer_id] = ids
 
+    def assist_plannable(self, layer_id: int, routes: int) -> bool:
+        """Whether a step of ``routes`` routes (tokens x top-k) can go through the LRU plan:
+        its misses must fit half the layer's slot region (so no slot the step reads can be
+        evicted by it), and its plan buffers must exist -- they grow on an eager step, never
+        under capture (a graph keeps the addresses it saw; capture warms up eagerly first).
+        A step that cannot is served without one: resident experts on the GPU, the rest on
+        the CPU, nothing admitted."""
+        if routes > self.lru_part(layer_id)[1] // 2:
+            return False
+        return self._assist_buffers(routes) is not None
+
     def assist_split(self, layer_id: int, expert_ids: torch.Tensor, cpu_max: int = 0) -> torch.Tensor:
         """Which routes of ``layer_id`` the GPU computes this step: the resident experts, and
         with ``cpu_max`` > 0 the misses past the first ``cpu_max`` (route order), which it
         fetches itself. The rest are the CPU's. A gather and a scan -- cheap, so the CPU can
-        be started right after."""
+        be started right after. A step too big for the LRU plan fetches nothing."""
         flat = (expert_ids.to(torch.int64) + layer_id * self.num_experts).reshape(-1)
         miss = self.slot_for_id.view(-1).index_select(0, flat) < 0
-        if cpu_max <= 0:
+        if cpu_max <= 0 or not self.assist_plannable(layer_id, flat.numel()):
             return (~miss).view(expert_ids.shape)
         cpu = miss & (torch.cumsum(miss.to(torch.int32), 0) <= cpu_max)
         return (~cpu).view(expert_ids.shape)
 
-    def _assist_buffers(self):
-        if self._adm_plan is None:
-            cap = self._PF_CAPACITY
+    def _assist_buffers(self, routes: int = 0):
+        """Per-layer plan buffers holding at least ``routes`` rows, or None when they would
+        have to grow under capture."""
+        if self._adm_plan is None or self._adm_plan[0].shape[-1] < routes:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            if self._adm_plan is not None:  # queued side copies may still read the old rows
+                self._pf_keep[("adm-old", id(self._adm_plan))] = self._adm_plan
+            cap = max(self._PF_CAPACITY, routes)
             i32 = dict(dtype=torch.int32, device=self.device)
             n = self.num_layers
             # [layer, 2 plans (now, background), rows]
@@ -2120,8 +2137,13 @@ class OffloadMoeCache:
         flat = expert_ids.reshape(-1).to(torch.int32)
         k = flat.numel()
         base, size = self.lru_part(layer_id)
-        assert k <= min(self._PF_CAPACITY, size // 2), (k, size)
-        out, src, dst, num = (t[layer_id] for t in self._assist_buffers())
+        if not self.assist_plannable(layer_id, k):
+            # too big a step for the plan: read the resident slots as they are; the GPU
+            # routes are all resident (assist_split fetched nothing), no slot is admitted,
+            # and nothing this step reads can be evicted before its GEMM in stream order
+            lookup = (expert_ids.to(torch.int64) + layer_id * self.num_experts).reshape(-1)
+            return self.slot_for_id.view(-1).index_select(0, lookup).view(expert_ids.shape)
+        out, src, dst, num = (t[layer_id] for t in self._assist_buffers(k))
         g = gpu.reshape(-1)
         # first GPU route's expert, else route 0's (index_select: no host read under capture)
         standin = flat.index_select(0, torch.argmax(g.to(torch.int32)).view(1))
