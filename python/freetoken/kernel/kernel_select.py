@@ -10,8 +10,12 @@ stays unless another candidate beats it by ``_MARGIN``: paths within timing nois
 other would otherwise flip from one start to the next, and with them the rounding of the
 output.
 
-``FREETOKEN_GGUF_KERNEL_SELECT``: ``auto`` (default) measures; a candidate name (``old``,
-``new``) forces it wherever it is offered.
+``FREETOKEN_GGUF_KERNEL_SELECT``: ``default`` (the default) takes each caller's rule;
+``auto`` measures; a candidate name (``old``, ``new``) forces it wherever it is offered.
+Measuring is opt-in: it times eager launches, and decode mostly replays CUDA graphs, where
+launch overhead is gone -- on the GPU the rules were tuned on, ``auto`` picked paths that
+made graphed MTP decode ~15 % slower. Use it on a GPU the rules were not measured on, and
+compare end to end.
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ logger = init_logger(__name__)
 
 T = TypeVar("T")
 
-_MODE = os.getenv("FREETOKEN_GGUF_KERNEL_SELECT", "auto").strip().lower()
+_MODE = os.getenv("FREETOKEN_GGUF_KERNEL_SELECT", "default").strip().lower()
 _REPS = 3
 _MARGIN = 0.05  # a candidate must be this much faster than the default to replace it
 _decisions: dict[Hashable, str] = {}
@@ -54,6 +58,8 @@ def select(key: Hashable, candidates: dict[str, Callable[[], T]], default: str) 
     return its result. Every candidate must compute the same result without side effects."""
     if _MODE in candidates:
         return candidates[_MODE]()
+    if _MODE != "auto":
+        return candidates[default if default in candidates else next(iter(candidates))]()
     name = _decisions.get(key)
     if name is None:
         if len(candidates) == 1 or torch.cuda.is_current_stream_capturing() or not torch.cuda.is_available():
