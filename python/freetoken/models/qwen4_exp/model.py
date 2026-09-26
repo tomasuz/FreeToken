@@ -263,20 +263,23 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             build_mtp_cache,
             mtp_expert_banks,
             mtp_layer_and_experts,
+            mtp_site_types,
             mtp_state_dict,
+            mtp_tensor_types,
         )
 
         layer, experts, expert_types = mtp_layer_and_experts(mtp_path)
+        site_types = mtp_site_types(mtp_tensor_types(mtp_path), layer)
         prev = torch.get_default_dtype()
         torch.set_default_dtype(torch.bfloat16)
         try:
             with torch.device(device):
-                head = Qwen4ExpMTPHead(self._config, experts)
+                head = Qwen4ExpMTPHead(self._config, experts, site_types=site_types)
         finally:
             torch.set_default_dtype(prev)
         want = head.state_dict()
         sd = {}
-        for key, t in mtp_state_dict(mtp_path, layer).items():
+        for key, t in mtp_state_dict(mtp_path, layer, site_types).items():
             sd[key] = t.to(device=device, dtype=want[key].dtype)
         head.load_state_dict(sd)
         head.self_attn.alloc_ring(device, torch.bfloat16)
