@@ -41,12 +41,13 @@ def _mmq_usable(num_tokens: int, *types: int) -> bool:
         return False
 
 
-# llama.cpp's current MMVQ (kernel/ggml_mmq) for 2-8 tokens (MTP verify), per projection where
-# it measured faster on an RDNA4 GPU (x 10 of Qwen3.8's experts): every down type (IQ4_NL
-# 50 vs 73 us at two tokens, Q8_0 70 vs 107) and gate/up fused with its activation except
-# IQ3_XXS, where the older kernel stays ahead (144 vs 180 us). One token keeps the older
-# kernels: the kernel-level gain there (~0.6 ms a step) is eaten by the f32/int32 conversions
-# around the call, measured 53.1 vs 52.0 ms/token end to end.
+# llama.cpp's current MMVQ (kernel/ggml_mmq) or the older per-row kernels, for up to 8 tokens
+# (decode, MTP verify): chosen per shape by measuring both on this GPU (kernel_select). The
+# defaults below apply only before a measurement (a shape first met under capture), and are
+# what one RDNA4 GPU measured (x 10 of Qwen3.8's experts): the new kernel from two tokens for
+# every down type (IQ4_NL 50 vs 73 us at two tokens, Q8_0 70 vs 107) and for gate/up fused
+# with its activation except IQ3_XXS (144 vs 180 us); the old kernels at one token, where the
+# conversions around the new call ate its kernel-level gain (53.1 vs 52.0 ms/token).
 _NEW_MMVQ = os.getenv("FREETOKEN_GGUF_NEW_MMVQ", "1").strip().lower() not in {"0", "false", "no", "off"}
 _OLD_MMVQ_GATE_UP_TYPES = frozenset({18})  # IQ3_XXS
 
@@ -116,31 +117,51 @@ def fused_experts_gguf(
         out = mmq_moe(down_q, qt_down, inter.shape[1], inter.view(num_tokens, top_k, -1), ids, n_exp)
         return _weighted_sum(out, topk_weights, num_tokens, top_k).to(hidden_states.dtype)
 
-    small = 2 <= num_tokens <= _MMVQ_MAX_TOKENS
-    if (
-        small and activation == "silu" and qt not in _OLD_MMVQ_GATE_UP_TYPES
-        and _new_mmvq_serves(qt)
-    ):
+    from freetoken.kernel.kernel_select import select
+
+    small = num_tokens <= _MMVQ_MAX_TOKENS
+
+    def old_gate_up():
+        # gate_up: [num_tokens*top_k, 2I] -> activation -> [num_tokens*top_k, I]
+        return act_fn(ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens))
+
+    if small and activation == "silu" and _new_mmvq_serves(qt):
         from freetoken.kernel.ggml_mmq import GLU_SWIGLU, mmvq
 
-        # one launch: silu(x @ gate) * (x @ up), gate rows then up rows in each slot
         i = n2 // 2
         k_in = hidden_states.shape[1]
-        inter = mmvq(
-            gate_up_q[:, i:], qt, k_in, hidden_states.view(num_tokens, 1, k_in),
-            topk_ids.to(torch.int32), gate=gate_up_q[:, :i], glu_op=GLU_SWIGLU,
-        ).view(num_tokens * top_k, i).to(hidden_states.dtype)
+
+        def new_gate_up():
+            # one launch: silu(x @ gate) * (x @ up), gate rows then up rows in each slot
+            return mmvq(
+                gate_up_q[:, i:], qt, k_in, hidden_states.view(num_tokens, 1, k_in),
+                topk_ids.to(torch.int32), gate=gate_up_q[:, :i], glu_op=GLU_SWIGLU,
+            ).view(num_tokens * top_k, i).to(hidden_states.dtype)
+
+        inter = select(
+            ("moe_gate_up", qt, n2, k_in, num_tokens, top_k),
+            {"new": new_gate_up, "old": old_gate_up},
+            default="new" if num_tokens >= 2 and qt not in _OLD_MMVQ_GATE_UP_TYPES else "old",
+        )
     else:
-        # gate_up: [num_tokens*top_k, 2I] -> activation -> [num_tokens*top_k, I]
-        gate_up = ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens)
-        inter = act_fn(gate_up)
+        inter = old_gate_up()
+
+    def old_down():
+        # down: each of the num_tokens*top_k intermediate rows uses its own expert id.
+        return ggml_moe_a8_vec(inter, down_q, topk_ids, 1, qt_down, h, num_tokens * top_k)
+
     if small and _new_mmvq_serves(qt_down):
         from freetoken.kernel.ggml_mmq import mmvq
 
-        out = mmvq(down_q, qt_down, inter.shape[1], inter.view(num_tokens, top_k, -1), topk_ids.to(torch.int32))
+        out = select(
+            ("moe_down", qt_down, h, inter.shape[1], num_tokens, top_k),
+            {"new": lambda: mmvq(down_q, qt_down, inter.shape[1], inter.view(num_tokens, top_k, -1),
+                                 topk_ids.to(torch.int32)),
+             "old": old_down},
+            default="new" if num_tokens >= 2 else "old",
+        )
     else:
-        # down: each of the num_tokens*top_k intermediate rows uses its own expert id.
-        out = ggml_moe_a8_vec(inter, down_q, topk_ids, 1, qt_down, h, num_tokens * top_k)
+        out = old_down()
     return _weighted_sum(out.reshape(num_tokens, top_k, h), topk_weights, num_tokens, top_k).to(
         hidden_states.dtype
     )

@@ -95,15 +95,34 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
     if qweight_type in _UNQUANTIZED:
         return x @ qweight.T
     x = x.contiguous()  # the kernels index X by raw data_ptr and row length
-    if 2 <= x.shape[0] <= _NEW_MMVQ_MAX_TOKENS and _new_mmvq_serves(qweight_type):
-        # llama.cpp's current MMVQ reads the weight once for all the tokens: at 3 tokens it
-        # takes ~1.1x the one-token time where the older kernel takes ~2x (RDNA4 GPU, Q8_0
-        # and Q6_K Qwen3.8 projections). At one token the two are even, so it stays old.
+    tokens = x.shape[0]
+    if tokens <= _NEW_MMVQ_MAX_TOKENS and _new_mmvq_serves(qweight_type):
+        # llama.cpp's current MMVQ reads the weight once for all the tokens, the older kernel
+        # once per token; which wins at this shape on this GPU (conversions included) is
+        # measured once (kernel_select). Default before a measurement: the new one from two
+        # tokens (on an RDNA4 GPU ~1.1x vs ~2x the one-token time at 3 tokens), the old one
+        # at a single token, where the two measured even.
         from freetoken.kernel.ggml_mmq import mmvq
+        from freetoken.kernel.kernel_select import select
 
         block, type_size = BLOCK_SHAPE[qweight_type]
         k = qweight.shape[1] // type_size * block
-        return mmvq(qweight, qweight_type, k, x).to(x.dtype)
+        return select(
+            ("dense", qweight_type, out_features, k, tokens),
+            {"new": lambda: mmvq(qweight, qweight_type, k, x).to(x.dtype),
+             "old": lambda: _older_kernels(x, qweight, qweight_type, out_features)},
+            default="new" if tokens >= 2 else "old",
+        )
+    return _older_kernels(x, qweight, qweight_type, out_features)
+
+
+def _older_kernels(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int, out_features: int) -> torch.Tensor:
+    from freetoken.kernel.gguf import (
+        ggml_dequantize,
+        ggml_mul_mat_a8,
+        ggml_mul_mat_vec_a8,
+    )
+
     if x.shape[0] <= _MMVQ_SAFE and qweight_type in _MMVQ:
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
     if qweight_type in _MMQ:
