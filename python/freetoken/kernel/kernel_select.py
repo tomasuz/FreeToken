@@ -12,10 +12,10 @@ output.
 
 ``FREETOKEN_GGUF_KERNEL_SELECT``: ``default`` (the default) takes each caller's rule;
 ``auto`` measures; a candidate name (``old``, ``new``) forces it wherever it is offered.
-Measuring is opt-in: it times eager launches, and decode mostly replays CUDA graphs, where
-launch overhead is gone -- on the GPU the rules were tuned on, ``auto`` picked paths that
-made graphed MTP decode ~15 % slower. Use it on a GPU the rules were not measured on, and
-compare end to end.
+Measuring is opt-in: it times eager launches, while decode mostly replays CUDA graphs,
+where launch overhead is gone, so its picks are not guaranteed to win there; it also makes
+the choice (and with it the output's rounding) depend on each start's timings. Use it on a
+GPU the rules were not measured on, and compare end to end.
 """
 
 from __future__ import annotations
