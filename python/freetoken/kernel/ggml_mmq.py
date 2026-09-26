@@ -1,13 +1,13 @@
-"""llama.cpp's MMQ (quantized matmul) for grouped-by-expert MoE, built with hipcc and
+"""llama.cpp's MMQ (quantized matmul) and MMVQ (mat-vec), built with the GPU toolchain and
 called through ctypes.
 
-The vendored sources (``csrc/ggml_mmq``, see its UPSTREAM.md) are llama.cpp's own and
-already speak HIP through ``GGML_USE_HIP``, so they are compiled as they are rather than
-through torch's hipify, which would rewrite them. The result is a plain shared library
-with a C entry point (``ft_mmq_moe``); it links nothing of torch, and every buffer --
-activations, output, scratch -- is a torch tensor passed by pointer.
-
-ROCm only for now: the CUDA build of the same files would need nvcc and its own flags.
+The vendored sources (``csrc/ggml_mmq``, see its UPSTREAM.md) are llama.cpp's own: they are
+CUDA, and speak HIP through ``GGML_USE_HIP`` (``vendors/hip.h``), so they are compiled as they
+are -- with hipcc on ROCm, nvcc on CUDA -- rather than through torch's hipify, which would
+rewrite them. The result is a plain shared library with C entry points (``ft_mmq_moe``,
+``ft_mmvq``); it links nothing of torch, and every buffer -- activations, output, scratch --
+is a torch tensor passed by pointer. Without the toolchain (or when the build fails) the
+older GGUF kernels serve instead.
 """
 
 from __future__ import annotations
@@ -31,14 +31,39 @@ _SRC = pathlib.Path(__file__).parent / "csrc" / "ggml_mmq"
 # ggml type enum names of the instantiated MMQ cases (one translation unit each)
 _TYPES = ("Q4_0", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "IQ3_XXS", "IQ4_NL", "IQ4_XS")
 _DEFINES = ("-DGGML_USE_HIP", "-DGGML_HIP_NO_VMM", "-DNDEBUG")
+_CUDA_DEFINES = ("-DGGML_CUDA_NO_VMM", "-DNDEBUG")
+
+
+def _platform() -> str | None:
+    """"hip" or "cuda": the runtime torch was built for, when this process sees a GPU."""
+    if getattr(torch.version, "hip", None):
+        return "hip"
+    if getattr(torch.version, "cuda", None):
+        return "cuda"
+    return None
 
 
 def available() -> bool:
-    return bool(getattr(torch.version, "hip", None)) and shutil.which(_hipcc()) is not None
+    plat = _platform()
+    return plat is not None and shutil.which(_compiler(plat)) is not None
 
 
 def _hipcc() -> str:
     return os.environ.get("FREETOKEN_MMQ_HIPCC", "hipcc")
+
+
+def _nvcc() -> str:
+    nvcc = os.environ.get("FREETOKEN_MMQ_NVCC")
+    if nvcc:
+        return nvcc
+    from torch.utils.cpp_extension import CUDA_HOME
+
+    cand = pathlib.Path(CUDA_HOME) / "bin" / "nvcc" if CUDA_HOME else None
+    return str(cand) if cand is not None and cand.exists() else "nvcc"
+
+
+def _compiler(plat: str) -> str:
+    return _hipcc() if plat == "hip" else _nvcc()
 
 
 def _hipcc_env() -> dict[str, str]:
@@ -56,6 +81,13 @@ def _hipcc_env() -> dict[str, str]:
 
 
 def _archs() -> list[str]:
+    """ROCm: gfx targets; CUDA: compute capabilities as ``86``, ``90``... -- the visible
+    devices', or ``PYTORCH_ROCM_ARCH`` / ``TORCH_CUDA_ARCH_LIST``."""
+    if _platform() == "cuda":
+        env = os.environ.get("TORCH_CUDA_ARCH_LIST")
+        if env:
+            return sorted({a.replace(".", "").replace("+PTX", "") for a in env.replace(",", ";").replace(" ", ";").split(";") if a})
+        return sorted({"%d%d" % torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count())})
     from freetoken.kernel.gguf import visible_device_archs
 
     env = os.environ.get("PYTORCH_ROCM_ARCH")
@@ -78,19 +110,29 @@ def _build_dir(archs: list[str]) -> pathlib.Path:
     from torch.utils.cpp_extension import _get_build_directory
 
     base = pathlib.Path(_get_build_directory("freetoken_ggml_mmq", verbose=False))
-    path = pathlib.Path(f"{base}-{'-'.join(archs)}-{_sources_digest()}")
+    path = pathlib.Path(f"{base}-{_platform()}-{'-'.join(archs)}-{_sources_digest()}")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def _compile(hipcc: str, src: pathlib.Path, obj: pathlib.Path, archs: list[str]) -> None:
-    cmd = [
-        hipcc, "-x", "hip", "-std=c++17", "-O3", "-fPIC",
-        *[f"--offload-arch={a}" for a in archs], *_DEFINES, "-include", str(_SRC / "ft_compat.h"),
-        f"-I{_SRC / 'include'}", f"-I{_SRC / 'src'}", f"-I{_SRC / 'src' / 'ggml-cuda'}",
-        "-c", str(src), "-o", str(obj),
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True, env=_hipcc_env())
+def _arch_flags(archs: list[str]) -> list[str]:
+    if _platform() == "cuda":
+        return [f"-gencode=arch=compute_{a},code=sm_{a}" for a in archs]
+    return [f"--offload-arch={a}" for a in archs]
+
+
+def _compile(cc: str, src: pathlib.Path, obj: pathlib.Path, archs: list[str]) -> None:
+    includes = [f"-I{_SRC / 'include'}", f"-I{_SRC / 'src'}", f"-I{_SRC / 'src' / 'ggml-cuda'}"]
+    compat = ["-include", str(_SRC / "ft_compat.h")]
+    if _platform() == "cuda":
+        cmd = [cc, "-x", "cu", "-std=c++17", "-O3", "-Xcompiler", "-fPIC", "--expt-relaxed-constexpr",
+               *_arch_flags(archs), *_CUDA_DEFINES, *compat, *includes, "-c", str(src), "-o", str(obj)]
+        env = None
+    else:
+        cmd = [cc, "-x", "hip", "-std=c++17", "-O3", "-fPIC", *_arch_flags(archs), *_DEFINES, *compat,
+               *includes, "-c", str(src), "-o", str(obj)]
+        env = _hipcc_env()
+    res = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if res.returncode != 0:
         raise RuntimeError(f"ggml_mmq: compiling {src.name} failed:\n{' '.join(cmd)}\n{res.stderr[-6000:]}")
 
@@ -99,11 +141,11 @@ def _compile(hipcc: str, src: pathlib.Path, obj: pathlib.Path, archs: list[str])
 def _lib() -> ctypes.CDLL:
     archs = _archs()
     if not archs:
-        raise RuntimeError("ggml_mmq: no visible ROCm device to build for")
+        raise RuntimeError("ggml_mmq: no visible GPU to build for")
     out = _build_dir(archs)
     so = out / "libft_mmq.so"
     if not so.exists():
-        hipcc = _hipcc()
+        cc = _compiler(_platform())
         units = [(_SRC / "ft_mmq.cu", out / "ft_mmq.o"),
                  (_SRC / "ft_mmvq.cu", out / "ft_mmvq.o"),
                  (_SRC / "src" / "ggml-cuda" / "quantize.cu", out / "quantize.o"),
@@ -112,14 +154,19 @@ def _lib() -> ctypes.CDLL:
             src = out / f"ft_mmq_inst_{t.lower()}.cu"
             src.write_text(f'#include "ggml-cuda/mmq.cuh"\n\nDECL_MMQ_CASE(GGML_TYPE_{t});\n')
             units.append((src, out / f"ft_mmq_inst_{t.lower()}.o"))
-        logger.info(f"ggml_mmq: building llama.cpp MMQ for {', '.join(archs)} ({len(units)} units, once)")
+        logger.info(f"ggml_mmq: building llama.cpp MMQ/MMVQ with {_platform()} for {', '.join(archs)} ({len(units)} units, once)")
         jobs = max(1, min(len(units), (os.cpu_count() or 4) // 2))
         with ThreadPoolExecutor(jobs) as ex:
-            list(ex.map(lambda u: _compile(hipcc, u[0], u[1], archs), units))
+            list(ex.map(lambda u: _compile(cc, u[0], u[1], archs), units))
         tmp = out / f"libft_mmq.so.tmp{os.getpid()}"
-        cmd = [hipcc, "-shared", "-fPIC", *[f"--offload-arch={a}" for a in archs],
-               *[str(o) for _, o in units], "-o", str(tmp)]
-        res = subprocess.run(cmd, capture_output=True, text=True, env=_hipcc_env())
+        if _platform() == "cuda":
+            cmd = [cc, "-shared", "-Xcompiler", "-fPIC", *_arch_flags(archs),
+                   *[str(o) for _, o in units], "-lcudart", "-lcublas", "-o", str(tmp)]
+            env = None
+        else:
+            cmd = [cc, "-shared", "-fPIC", *_arch_flags(archs), *[str(o) for _, o in units], "-o", str(tmp)]
+            env = _hipcc_env()
+        res = subprocess.run(cmd, capture_output=True, text=True, env=env)
         if res.returncode != 0:
             raise RuntimeError(f"ggml_mmq: linking failed:\n{res.stderr[-6000:]}")
         os.replace(tmp, so)
