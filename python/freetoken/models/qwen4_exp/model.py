@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.core import get_global_ctx
+from freetoken.layers.gguf import GGUFLinear
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import init_logger, nvtx_annotate
@@ -44,6 +45,26 @@ _PREFETCH_K = int(os.getenv("FREETOKEN_MOE_PREFETCH_K", "0") or 0)
 _PREFETCH_AT = os.getenv("FREETOKEN_MOE_PREFETCH_AT", "post_attn")
 _PREFETCH_CHEAP = os.getenv("FREETOKEN_MOE_PREFETCH_CHEAP", "0") == "1"
 _PREFETCH_DEBUG = os.getenv("FREETOKEN_MOE_PREFETCH_DEBUG", "")  # "predict_only": cost of the guess alone
+
+
+# Draft over the first N token ids only (0: the whole vocabulary). A BPE vocabulary is
+# numbered by merge rank, so its head holds the frequent tokens; the head's logits are
+# the biggest read of a draft (Qwen3.8: 248k x 2560 Q6_K, ~1.7 ms), and a draft outside
+# the prefix only costs a reject -- the verify scores the full vocabulary.
+_MTP_DRAFT_VOCAB = int(os.getenv("FREETOKEN_MTP_DRAFT_VOCAB", "0") or 0)
+
+
+class _DraftVocabHead:
+    """The first ``n`` rows of a GGUF LM head (contiguous packed rows: a view)."""
+
+    def __init__(self, head: "GGUFLinear", n: int) -> None:
+        self.qweight = head.qweight[:n]
+        self._quant_type = head._quant_type
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.layers.gguf import fused_mul_mat_gguf
+
+        return fused_mul_mat_gguf(x, self.qweight, self._quant_type)
 
 
 class _LayerRef:
@@ -276,6 +297,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         """``(draft logits, head residual)`` for each (base residual at p, token at p+1)."""
         lm = self.lm_head
         head_linear = getattr(lm, "head", lm)  # GGUFLMHead wraps a GGUFLinear: all rows
+        n = _MTP_DRAFT_VOCAB
+        if n and isinstance(head_linear, GGUFLinear) and n < head_linear.out_features:
+            head_linear = _DraftVocabHead(head_linear, n)
         return self._mtp.head.forward(R_prev, next_ids, positions, self.model.embed_tokens, head_linear)
 
     def load_host_tables(self, engine_config) -> int:
