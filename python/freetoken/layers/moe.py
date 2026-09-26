@@ -144,6 +144,7 @@ class MoELayer(BaseOP):
         return self._maybe_all_reduce(self._resident_gemm(hidden_states, topk_weights, topk_ids))
 
 
+
 def _submit(executor, layer_id: int, hidden_states, topk_weights, ids):
     """Start work on an executor without waiting, whatever kind of executor it is.
 
@@ -374,20 +375,22 @@ class OffloadMoELayer(MoELayer):
 
     def _decode_cpu_assist(self, cache, hidden_states, topk_weights, topk_ids):
         """Resident experts on the GPU, the rest on the CPU at the same time; nothing waits
-        on PCIe. The CPU reads a missing expert from host RAM faster than the link can
-        bring it over (Ryzen 7 5700G: ~70 us for a 2 MiB IQ3_XXS/IQ4_NL expert, ~160 us to
-        copy it), and it runs beside the GPU's GEMM instead of before it. The misses are
-        still admitted to the slot cache, copied in the background for later steps."""
+        on PCIe. The CPU computes a missing expert from host RAM sooner than the link brings
+        it over (Ryzen 7 5700G, Qwen3.8 UD-Q3_K_XL: ~100 us a route in the pool vs ~160 us
+        to copy a 2 MiB expert), beside the GPU's GEMM instead of before it. The misses are
+        still admitted to the slot cache, copied in the background for later steps.
+
+        FREETOKEN_GGUF_CPU_ASSIST=1. On tm, decode 52.3 -> 44.7 ms/token; not for MTP
+        verifies, whose extra misses make the CPU the longer side (T=3: 93 -> ~100 ms)."""
         executor = cache.cpu_assist
         with phase("moe.plan"):
-            slots = cache.assist_lookup(self.layer_id, topk_ids)
-            on_gpu = slots >= 0
+            on_gpu = cache.assist_split(self.layer_id, topk_ids)
             cpu_ids = torch.where(on_gpu, topk_ids.new_full((), -1), topk_ids).contiguous()
             cpu_w = torch.where(on_gpu, topk_weights.new_zeros(()), topk_weights).contiguous()
         with phase("moe.submit.cpu"):
             pending = _submit(executor, self.layer_id, hidden_states, cpu_w, cpu_ids)
         with phase("moe.admit"):
-            cache.assist_admit(self.layer_id, topk_ids)
+            slots = cache.assist_plan(self.layer_id, topk_ids)
         with phase("moe.gemm"):
             gpu_slots = torch.where(on_gpu, slots, slots.new_zeros(())).to(topk_ids.dtype)
             gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
@@ -402,7 +405,8 @@ class OffloadMoELayer(MoELayer):
                 is_prefill=False,
             )
         with phase("moe.join.cpu"):
-            return out + _sync(executor, pending)
+            part = _sync(executor, pending)
+        return out + part
 
     def _decode_split(
         self,

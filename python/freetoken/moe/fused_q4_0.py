@@ -60,6 +60,15 @@ def _new_mmvq_serves(ggml_type: int) -> bool:
     return ggml_mmq.supports(ggml_type)
 
 
+def _weighted_sum(out: torch.Tensor, topk_weights: torch.Tensor, num_tokens: int, top_k: int) -> torch.Tensor:
+    """Sum of the routes' outputs by their router weights, a zero-weight route dropped
+    rather than multiplied: a caller that hands a route to another executor keeps its
+    slot id pointing somewhere, and in a slot region shared by layers of different ggml
+    types that somewhere can decode to inf -- which times zero is NaN."""
+    w = topk_weights.reshape(num_tokens, top_k, 1).to(out.dtype)
+    return torch.where(w != 0, out * w, out.new_zeros(())).sum(dim=1)
+
+
 def fused_experts_gguf(
     hidden_states: torch.Tensor,
     gate_up_q: torch.Tensor,  # [num_slots, 2I, H//32*18] uint8
@@ -105,8 +114,7 @@ def fused_experts_gguf(
         gate_up = mmq_moe(gate_up_q, qt, k_in, hidden_states.view(num_tokens, 1, k_in), ids, n_exp)
         inter = act_fn(gate_up.view(num_tokens * top_k, n2).to(hidden_states.dtype))
         out = mmq_moe(down_q, qt_down, inter.shape[1], inter.view(num_tokens, top_k, -1), ids, n_exp)
-        out = out * topk_weights.reshape(num_tokens, top_k, 1).to(out.dtype)
-        return out.sum(dim=1).to(hidden_states.dtype)
+        return _weighted_sum(out, topk_weights, num_tokens, top_k).to(hidden_states.dtype)
 
     small = 2 <= num_tokens <= _MMVQ_MAX_TOKENS
     if (
@@ -133,10 +141,9 @@ def fused_experts_gguf(
     else:
         # down: each of the num_tokens*top_k intermediate rows uses its own expert id.
         out = ggml_moe_a8_vec(inter, down_q, topk_ids, 1, qt_down, h, num_tokens * top_k)
-    out = out.reshape(num_tokens, top_k, h) * topk_weights.reshape(num_tokens, top_k, 1).to(
-        out.dtype
+    return _weighted_sum(out.reshape(num_tokens, top_k, h), topk_weights, num_tokens, top_k).to(
+        hidden_states.dtype
     )
-    return out.sum(dim=1).to(hidden_states.dtype)
 
 
 def fused_experts_gguf_q4_0(

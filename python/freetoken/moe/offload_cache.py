@@ -2055,29 +2055,30 @@ class OffloadMoeCache:
         # the ids tensor must outlive the side stream's kernels: dropped at the join
         self._pf_keep[layer_id] = ids
 
-    def assist_lookup(self, layer_id: int, expert_ids: torch.Tensor) -> torch.Tensor:
-        """The region-local slot of each routed expert of ``layer_id``, or -1 where it is
-        not resident. A pure read: nothing is admitted or bumped."""
-        flat = expert_ids.to(torch.int64) + layer_id * self.num_experts
-        return self.slot_for_id.view(-1).index_select(0, flat.reshape(-1)).view(expert_ids.shape)
+    def assist_split(self, layer_id: int, expert_ids: torch.Tensor) -> torch.Tensor:
+        """Which routes of ``layer_id`` the GPU computes this step: the resident experts. The
+        rest are the CPU's. One gather, so the CPU can be started right after."""
+        flat = (expert_ids.to(torch.int64) + layer_id * self.num_experts).reshape(-1)
+        return (self.slot_for_id.view(-1).index_select(0, flat) >= 0).view(expert_ids.shape)
 
-    def assist_admit(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+    def assist_plan(self, layer_id: int, expert_ids: torch.Tensor) -> torch.Tensor:
         """Record this step's routing of ``layer_id`` in the LRU -- bumping the resident
         experts, giving the rest slots -- and copy the newcomers in on the side stream
         without waiting: this step computes them on the CPU, so only a later step reads
-        them, after :meth:`assist_join` at the end of this forward.
+        them, after :meth:`assist_join` at the end of this forward. Returns every route's
+        slot (the resident ones are what the GPU reads this step).
 
         Each layer has its own plan buffers, so no plan is overwritten while its copy may
-        still be queued. The resident experts this step's GEMM reads carry this call's
-        step stamp, which is what keeps them out of the eviction."""
+        still be queued; the resident experts this step reads carry this call's step stamp,
+        which keeps them out of every later eviction of the step.
+        """
         from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
         from freetoken.moe.offload_kernels import lru_ensure
 
         ids = expert_ids.reshape(-1).to(torch.int32, copy=True)
         k = ids.numel()
         base, size = self.lru_part(layer_id)
-        if k > min(self._PF_CAPACITY, size // 2):
-            return
+        assert k <= min(self._PF_CAPACITY, size // 2), (k, size)
         if self._adm_plan is None:
             cap = self._PF_CAPACITY
             i32 = dict(dtype=torch.int32, device=self.device)
@@ -2113,8 +2114,9 @@ class OffloadMoeCache:
 
                 for view, start in self._tail_zero[layer_id]:
                     zero_slot_tails(view, dst[:k], num, start, _GGUF_SLOT_TAIL_BYTES)
-        self._pf_keep[("adm", layer_id)] = ids
         self._adm_pending = True
+        self._pf_keep[("adm", layer_id)] = ids
+        return out[:k].view(expert_ids.shape)
 
     def assist_join(self) -> None:
         """End of a forward: the background admissions must land before the next step
