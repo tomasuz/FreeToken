@@ -1,6 +1,6 @@
 """Captured MTP verify forwards: one request, T consecutive tokens, every row scored.
 
-A verify is an extend of 2..4 tokens (``scheduler/mtp4.py``). Run eagerly it costs about three
+A verify is an extend of 1..4 tokens (``scheduler/mtp4.py``; 1: a step with no draft). Run eagerly it costs about three
 graph decode steps on the RX 9060 XT, all of it launch overhead, so each T gets its own graph.
 The forward is the ordinary prefill-phase one with ``batch.mtp_verify`` (the GDN layers take
 the decode kernels row by row) and ``batch.mtp_capture`` (all-row logits + the wide residual),

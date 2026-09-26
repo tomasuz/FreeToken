@@ -194,7 +194,7 @@ class Qwen4MTPMixin:
         from freetoken.engine.verify_graph import HeadGraphs, VerifyGraphs
 
         try:
-            graphs = VerifyGraphs(self.engine, sizes=range(2, MAX_T + 1))
+            graphs = VerifyGraphs(self.engine, sizes=range(1, MAX_T + 1))  # T=1: a step with no draft
             graphs.capture()
         except Exception:  # noqa: BLE001 -- eager verify still works
             import traceback

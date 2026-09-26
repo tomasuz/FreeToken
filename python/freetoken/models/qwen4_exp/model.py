@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 # window for the copy, a staler residual for the guess).
 _PREFETCH_K = int(os.getenv("FREETOKEN_MOE_PREFETCH_K", "0") or 0)
 _PREFETCH_AT = os.getenv("FREETOKEN_MOE_PREFETCH_AT", "post_attn")
+_PREFETCH_CHEAP = os.getenv("FREETOKEN_MOE_PREFETCH_CHEAP", "0") == "1"
 _PREFETCH_DEBUG = os.getenv("FREETOKEN_MOE_PREFETCH_DEBUG", "")  # "predict_only": cost of the guess alone
 
 
@@ -110,7 +111,17 @@ class Qwen4ExpDecoderLayer(BaseOP):
         if k <= 0:
             return
         with phase("prefetch"):
-            x, _ = self.mlp_hyper_connection.mix(hidden)
+            hc = self.mlp_hyper_connection
+            if _PREFETCH_CHEAP:
+                # the mix without its gates: normed streams summed, then the router. Skips
+                # the mix's two GEMMs (down to the low rank, up to every stream's gate);
+                # top-k does not care about the scale the mean would add.
+                from freetoken.kernel.triton.hc import grouped_gemma_rmsnorm
+
+                rn = grouped_gemma_rmsnorm(hidden, hc.hc_norm.weight, hc.hc_norm.eps, hc.hc_count)
+                x = rn.view(hidden.shape[0], hc.hc_count, hc.hidden_size).sum(1)
+            else:
+                x, _ = hc.mix(hidden)
             ids = torch.topk(self.mlp.gate.forward(x), k, dim=-1).indices
             if _PREFETCH_DEBUG != "predict_only":
                 cache.prefetch_begin(self._layer_id, ids)

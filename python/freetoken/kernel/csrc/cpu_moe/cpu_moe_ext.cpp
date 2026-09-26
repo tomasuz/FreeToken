@@ -1343,6 +1343,13 @@ struct CpuMoeExecutor {
   bool spin_wait = false;
   int64_t gg_xq_stride = 0, gg_gq_stride = 0;
   std::vector<uint8_t> gg_xq, gg_gq;
+  // gguf work is per distinct expert, not per route, so an expert several tokens route
+  // to (an MTP verify) is read from host RAM once: the task's distinct experts, the
+  // routes of each (CSR), and the routes' down outputs before the per-token sum
+  std::vector<int> gg_uniq, gg_rstart, gg_routes;
+  std::vector<float> gg_part;
+  std::atomic<int64_t> p3_next{0};
+  int64_t p3_total = 0;
   dsdot_fn dsdot;
   mxgemv_fn mxgemv;
   q4dot_fn q4dot;
@@ -1791,59 +1798,79 @@ struct CpuMoeExecutor {
 
   void do_pass1_gguf(const MoeTask* t, int64_t p) {
     const int64_t ib = p % n_iblk;
-    const int64_t tk = p / n_iblk;
-    const int k = static_cast<int>(tk % top_k);
-    const int tok = static_cast<int>(tk / top_k);
-    const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
-    if (e < 0 || e >= num_experts) return;
+    const int u = static_cast<int>(p / n_iblk);
+    const int e = gg_uniq[u];
     const GgufRows& L = gguf[t->layer_id];
-    const float w_in = apply_on_input ? t->w[static_cast<size_t>(tok) * top_k + k] : 1.0f;
     const uint8_t* w_e = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id)) +
                          (size_t)e * (2 * I) * (size_t)L.gu_row;
-    const uint8_t* xq = gg_xq.data() + (size_t)tok * gg_xq_stride;
-    bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
+    const int r0 = gg_rstart[u], r1 = gg_rstart[u + 1];
     const int i0 = static_cast<int>(ib) * IBLK;
     const int i1 = std::min(I, i0 + IBLK);
     const bool clamped = act == ACT_SWIGLUOAI || act == ACT_SWIGLU_CLAMP;
     const float up_bias = act == ACT_SWIGLUOAI ? 1.0f : 0.0f;
     const float lim = swiglu_limit, alpha = swiglu_alpha;
     for (int i = i0; i < i1; ++i) {
-      float gate, up;
-      L.gu_dot(H, &gate, 0, w_e + (size_t)i * L.gu_row, 0, xq, 0, 1);
-      L.gu_dot(H, &up, 0, w_e + (size_t)(I + i) * L.gu_row, 0, xq, 0, 1);
-      gate *= w_in;
-      up *= w_in;
-      if (clamped) {
-        if (gate > lim) gate = lim;
-        if (up > lim) up = lim;
-        else if (up < -lim) up = -lim;
-        const float glu = gate / (1.0f + std::exp(-gate * alpha));
-        g_row[i] = f32_to_bf16(glu * (up + up_bias));
-      } else {
-        g_row[i] = f32_to_bf16(act_apply(act, gate) * up);
+      const uint8_t* g_w = w_e + (size_t)i * L.gu_row;
+      const uint8_t* u_w = w_e + (size_t)(I + i) * L.gu_row;
+      for (int j = r0; j < r1; ++j) {  // this row stays in cache across the expert's routes
+        const int r = gg_routes[j];
+        const int tok = r / top_k;
+        const uint8_t* xq = gg_xq.data() + (size_t)tok * gg_xq_stride;
+        const float w_in = apply_on_input ? t->w[r] : 1.0f;
+        float gate, up;
+        L.gu_dot(H, &gate, 0, g_w, 0, xq, 0, 1);
+        L.gu_dot(H, &up, 0, u_w, 0, xq, 0, 1);
+        gate *= w_in;
+        up *= w_in;
+        bf16_t* g_row = g_scratch.data() + (size_t)r * I;
+        if (clamped) {
+          if (gate > lim) gate = lim;
+          if (up > lim) up = lim;
+          else if (up < -lim) up = -lim;
+          const float glu = gate / (1.0f + std::exp(-gate * alpha));
+          g_row[i] = f32_to_bf16(glu * (up + up_bias));
+        } else {
+          g_row[i] = f32_to_bf16(act_apply(act, gate) * up);
+        }
       }
     }
   }
 
   void do_pass2_gguf(const MoeTask* t, int64_t p) {
     const int64_t hb = p % n_hblk;
-    const int tok = static_cast<int>(p / n_hblk);
+    const int u = static_cast<int>(p / n_hblk);
+    const int e = gg_uniq[u];
     const int h0 = static_cast<int>(hb) * HBLK;
     const int h1 = std::min(H, h0 + HBLK);
     const GgufRows& L = gguf[t->layer_id];
-    const uint8_t* dn_l = reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id));
+    const uint8_t* dn_e = reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id)) +
+                          (size_t)e * H * (size_t)L.dn_row;
+    const int r0 = gg_rstart[u], r1 = gg_rstart[u + 1];
+    for (int h = h0; h < h1; ++h) {
+      const uint8_t* row = dn_e + (size_t)h * L.dn_row;
+      for (int j = r0; j < r1; ++j) {
+        const int r = gg_routes[j];
+        const float w_out = apply_on_input ? 1.0f : t->w[r];
+        float v;
+        L.dn_dot(I, &v, 0, row, 0, gg_gq.data() + (size_t)r * gg_gq_stride, 0, 1);
+        gg_part[(size_t)r * H + h] = v * w_out;
+      }
+    }
+  }
+
+  void do_pass3_gguf(const MoeTask* t, int64_t p) {
+    const int64_t hb = p % n_hblk;
+    const int tok = static_cast<int>(p / n_hblk);
+    const int h0 = static_cast<int>(hb) * HBLK;
+    const int h1 = std::min(H, h0 + HBLK);
     bf16_t* y_row = t->y + (size_t)tok * H;
     for (int h = h0; h < h1; ++h) {
       float acc = 0.0f;
       for (int k = 0; k < top_k; ++k) {
-        const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
+        const int r = tok * top_k + k;
+        const int e = t->ids[r];
         if (e < 0 || e >= num_experts) continue;
-        const float w_out = apply_on_input ? 1.0f : t->w[static_cast<size_t>(tok) * top_k + k];
-        const size_t gr = (size_t)tok * top_k + k;
-        float v;
-        L.dn_dot(I, &v, 0, dn_l + ((size_t)e * H + h) * (size_t)L.dn_row, 0,
-                 gg_gq.data() + gr * gg_gq_stride, 0, 1);
-        acc += v * w_out;
+        acc += gg_part[(size_t)r * H + h];
       }
       y_row[h] = f32_to_bf16(acc);
     }
@@ -2068,6 +2095,14 @@ struct CpuMoeExecutor {
       if (p >= p2_total) break;
       do_pass2(t, p);
     }
+    if (fmt == WF_GGUF) {  // sum each token's routes (pass 2 wrote them per route)
+      barrier(local_sense);
+      for (;;) {
+        int64_t p = p3_next.fetch_add(1, std::memory_order_relaxed);
+        if (p >= p3_total) break;
+        do_pass3_gguf(t, p);
+      }
+    }
   }
 
   void worker_loop(int tid) {
@@ -2085,7 +2120,8 @@ struct CpuMoeExecutor {
       MoeTask* t;
       if (spin_wait && hot_clock::now() - last_task < kHotWindow) {
         unsigned polls = 0;
-        while (submitted.load(std::memory_order_acquire) == my_gen && !stop) {
+        while (submitted.load(std::memory_order_acquire) == my_gen &&
+               !__atomic_load_n(&stop, __ATOMIC_RELAXED)) {
 #if CPU_MOE_X86
           _mm_pause();
 #endif
@@ -2136,9 +2172,38 @@ struct CpuMoeExecutor {
     p1_total = static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
     p2_total = static_cast<int64_t>(t->num_tokens) * n_hblk;
     prt_total = (needs_di || use_q4a8 || fmt == WF_GGUF) ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
+    p3_total = 0;
+    if (fmt == WF_GGUF) {
+      const int nr = t->num_tokens * top_k;
+      gg_uniq.clear();
+      gg_rstart.assign(1, 0);
+      gg_routes.clear();
+      // distinct experts in first-seen order; routes grouped under each (nr <= a few dozen)
+      std::vector<int> seen;
+      for (int r = 0; r < nr; ++r) {
+        const int e = t->ids[r];
+        if (e < 0 || e >= num_experts) continue;
+        bool dup = false;
+        for (int u : seen) dup |= (u == e);
+        if (!dup) seen.push_back(e);
+      }
+      for (int e : seen) {
+        gg_uniq.push_back(e);
+        for (int r = 0; r < nr; ++r)
+          if (t->ids[r] == e) gg_routes.push_back(r);
+        gg_rstart.push_back(static_cast<int>(gg_routes.size()));
+      }
+      const int64_t U = static_cast<int64_t>(gg_uniq.size());
+      p1_total = U * n_iblk;
+      p2_total = U * n_hblk;
+      p3_total = static_cast<int64_t>(t->num_tokens) * n_hblk;
+      const size_t pn = static_cast<size_t>(nr) * H;
+      if (pn > gg_part.size()) gg_part.resize(pn);
+    }
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
     prt_next.store(0, std::memory_order_relaxed);
+    p3_next.store(0, std::memory_order_relaxed);
     done_count.store(0, std::memory_order_relaxed);
     bar_count.store(0, std::memory_order_relaxed);
     bar_sense.store(0, std::memory_order_relaxed);

@@ -148,7 +148,7 @@ class MoELayer(BaseOP):
 # CPU assist: the CPU's misses admitted to the slot cache per layer and step (0: all), and
 # the most misses the CPU takes per layer (0: all; past it the GPU fetches the rest itself)
 _ASSIST_ADMIT_CAP = int(os.environ.get("FREETOKEN_ASSIST_ADMIT_CAP", "1"))
-_ASSIST_CPU_MAX = int(os.environ.get("FREETOKEN_ASSIST_CPU_MAX", "0"))
+_ASSIST_CPU_MAX = int(os.environ.get("FREETOKEN_ASSIST_CPU_MAX", "12"))
 
 
 def _submit(executor, layer_id: int, hidden_states, topk_weights, ids):
@@ -397,6 +397,7 @@ class OffloadMoELayer(MoELayer):
             pending = _submit(executor, self.layer_id, hidden_states, cpu_w, cpu_ids)
         with phase("moe.admit"):
             slots = cache.assist_plan(self.layer_id, topk_ids, on_gpu, _ASSIST_ADMIT_CAP, _ASSIST_CPU_MAX > 0)
+            cache.prefetch_join(self.layer_id)  # experts a prefetch made resident must have landed
         with phase("moe.gemm"):
             gpu_slots = torch.where(on_gpu, slots, slots.new_zeros(())).to(topk_ids.dtype)
             gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
