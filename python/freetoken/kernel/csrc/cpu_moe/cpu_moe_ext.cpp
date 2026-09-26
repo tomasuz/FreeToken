@@ -1339,6 +1339,8 @@ struct CpuMoeExecutor {
   // gguf: per-layer rows (set_gguf_layers) and the quantized activations, input rows
   // ``gg_xq_stride`` apart per token and intermediate rows ``gg_gq_stride`` apart per route
   std::vector<GgufRows> gguf;
+  // workers spin between closely spaced tasks instead of sleeping (FREETOKEN_CPU_MOE_SPIN)
+  bool spin_wait = false;
   int64_t gg_xq_stride = 0, gg_gq_stride = 0;
   std::vector<uint8_t> gg_xq, gg_gq;
   dsdot_fn dsdot;
@@ -2071,8 +2073,25 @@ struct CpuMoeExecutor {
   void worker_loop(int tid) {
     pin_self(tid);
     uint64_t my_gen = 0;
+    // Hot wait: while tasks keep coming (one per MoE layer, ~0.5-1 ms apart in decode),
+    // spin on the generation instead of sleeping on the condition variable. Waking a pool
+    // of sleeping workers costs a futex round trip per thread -- measured as ~0.2 ms of a
+    // 0.29 ms task on the Ryzen 7 5700G, more than the expert rows themselves. Past
+    // kHotWindow without a task the worker sleeps as before.
+    using hot_clock = std::chrono::steady_clock;
+    constexpr auto kHotWindow = std::chrono::milliseconds(5);
+    auto last_task = hot_clock::now() - kHotWindow;
     for (;;) {
       MoeTask* t;
+      if (spin_wait && hot_clock::now() - last_task < kHotWindow) {
+        unsigned polls = 0;
+        while (submitted.load(std::memory_order_acquire) == my_gen && !stop) {
+#if CPU_MOE_X86
+          _mm_pause();
+#endif
+          if ((++polls & 1023u) == 0 && hot_clock::now() - last_task >= kHotWindow) break;
+        }
+      }
       {
         std::unique_lock<std::mutex> lk(task_mtx);
         task_cv.wait(lk, [&] { return stop || cur_gen != my_gen; });
@@ -2081,6 +2100,7 @@ struct CpuMoeExecutor {
         t = cur_task;
       }
       run_task_body(t);
+      last_task = hot_clock::now();
       if (done_count.fetch_add(1) + 1 == num_threads) {
         if (task_routes > 0) {  // counted before completion, so a sync sees this task
           const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2372,6 +2392,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("ready_ptr"), py::arg("done_ptr"), py::arg("num_slots"),
            py::arg("pin_core"))
       .def("set_gguf_layers", &CpuMoeExecutor::set_gguf_layers, py::arg("rows"))
+      .def("set_spin_wait", [](CpuMoeExecutor& e, bool v) { e.spin_wait = v; }, py::arg("value"))
       .def("set_input_prequant",
            [](CpuMoeExecutor& e, bool v) { e.input_prequant = v; },
            py::arg("value"))

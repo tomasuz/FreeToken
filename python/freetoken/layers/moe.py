@@ -145,6 +145,12 @@ class MoELayer(BaseOP):
 
 
 
+# CPU assist: the CPU's misses admitted to the slot cache per layer and step (0: all), and
+# the most misses the CPU takes per layer (0: all; past it the GPU fetches the rest itself)
+_ASSIST_ADMIT_CAP = int(os.environ.get("FREETOKEN_ASSIST_ADMIT_CAP", "1"))
+_ASSIST_CPU_MAX = int(os.environ.get("FREETOKEN_ASSIST_CPU_MAX", "0"))
+
+
 def _submit(executor, layer_id: int, hidden_states, topk_weights, ids):
     """Start work on an executor without waiting, whatever kind of executor it is.
 
@@ -384,13 +390,13 @@ class OffloadMoELayer(MoELayer):
         verifies, whose extra misses make the CPU the longer side (T=3: 93 -> ~100 ms)."""
         executor = cache.cpu_assist
         with phase("moe.plan"):
-            on_gpu = cache.assist_split(self.layer_id, topk_ids)
+            on_gpu = cache.assist_split(self.layer_id, topk_ids, _ASSIST_CPU_MAX)
             cpu_ids = torch.where(on_gpu, topk_ids.new_full((), -1), topk_ids).contiguous()
             cpu_w = torch.where(on_gpu, topk_weights.new_zeros(()), topk_weights).contiguous()
         with phase("moe.submit.cpu"):
             pending = _submit(executor, self.layer_id, hidden_states, cpu_w, cpu_ids)
         with phase("moe.admit"):
-            slots = cache.assist_plan(self.layer_id, topk_ids)
+            slots = cache.assist_plan(self.layer_id, topk_ids, on_gpu, _ASSIST_ADMIT_CAP, _ASSIST_CPU_MAX > 0)
         with phase("moe.gemm"):
             gpu_slots = torch.where(on_gpu, slots, slots.new_zeros(())).to(topk_ids.dtype)
             gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()

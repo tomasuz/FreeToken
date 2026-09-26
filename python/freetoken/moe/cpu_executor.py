@@ -309,6 +309,11 @@ class CpuMoeExecutor:
         )
         if self._gguf_rows is not None:
             self._ext.set_gguf_layers(self._gguf_rows)
+        # the pool's cores are pinned to it anyway: spin between a step's layers (on by
+        # default where it was measured, gguf; FREETOKEN_CPU_MOE_SPIN=0/1 decides elsewhere)
+        spin = os.environ.get("FREETOKEN_CPU_MOE_SPIN")
+        if (spin == "1" or (spin is None and fmt == "gguf")) and hasattr(self._ext, "set_spin_wait"):
+            self._ext.set_spin_wait(True)
         self.num_threads = nthreads
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()

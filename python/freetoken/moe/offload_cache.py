@@ -2055,68 +2055,104 @@ class OffloadMoeCache:
         # the ids tensor must outlive the side stream's kernels: dropped at the join
         self._pf_keep[layer_id] = ids
 
-    def assist_split(self, layer_id: int, expert_ids: torch.Tensor) -> torch.Tensor:
-        """Which routes of ``layer_id`` the GPU computes this step: the resident experts. The
-        rest are the CPU's. One gather, so the CPU can be started right after."""
+    def assist_split(self, layer_id: int, expert_ids: torch.Tensor, cpu_max: int = 0) -> torch.Tensor:
+        """Which routes of ``layer_id`` the GPU computes this step: the resident experts, and
+        with ``cpu_max`` > 0 the misses past the first ``cpu_max`` (route order), which it
+        fetches itself. The rest are the CPU's. A gather and a scan -- cheap, so the CPU can
+        be started right after."""
         flat = (expert_ids.to(torch.int64) + layer_id * self.num_experts).reshape(-1)
-        return (self.slot_for_id.view(-1).index_select(0, flat) >= 0).view(expert_ids.shape)
+        miss = self.slot_for_id.view(-1).index_select(0, flat) < 0
+        if cpu_max <= 0:
+            return (~miss).view(expert_ids.shape)
+        cpu = miss & (torch.cumsum(miss.to(torch.int32), 0) <= cpu_max)
+        return (~cpu).view(expert_ids.shape)
 
-    def assist_plan(self, layer_id: int, expert_ids: torch.Tensor) -> torch.Tensor:
-        """Record this step's routing of ``layer_id`` in the LRU -- bumping the resident
-        experts, giving the rest slots -- and copy the newcomers in on the side stream
-        without waiting: this step computes them on the CPU, so only a later step reads
-        them, after :meth:`assist_join` at the end of this forward. Returns every route's
-        slot (the resident ones are what the GPU reads this step).
-
-        Each layer has its own plan buffers, so no plan is overwritten while its copy may
-        still be queued; the resident experts this step reads carry this call's step stamp,
-        which keeps them out of every later eviction of the step.
-        """
-        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
-        from freetoken.moe.offload_kernels import lru_ensure
-
-        ids = expert_ids.reshape(-1).to(torch.int32, copy=True)
-        k = ids.numel()
-        base, size = self.lru_part(layer_id)
-        assert k <= min(self._PF_CAPACITY, size // 2), (k, size)
+    def _assist_buffers(self):
         if self._adm_plan is None:
             cap = self._PF_CAPACITY
             i32 = dict(dtype=torch.int32, device=self.device)
             n = self.num_layers
+            # [layer, 2 plans (now, background), rows]
             self._adm_plan = (
-                torch.empty((n, cap), **i32), torch.empty((n, cap), **i32),
-                torch.empty((n, cap), **i32), torch.zeros((n, 1), dtype=torch.int64, device=self.device),
+                torch.empty((n, 2, cap), **i32), torch.empty((n, 2, cap), **i32),
+                torch.empty((n, 2, cap), **i32), torch.zeros((n, 2, 1), dtype=torch.int64, device=self.device),
             )
             if self._pf_stream is None:
                 self._pf_stream = torch.cuda.Stream(device=self.device, priority=-1)
-        out, src, dst, num = (t[layer_id] for t in self._adm_plan)
-        lru_ensure(
-            ids, self.slot_for_id.view(-1), self.id_of_slot[base : base + size],
-            self.usage[base : base + size], self.step, out[:k], src[:k], dst[:k], num,
-            stats=self.lru_stats[layer_id] if self.collect_stats else None,
-            id_base=layer_id * self.num_experts,
+        return self._adm_plan
+
+    def _assist_copy(self, layer_id: int, dst, src, num, blocks: int) -> None:
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+        mixed = self._copy_layer_feat_bytes is not None
+        fast_index_copy_multi_jit(
+            self._copy_layer_dst_ptrs[layer_id] if mixed else self._copy_dst_ptrs,
+            self._copy_src_ptrs[layer_id],
+            self._copy_layer_feat_bytes[layer_id] if mixed else self._copy_feat_bytes,
+            dst, src, num,
+            dst_stride_bytes=self._copy_layer_dst_stride[layer_id] if mixed else None,
+            blocks_per_bank=blocks,
         )
+        if mixed and self._tail_zero[layer_id]:
+            from freetoken.moe.offload_kernels import zero_slot_tails
+
+            for view, start in self._tail_zero[layer_id]:
+                zero_slot_tails(view, dst, num, start, _GGUF_SLOT_TAIL_BYTES)
+
+    def assist_plan(self, layer_id: int, expert_ids: torch.Tensor, gpu: torch.Tensor,
+                    admit_cap: int = 0, gpu_fetches: bool = True) -> torch.Tensor:
+        """The slot cache side of a CPU-assisted MoE step of ``layer_id``; returns every
+        GPU route's slot (a CPU route reads a stand-in the caller zero-weights).
+
+        1. The GPU routes (``gpu``): the resident experts are bumped and the misses among
+           them get slots and are copied in now, on this stream, before the GEMM.
+        2. The CPU's misses are admitted for later steps -- at most ``admit_cap`` of them
+           (0: all), since the background copies read the same host RAM the CPU computes
+           from -- and copied on the side stream, joined by :meth:`assist_join` at the end
+           of the forward. The GPU routes ride along to be bumped again, so this second
+           plan cannot evict a slot the GEMM reads.
+
+        A route left out of a plan stands in as the first GPU route's expert (or route 0's
+        when there is none), so each plan holds exactly the experts it should.
+        """
+        from freetoken.moe.offload_kernels import lru_ensure
+
+        flat = expert_ids.reshape(-1).to(torch.int32)
+        k = flat.numel()
+        base, size = self.lru_part(layer_id)
+        assert k <= min(self._PF_CAPACITY, size // 2), (k, size)
+        out, src, dst, num = (t[layer_id] for t in self._assist_buffers())
+        g = gpu.reshape(-1)
+        # first GPU route's expert, else route 0's (index_select: no host read under capture)
+        standin = flat.index_select(0, torch.argmax(g.to(torch.int32)).view(1))
+        stats_plan = 0 if gpu_fetches else 1  # the plan that still sees the misses as misses
+
+        def plan(i: int, ids: torch.Tensor) -> None:
+            lru_ensure(
+                ids, self.slot_for_id.view(-1), self.id_of_slot[base : base + size],
+                self.usage[base : base + size], self.step, out[i, :k], src[i, :k], dst[i, :k], num[i],
+                stats=self.lru_stats[layer_id] if (self.collect_stats and i == stats_plan) else None,
+                id_base=layer_id * self.num_experts,
+            )
+
+        ids_now = None
+        if gpu_fetches:  # else every GPU route is resident: nothing to fetch now
+            ids_now = torch.where(g, flat, standin)
+            plan(0, ids_now)
+            self._assist_copy(layer_id, dst[0, :k], src[0, :k], num[0], 8)
+        cpu = ~g
+        admit = cpu if admit_cap <= 0 else cpu & (torch.cumsum(cpu.to(torch.int32), 0) <= admit_cap)
+        ids_later = torch.where(g | admit, flat, standin)
+        plan(1, ids_later)
         main = torch.cuda.current_stream(self.device)
         side = self._pf_stream
         side.wait_stream(main)
-        mixed = self._copy_layer_feat_bytes is not None
         with torch.cuda.stream(side):
-            fast_index_copy_multi_jit(
-                self._copy_layer_dst_ptrs[layer_id] if mixed else self._copy_dst_ptrs,
-                self._copy_src_ptrs[layer_id],
-                self._copy_layer_feat_bytes[layer_id] if mixed else self._copy_feat_bytes,
-                dst[:k], src[:k], num,
-                dst_stride_bytes=self._copy_layer_dst_stride[layer_id] if mixed else None,
-                blocks_per_bank=1,  # leave the CUs to the GEMMs it runs beside
-            )
-            if mixed and self._tail_zero[layer_id]:
-                from freetoken.moe.offload_kernels import zero_slot_tails
-
-                for view, start in self._tail_zero[layer_id]:
-                    zero_slot_tails(view, dst[:k], num, start, _GGUF_SLOT_TAIL_BYTES)
+            self._assist_copy(layer_id, dst[1, :k], src[1, :k], num[1], 1)  # leave the CUs alone
         self._adm_pending = True
-        self._pf_keep[("adm", layer_id)] = ids
-        return out[:k].view(expert_ids.shape)
+        # the side stream's inputs must outlive its kernels: dropped at the join
+        self._pf_keep[("adm", layer_id)] = (ids_now, ids_later)
+        return out[1, :k].view(expert_ids.shape)
 
     def assist_join(self) -> None:
         """End of a forward: the background admissions must land before the next step
