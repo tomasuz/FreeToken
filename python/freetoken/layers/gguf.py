@@ -97,7 +97,7 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
     x = x.contiguous()  # the kernels index X by raw data_ptr and row length
     if 2 <= x.shape[0] <= _NEW_MMVQ_MAX_TOKENS and _new_mmvq_serves(qweight_type):
         # llama.cpp's current MMVQ reads the weight once for all the tokens: at 3 tokens it
-        # takes ~1.1x the one-token time where the older kernel takes ~2x (RX 9060 XT, Q8_0
+        # takes ~1.1x the one-token time where the older kernel takes ~2x (RDNA4 GPU, Q8_0
         # and Q6_K Qwen3.8 projections). At one token the two are even, so it stays old.
         from freetoken.kernel.ggml_mmq import mmvq
 

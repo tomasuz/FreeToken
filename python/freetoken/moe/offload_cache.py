@@ -1418,7 +1418,7 @@ class OffloadMoeCache:
             # eager warm-up, the very window calibrate_fetch_cost exists to distrust --
             # there one expert read 9.4 ms against a real 0.7. An inflated "already
             # committed" figure makes this device look busier than it is and pushes misses
-            # onto the helpers; on tm that showed as the iGPU being the long pole (2.68 ms
+            # onto the helpers; measured, that showed as the iGPU being the long pole (2.68 ms
             # against the dGPU's 1.9) while the dGPU sat at 37 % utilisation. Omitting an
             # unknown is better than using a wrong one.
             busy = 0.0

@@ -386,11 +386,11 @@ class OffloadMoELayer(MoELayer):
     def _decode_cpu_assist(self, cache, hidden_states, topk_weights, topk_ids):
         """Resident experts on the GPU, the rest on the CPU at the same time; nothing waits
         on PCIe. The CPU computes a missing expert from host RAM sooner than the link brings
-        it over (Ryzen 7 5700G, Qwen3.8 UD-Q3_K_XL: ~100 us a route in the pool vs ~160 us
+        it over (8-core desktop CPU, DDR4, PCIe 3.0 x16; Qwen3.8 UD-Q3_K_XL: ~100 us a route in the pool vs ~160 us
         to copy a 2 MiB expert), beside the GPU's GEMM instead of before it. The misses are
         still admitted to the slot cache, copied in the background for later steps.
 
-        FREETOKEN_GGUF_CPU_ASSIST=1. On tm, decode 52.3 -> 44.7 ms/token; not for MTP
+        FREETOKEN_GGUF_CPU_ASSIST=1. Measured there, decode 52.3 -> 44.7 ms/token; not for MTP
         verifies, whose extra misses make the CPU the longer side (T=3: 93 -> ~100 ms)."""
         executor = cache.cpu_assist
         with phase("moe.plan"):

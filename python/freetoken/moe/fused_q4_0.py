@@ -21,7 +21,7 @@ from freetoken.layers.activation import gelu_and_mul, gelu_tanh_and_mul, silu_an
 _ACT = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
 
 # From this many tokens on, the experts run as llama.cpp's grouped MMQ (kernel/ggml_mmq)
-# where it serves the types: 6-8x the per-row MMVQ at a 300-token prefill on the RX 9060 XT.
+# where it serves the types: 6-8x the per-row MMVQ at a 300-token prefill on an RDNA4 GPU.
 # Below it (decode, MTP verify) MMVQ stays. 0 turns MMQ off.
 _MMQ_MIN_TOKENS = int(os.getenv("FREETOKEN_GGUF_MMQ_MIN_TOKENS", "8") or 0)
 # llama.cpp's MMVQ takes at most this many tokens per launch (MMVQ_MAX_BATCH_SIZE)
@@ -42,7 +42,7 @@ def _mmq_usable(num_tokens: int, *types: int) -> bool:
 
 
 # llama.cpp's current MMVQ (kernel/ggml_mmq) for 2-8 tokens (MTP verify), per projection where
-# it measured faster on the RX 9060 XT (x 10 of Qwen3.8's experts): every down type (IQ4_NL
+# it measured faster on an RDNA4 GPU (x 10 of Qwen3.8's experts): every down type (IQ4_NL
 # 50 vs 73 us at two tokens, Q8_0 70 vs 107) and gate/up fused with its activation except
 # IQ3_XXS, where the older kernel stays ahead (144 vs 180 us). One token keeps the older
 # kernels: the kernel-level gain there (~0.6 ms a step) is eaten by the f32/int32 conversions

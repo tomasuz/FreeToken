@@ -1330,7 +1330,7 @@ class Glm47Detector(BaseFormatDetector):
         case: on GLM-4.5-Air (both the 106B and the REAP-82B) every single tool call arrives
         this way -- the name and every argument complete, then the turn-ending token instead
         of the closing tag -- so ``tool_calls`` came back null while the text plainly held
-        the call. Measured on tm, 2026-09-18, on three shapes including tool_choice=required.
+        the call. Seen on three shapes, tool_choice=required included.
 
         Only the LAST opener can be the unterminated one: an earlier opener with no closer
         would mean two calls are interleaved, which this format cannot express.

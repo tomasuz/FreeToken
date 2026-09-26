@@ -49,7 +49,7 @@ logger = init_logger(__name__)
 # first sight and never released. The count has to scale with the LAYER COUNT, not be a flat
 # number -- every MoE layer takes a slot for each decode shape, so a 45-layer model exhausts
 # a flat 64 the moment a second batch shape appears, and the engine dies mid-run with
-# "ran out of handshake slots" (GLM-4.5-Air on tm, 2026-09-18, 45 minutes into a run).
+# "ran out of handshake slots" (GLM-4.5-Air, 45 minutes into a run).
 # The CPU pool already sizes its flags this way; this is the same arithmetic.
 _SLOTS_PER_LAYER = 4
 _SLOTS_MIN = 64
