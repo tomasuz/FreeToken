@@ -15,13 +15,16 @@ immediate combine::
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.core import get_global_ctx
+from freetoken.layers.gguf import GGUFLinear
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import init_logger, nvtx_annotate
+from freetoken.utils.phase_timer import phase, step_done
 
 from .attention import Qwen4ExpAttention
 from .hc import GatedResidual
@@ -33,6 +36,42 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from freetoken.core import Batch
     from freetoken.models.config import ModelConfig
+
+
+# Experts guessed per token for the next layer's prefetch (0: off), and where the guess is
+# taken: after this layer's attention ("post_attn") or before it ("pre_attn", a longer
+# window for the copy, a staler residual for the guess).
+_PREFETCH_K = int(os.getenv("FREETOKEN_MOE_PREFETCH_K", "0") or 0)
+_PREFETCH_AT = os.getenv("FREETOKEN_MOE_PREFETCH_AT", "post_attn")
+_PREFETCH_CHEAP = os.getenv("FREETOKEN_MOE_PREFETCH_CHEAP", "0") == "1"
+_PREFETCH_DEBUG = os.getenv("FREETOKEN_MOE_PREFETCH_DEBUG", "")  # "predict_only": cost of the guess alone
+
+
+# Draft over the first N token ids only (0: the whole vocabulary). A BPE vocabulary is
+# numbered by merge rank, so its head holds the frequent tokens; the head's logits are
+# the biggest read of a draft (Qwen3.8: 248k x 2560 Q6_K, ~1.7 ms), and a draft outside
+# the prefix only costs a reject -- the verify scores the full vocabulary.
+_MTP_DRAFT_VOCAB = int(os.getenv("FREETOKEN_MTP_DRAFT_VOCAB", "0") or 0)
+
+
+class _DraftVocabHead:
+    """The first ``n`` rows of a GGUF LM head (contiguous packed rows: a view)."""
+
+    def __init__(self, head: "GGUFLinear", n: int) -> None:
+        self.qweight = head.qweight[:n]
+        self._quant_type = head._quant_type
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.layers.gguf import fused_mul_mat_gguf
+
+        return fused_mul_mat_gguf(x, self.qweight, self._quant_type)
+
+
+class _LayerRef:
+    __slots__ = ("op",)
+
+    def __init__(self, op) -> None:
+        self.op = op
 
 
 def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseOP:
@@ -72,18 +111,71 @@ class Qwen4ExpDecoderLayer(BaseOP):
             PLELayer(config, layer_id, prefix=f"{prefix}.ple") if layer_id in config.qwen4_args.ple_layer_ids else None
         )
 
+    # the next decoder layer, behind a plain holder: the BaseOP tree and the MoE-layer walk
+    # (which also enters lists and tuples) must not reach it twice
+    _next: "_LayerRef | None" = None
+
+    def prefetch_from(self, hidden: torch.Tensor) -> None:
+        """Guess this layer's experts from an earlier residual and let the offload cache
+        copy the misses in on a side stream while the previous layer still computes.
+
+        The guess is this layer's own MLP mix and router applied to the earlier streams:
+        the residual moves little across one block, so its top-k holds most of the real
+        routing (from the pre-attention streams of the same layer, a top-12 held 90% of
+        the real top-10 on Qwen3.8).
+        """
+        experts = getattr(self.mlp, "experts", None)
+        cache = getattr(experts, "offload_cache", None)
+        if cache is None or not cache.prefetch_supported(self._layer_id):
+            return
+        k = min(_PREFETCH_K, cache.num_experts, cache.prefetch_budget(self._layer_id) // hidden.shape[0])
+        if k <= 0:
+            return
+        with phase("prefetch"):
+            hc = self.mlp_hyper_connection
+            if _PREFETCH_CHEAP:
+                # the mix without its gates: normed streams summed, then the router. Skips
+                # the mix's two GEMMs (down to the low rank, up to every stream's gate);
+                # top-k does not care about the scale the mean would add.
+                from freetoken.kernel.triton.hc import grouped_gemma_rmsnorm
+
+                rn = grouped_gemma_rmsnorm(hidden, hc.hc_norm.weight, hc.hc_norm.eps, hc.hc_count)
+                x = rn.view(hidden.shape[0], hc.hc_count, hc.hidden_size).sum(1)
+            else:
+                x, _ = hc.mix(hidden)
+            ids = torch.topk(self.mlp.gate.forward(x), k, dim=-1).indices
+            if _PREFETCH_DEBUG != "predict_only":
+                cache.prefetch_begin(self._layer_id, ids)
+
+    def _prefetch_next(self, hidden: torch.Tensor, batch: Batch) -> None:
+        if self._next is not None and (batch.is_decode or getattr(batch, "mtp_verify", False)):
+            self._next.op.prefetch_from(hidden)
+
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
         if self.ple is not None:
-            hidden = hidden + self.ple.forward(hidden, batch)
-        block_input, inject = self.attn_hyper_connection.mix(hidden)
+            with phase("ple"):
+                hidden = hidden + self.ple.forward(hidden, batch)
+        if _PREFETCH_K and _PREFETCH_AT == "pre_attn":
+            self._prefetch_next(hidden, batch)
+        with phase("hc.mix"):
+            block_input, inject = self.attn_hyper_connection.mix(hidden)
         if self._is_linear:
-            block_output = self.linear_attn.forward(block_input)
+            with phase("linear_attn"):
+                block_output = self.linear_attn.forward(block_input)
         else:
-            block_output = self.self_attn.forward(block_input, batch)
-        hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
-        block_input, inject = self.mlp_hyper_connection.mix(hidden)
-        return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
+            with phase("self_attn"):
+                block_output = self.self_attn.forward(block_input, batch)
+        with phase("hc.combine"):
+            hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
+        if _PREFETCH_K and _PREFETCH_AT == "post_attn":
+            self._prefetch_next(hidden, batch)
+        with phase("hc.mix"):
+            block_input, inject = self.mlp_hyper_connection.mix(hidden)
+        with phase("mlp"):
+            block_output = self.mlp.forward(block_input)
+        with phase("hc.combine"):
+            return self.mlp_hyper_connection.combine(hidden, block_output, inject)
 
 
 class Qwen4ExpModel(BaseOP):
@@ -100,6 +192,9 @@ class Qwen4ExpModel(BaseOP):
             ]
         )
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer")
+        layers = self.layers.op_list
+        for layer, nxt in zip(layers, layers[1:]):
+            layer._next = _LayerRef(nxt)
         # plain tuple (not an OP child), so it never shows up in the state dict
         self._ple = tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)
 
@@ -123,7 +218,16 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
-        return self.hyper_connection_mixer.mix(hidden)[0]
+        cache = getattr(get_global_ctx(), "moe_offload_cache", None)
+        if cache is not None and getattr(cache, "cpu_assist", None) is not None:
+            cache.assist_join()  # background admissions land before the next step
+        if getattr(batch, "mtp_capture", False):
+            # the MTP head drafts from the wide residual of every processed position
+            self._mtp_residual = hidden
+        with phase("hc.final"):
+            out = self.hyper_connection_mixer.mix(hidden)[0]
+        step_done()
+        return out
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
@@ -139,6 +243,64 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             prefix="lm_head",
         )
         super().__init__()
+        if config.gguf_dense_types:
+            # a GGUF checkpoint: its block-quantized projections run packed
+            from .gguf import convert_qwen4exp_to_gguf
+
+            convert_qwen4exp_to_gguf(self, config)
+
+    # ----- MTP draft head (llama.cpp's separate MTP GGUF; see mtp.py) -----------------
+    _mtp = None
+
+    def init_mtp(self, mtp_path: str, device: torch.device) -> None:
+        """Build the MTP head from ``mtp_path`` with its own expert cache. Kept out of the
+        BaseOP tree: the engine's base expert cache and base state dict never see it."""
+        import types
+
+        from .mtp import (
+            MTP_CACHE_SLOTS,
+            Qwen4ExpMTPHead,
+            build_mtp_cache,
+            mtp_expert_banks,
+            mtp_layer_and_experts,
+            mtp_state_dict,
+        )
+
+        layer, experts, expert_types = mtp_layer_and_experts(mtp_path)
+        prev = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)
+        try:
+            with torch.device(device):
+                head = Qwen4ExpMTPHead(self._config, experts)
+        finally:
+            torch.set_default_dtype(prev)
+        want = head.state_dict()
+        sd = {}
+        for key, t in mtp_state_dict(mtp_path, layer).items():
+            sd[key] = t.to(device=device, dtype=want[key].dtype)
+        head.load_state_dict(sd)
+        head.self_attn.alloc_ring(device, torch.bfloat16)
+        cfg = self._config
+        banks = mtp_expert_banks(mtp_path, layer, experts, cfg.moe_intermediate_size, cfg.hidden_size, expert_types)
+        top_k = cfg.num_experts_per_tok
+        cache = build_mtp_cache(device, experts, expert_types, banks, max(MTP_CACHE_SLOTS, 4 * top_k))
+        head.mlp.experts.offload_cache = cache
+        self._mtp = types.SimpleNamespace(head=head, cache=cache, banks=banks)
+        mib = sum(v.numel() for v in cache.bank_caches.values()) / 2**20
+        logger.info_rank0(f"MTP head from {mtp_path}: {experts} experts, {cache.lru_slots} cached ({mib:.0f} MiB)")
+
+    @property
+    def has_mtp_head(self) -> bool:
+        return self._mtp is not None
+
+    def mtp_forward(self, R_prev: torch.Tensor, next_ids: torch.Tensor, positions: torch.Tensor):
+        """``(draft logits, head residual)`` for each (base residual at p, token at p+1)."""
+        lm = self.lm_head
+        head_linear = getattr(lm, "head", lm)  # GGUFLMHead wraps a GGUFLinear: all rows
+        n = _MTP_DRAFT_VOCAB
+        if n and isinstance(head_linear, GGUFLinear) and n < head_linear.out_features:
+            head_linear = _DraftVocabHead(head_linear, n)
+        return self._mtp.head.forward(R_prev, next_ids, positions, self.model.embed_tokens, head_linear)
 
     def load_host_tables(self, engine_config) -> int:
         """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""
@@ -215,7 +377,14 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
-        return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+        h = self.model.forward(batch.input_ids, batch)
+        with phase("lm_head"):
+            if getattr(batch, "mtp_capture", False):
+                # an MTP verify scores every row, not just each request's last
+                head = getattr(self.lm_head, "head", None)
+                assert head is not None, "MTP verify needs the GGUF LM head"
+                return head.forward(h)
+            return self.lm_head.forward(h)
 
 
 __all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel", "build_linear_mixer"]

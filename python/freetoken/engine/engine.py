@@ -919,8 +919,17 @@ class Engine:
         assert len(layers) == config.model_config.num_moe_layers
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
+        elif cache.quant_format == "gguf" and os.environ.get("FREETOKEN_GGUF_CPU_ASSIST", "0") == "1":
+            # GGUF offload decode with the CPU computing the non-resident experts
+            cache.cpu_assist = self._init_cpu_moe_executor(config, cache, layers, attach=False)
+            logger.info_rank0(
+                f"GGUF CPU assist: {cache.cpu_assist.num_threads} CPU threads compute the "
+                f"experts the slot cache does not hold ({cache.cpu_assist.isa})"
+            )
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
+        if getattr(config, "mtp", False) and _gguf_mtp_head(config, config.model_config):
+            self.model.init_mtp(config.mtp_model_path, self.device)
         return cache
 
     def _resolve_hybrid_fetch(self, config: EngineConfig, cache) -> None:
@@ -1091,7 +1100,7 @@ class Engine:
             )
         return executors
 
-    def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
+    def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers, *, attach: bool = True):
         """Build the persistent CPU MoE executor (decode-time expert compute).
 
         Must run before CUDA graph capture: the worker pool has to be live for the
@@ -1124,8 +1133,10 @@ class Engine:
             # FIXME: the None branch serves GGUF q4_0 banks, which have no quant method yet; drop it once GGUF joins the quant path
             fmt=sample.quant_method.cpu_format if sample.quant_method is not None else None,
         )
-        cache.set_cpu_executor(executor)
+        if attach:
+            cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
+        return executor
 
     def _sync_get_memory(self) -> Tuple[int, int]:
         """Get the min and max free memory across TP ranks."""
@@ -1340,6 +1351,15 @@ class Engine:
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        if use_graph and _GRAPH_HOST_WAIT:
+            # Measured on ROCm (RX 9060 XT, Qwen3.8 offload decode): host work queued while a
+            # replay is still running -- sampling, the next step's staging -- stretched the
+            # replay itself from ~60 to ~120 ms. Letting the replay finish first costs the few
+            # ms of host work it would have hidden. After the host ctx on purpose: its exit may
+            # be what releases a graph waiting on a host flag.
+            done = torch.cuda.Event()
+            done.record(self.stream)
+            done.synchronize()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1424,6 +1444,25 @@ def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
         return None, None
     ident = gpu_identity(torch.cuda.current_device() if index is None else index)
     return ident["name"], ident["uuid"]
+
+
+def _gguf_mtp_head(config, model_config) -> bool:
+    """--mtp with a separate MTP GGUF on a model that builds such a head itself."""
+    path = getattr(config, "mtp_model_path", None) or ""
+    return path.endswith(".gguf") and getattr(model_config, "qwen4_args", None) is not None
+
+
+def _graph_host_wait() -> bool:
+    """``FREETOKEN_GRAPH_HOST_WAIT``: 1/0 forces it, unset or ``auto`` means on under ROCm."""
+    mode = os.getenv("FREETOKEN_GRAPH_HOST_WAIT", "auto").strip().lower()
+    if mode in ("1", "true", "on"):
+        return True
+    if mode in ("0", "false", "off"):
+        return False
+    return torch.version.hip is not None
+
+
+_GRAPH_HOST_WAIT = _graph_host_wait()
 
 
 def _ensure_expandable_segments() -> None:
@@ -2180,7 +2219,12 @@ def _adjust_config(config: EngineConfig):
     # head (mtp_num_hidden_layers). Flipping mtp_enabled here (on the SAME ModelConfig instance
     # the engine builds the model and KV pool from) makes the model construct its head, the KV
     # group carry one extra full-attention slab and the weight load pull the mtp.* tensors.
-    if getattr(config, "mtp", False):
+    if getattr(config, "mtp", False) and _gguf_mtp_head(config, model_config):
+        # qwen4exp: llama.cpp ships the head as its own GGUF, and the model builds it with its
+        # own expert cache and attention ring (Qwen4ExpForCausalLM.init_mtp) -- none of the
+        # qwen3_5 head wiring (extra KV slab, mtp.* tensors) applies
+        logger.info_rank0(f"MTP draft head: {config.mtp_model_path}")
+    elif getattr(config, "mtp", False):
         mtp_layers = getattr(model_config, "mtp_num_layers", 0)
         if mtp_layers <= 0:
             raise ValueError(

@@ -25,11 +25,13 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     tensor. ``out_indices`` aliases the input, preserving the in-place rewrite every
     downstream GEMM depends on.
     """
+    # a slot-class region: its slice of the LRU arrays, and slot ids local to it
+    base, size = cache.lru_part(layer_id)
     lru_ensure(
         expert_ids,
         cache.slot_for_id.view(-1),
-        cache.id_of_slot,
-        cache.usage,
+        cache.id_of_slot[base : base + size],
+        cache.usage[base : base + size],
         cache.step,
         expert_ids,
         cache.src_indices,
@@ -102,6 +104,27 @@ def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
         num_experts,
         BLOCK=triton.next_power_of_2(num_experts),
     )
+
+
+def zero_slot_tails(view: torch.Tensor, slots: torch.Tensor, num: torch.Tensor, start: int, nbytes: int) -> None:
+    """Zero bytes ``[start, start + nbytes)`` of the first ``num[0]`` slots of ``slots`` in
+    the ``[slots, width]`` uint8 region ``view``. One program per plan entry, fixed grid (the
+    count stays on the device), so it is CUDA-graph capturable."""
+    grid = (slots.numel(),)
+    _zero_slot_tails_kernel[grid](
+        view, slots, num, view.stride(0), start, NBYTES=nbytes, BLOCK=1024,
+    )
+
+
+@triton.jit
+def _zero_slot_tails_kernel(base_ptr, slots_ptr, num_ptr, width, start, NBYTES: tl.constexpr, BLOCK: tl.constexpr):
+    i = tl.program_id(0)
+    if i < tl.load(num_ptr):
+        slot = tl.load(slots_ptr + i).to(tl.int64)
+        row = base_ptr + slot * width + start
+        off = tl.arange(0, BLOCK)
+        for c in tl.static_range(0, NBYTES, BLOCK):
+            tl.store(row + c + off, tl.zeros((BLOCK,), dtype=tl.uint8), mask=c + off < NBYTES)
 
 
 def materialize_layer(cache, layer_id: int) -> None:
@@ -218,18 +241,19 @@ def _ensure_experts_hybrid_cpu(
 
 
 def _materialize_layer_gpu(cache, layer_id: int) -> None:
-    block = triton.next_power_of_2(max(cache.num_experts, cache.cache_size))
+    base, size = cache.lru_part(layer_id)
+    block = triton.next_power_of_2(max(cache.num_experts, size))
     _materialize_layer_kernel[(1,)](
         cache.slot_for_id,
-        cache.id_of_slot,
-        cache.usage,
+        cache.id_of_slot[base : base + size],
+        cache.usage[base : base + size],
         cache.step,
         cache.evict_slots,
         cache.src_indices,
         cache.num_indices,
         layer_id,
         cache.num_experts,
-        cache.cache_size,
+        size,
         BLOCK=block,
     )
 
@@ -237,7 +261,7 @@ def _materialize_layer_gpu(cache, layer_id: int) -> None:
 def _reset_cache_gpu(cache) -> None:
     block = 256
     total_ids = cache.num_layers * cache.num_experts
-    grid = (triton.cdiv(max(total_ids, cache.cache_size), block),)
+    grid = (triton.cdiv(max(total_ids, cache.lru_slots), block),)
     _reset_cache_kernel[grid](
         cache.slot_for_id,
         cache.id_of_slot,
@@ -247,7 +271,7 @@ def _reset_cache_gpu(cache) -> None:
         cache.num_indices,
         total_ids,
         cache.num_experts,
-        cache.cache_size,
+        cache.lru_slots,
         BLOCK=block,
     )
 

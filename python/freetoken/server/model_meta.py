@@ -119,6 +119,24 @@ def effort_toggle_kwargs(
     return mapped
 
 
+def default_template_kwargs(chat_template_kwargs: dict | None) -> dict:
+    """The request's template kwargs over the deployment's defaults
+    (``FREETOKEN_DEFAULT_CHAT_TEMPLATE_KWARGS``, a JSON object, e.g.
+    ``{"reasoning_effort": "low"}`` -- what llama.cpp's ``--chat-template-kwargs`` sets).
+    A request that says anything about thinking keeps its own choice whole."""
+    import json
+    import os
+
+    ctk = dict(chat_template_kwargs or {})
+    raw = os.environ.get("FREETOKEN_DEFAULT_CHAT_TEMPLATE_KWARGS")
+    if not raw:
+        return ctk
+    defaults = json.loads(raw)
+    if any(key in ctk for key in _THINKING_KWARG_KEYS):
+        defaults = {k: v for k, v in defaults.items() if k not in _THINKING_KWARG_KEYS}
+    return {**defaults, **ctk}
+
+
 def moe_total_experts(config: Any) -> int:
     """Total routed-expert slots the model has: experts per layer x MoE layers. Matches the
     engine's own basis (``Engine._resolve_auto_moe_cache_size``), so a residency rate derived

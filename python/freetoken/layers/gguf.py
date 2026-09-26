@@ -13,6 +13,9 @@ TP is assumed to be 1 (the gemma4 GGUF path restricts to TP=1, like the HF path)
 
 from __future__ import annotations
 
+import functools
+import os
+
 import torch
 
 from freetoken.models.gguf.dequant import (
@@ -64,6 +67,20 @@ _DEQUANT = set(_QUANTS)
 _MMVQ_SAFE = 6
 
 
+_NEW_MMVQ_MAX_TOKENS = 8  # llama.cpp's MMVQ_MAX_BATCH_SIZE
+
+
+@functools.cache
+def _new_mmvq_serves(qweight_type: int) -> bool:
+    if os.getenv("FREETOKEN_GGUF_NEW_MMVQ", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    from freetoken.kernel import ggml_mmq
+
+    return ggml_mmq.supports(qweight_type)
+
+
 def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> torch.Tensor:
     """y = x @ dequant(qweight).T, dispatched by batch size and quant type."""
     from freetoken.kernel.gguf import (
@@ -77,6 +94,16 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
         return x.new_empty((0, out_features))
     if qweight_type in _UNQUANTIZED:
         return x @ qweight.T
+    x = x.contiguous()  # the kernels index X by raw data_ptr and row length
+    if 2 <= x.shape[0] <= _NEW_MMVQ_MAX_TOKENS and _new_mmvq_serves(qweight_type):
+        # llama.cpp's current MMVQ reads the weight once for all the tokens: at 3 tokens it
+        # takes ~1.1x the one-token time where the older kernel takes ~2x (RX 9060 XT, Q8_0
+        # and Q6_K Qwen3.8 projections). At one token the two are even, so it stays old.
+        from freetoken.kernel.ggml_mmq import mmvq
+
+        block, type_size = BLOCK_SHAPE[qweight_type]
+        k = qweight.shape[1] // type_size * block
+        return mmvq(qweight, qweight_type, k, x).to(x.dtype)
     if x.shape[0] <= _MMVQ_SAFE and qweight_type in _MMVQ:
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
     if qweight_type in _MMQ:

@@ -317,6 +317,9 @@ class ModelConfig:
     # checkpoints whose layers store their experts in different quants (unsloth's UD mixes:
     # most layers IQ3_XXS / IQ4_NL, a few Q8_0 downs). Set with ``expert_quant="gguf"``.
     gguf_expert_types: Tuple[Tuple[int, int], ...] | None = None
+    # ``(GGUF tensor name, ggml type)`` of every dense GGUF tensor, for loaders that keep the
+    # block-quantized ones packed instead of dequantizing them (qwen4exp).
+    gguf_dense_types: Tuple[Tuple[str, int], ...] | None = None
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,

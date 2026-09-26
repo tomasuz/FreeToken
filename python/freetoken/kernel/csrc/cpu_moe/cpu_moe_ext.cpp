@@ -1285,7 +1285,21 @@ q4dot_fn select_q4dot() {
   return q4_0_dot_i8_scalar;
 }
 
-enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4 };
+enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4, WF_GGUF = 5 };
+
+// GGUF experts in any ggml block type, a type per layer and projection (UD mixes them).
+// The row dot products and activation quantizers are llama.cpp's own, built for this host
+// by freetoken/kernel/ggml_cpu.py and handed over as addresses (set_gguf_layers), so this
+// extension carries no ggml code and no -march of its own.
+typedef void (*gg_dot_fn)(int n, float* s, size_t bs, const void* x, size_t bx, const void* y,
+                          size_t by, int nrc);
+typedef void (*gg_quant_fn)(const float* x, void* y, int64_t k);
+struct GgufRows {
+  gg_dot_fn gu_dot = nullptr, dn_dot = nullptr;
+  gg_quant_fn gu_quant = nullptr, dn_quant = nullptr;
+  int64_t gu_row = 0, dn_row = 0;    // weight row bytes (K = H for gate_up, I for down)
+  int64_t gu_qrow = 0, dn_qrow = 0;  // quantized activation row bytes
+};
 
 // Each ctor pointer arg is the address of a CPU int64 array of length
 // num_layers (one base address per layer, built by cpu_executor.py's
@@ -1322,6 +1336,20 @@ struct CpuMoeExecutor {
   nvi8dot_fn nvi8dot = nullptr;  // AVX-VNNI W4A8 nvfp4 dot (nullptr -> use fp32 nvdot)
   bool use_vnni = false;         // nvfp4 + AVX-VNNI: decode via int8 VPDPBUSD (W4A8)
   bool use_q4a8 = false;       // q4_0: always W4A8 (llama.cpp Q4_0 x Q8_0); int8 pre-quant
+  // gguf: per-layer rows (set_gguf_layers) and the quantized activations, input rows
+  // ``gg_xq_stride`` apart per token and intermediate rows ``gg_gq_stride`` apart per route
+  std::vector<GgufRows> gguf;
+  // workers spin between closely spaced tasks instead of sleeping (FREETOKEN_CPU_MOE_SPIN)
+  bool spin_wait = false;
+  int64_t gg_xq_stride = 0, gg_gq_stride = 0;
+  std::vector<uint8_t> gg_xq, gg_gq;
+  // gguf work is per distinct expert, not per route, so an expert several tokens route
+  // to (an MTP verify) is read from host RAM once: the task's distinct experts, the
+  // routes of each (CSR), and the routes' down outputs before the per-token sum
+  std::vector<int> gg_uniq, gg_rstart, gg_routes;
+  std::vector<float> gg_part;
+  std::atomic<int64_t> p3_next{0};
+  int64_t p3_total = 0;
   dsdot_fn dsdot;
   mxgemv_fn mxgemv;
   q4dot_fn q4dot;
@@ -1476,7 +1504,8 @@ struct CpuMoeExecutor {
     const char* q4tag = use_q4a8 ? (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)" : "+q4_0-w4a8") : "";
     const char* vnni_tag =
         cpu_has_avx512vnni() ? "+avx512vnni(nvfp4-w4a8)" : "+vnni(nvfp4-w4a8)";
-    isa_str = std::string(c.name) + (use_vnni ? vnni_tag : "") + q4tag;
+    isa_str = std::string(c.name) + (use_vnni ? vnni_tag : "") + q4tag +
+              (weight_format == WF_GGUF ? "+gguf(llama.cpp vec_dot)" : "");
     isa = isa_str.c_str();
     for (int i = 0; i < 16; ++i) e2m1_lut[i] = kE2M1[i];
     for (int i = 0; i < 256; ++i) e4m3_lut[i] = e4m3_decode((uint8_t)i);
@@ -1665,6 +1694,10 @@ struct CpuMoeExecutor {
       do_pass1_dsfp4(t, p);
       return;
     }
+    if (fmt == WF_GGUF) {
+      do_pass1_gguf(t, p);
+      return;
+    }
     const int64_t ib = p % n_iblk;
     const int64_t tk = p / n_iblk;
     const int k = static_cast<int>(tk % top_k);
@@ -1722,6 +1755,10 @@ struct CpuMoeExecutor {
       do_pass2_dsfp4(t, p);
       return;
     }
+    if (fmt == WF_GGUF) {
+      do_pass2_gguf(t, p);
+      return;
+    }
     const int64_t hb = p % n_hblk;
     const int tok = static_cast<int>(p / n_hblk);
     const int h0 = static_cast<int>(hb) * HBLK;
@@ -1751,6 +1788,115 @@ struct CpuMoeExecutor {
                          gas) * w_out;
       }
       y_row[h] = f32_to_bf16(acc);
+    }
+  }
+
+  // ------------------------------- gguf (llama.cpp) --------------------------------
+  // gate_up [E, 2I, gu_row] (gate rows, then up rows), down [E, H, dn_row], rows in the
+  // layer's own ggml types; activations quantized once per token / route (submit,
+  // prep_g_row) and dotted with llama.cpp's vec_dot, as its CPU backend would.
+
+  void do_pass1_gguf(const MoeTask* t, int64_t p) {
+    const int64_t ib = p % n_iblk;
+    const int u = static_cast<int>(p / n_iblk);
+    const int e = gg_uniq[u];
+    const GgufRows& L = gguf[t->layer_id];
+    const uint8_t* w_e = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id)) +
+                         (size_t)e * (2 * I) * (size_t)L.gu_row;
+    const int r0 = gg_rstart[u], r1 = gg_rstart[u + 1];
+    const int i0 = static_cast<int>(ib) * IBLK;
+    const int i1 = std::min(I, i0 + IBLK);
+    const bool clamped = act == ACT_SWIGLUOAI || act == ACT_SWIGLU_CLAMP;
+    const float up_bias = act == ACT_SWIGLUOAI ? 1.0f : 0.0f;
+    const float lim = swiglu_limit, alpha = swiglu_alpha;
+    for (int i = i0; i < i1; ++i) {
+      const uint8_t* g_w = w_e + (size_t)i * L.gu_row;
+      const uint8_t* u_w = w_e + (size_t)(I + i) * L.gu_row;
+      for (int j = r0; j < r1; ++j) {  // this row stays in cache across the expert's routes
+        const int r = gg_routes[j];
+        const int tok = r / top_k;
+        const uint8_t* xq = gg_xq.data() + (size_t)tok * gg_xq_stride;
+        const float w_in = apply_on_input ? t->w[r] : 1.0f;
+        float gate, up;
+        L.gu_dot(H, &gate, 0, g_w, 0, xq, 0, 1);
+        L.gu_dot(H, &up, 0, u_w, 0, xq, 0, 1);
+        gate *= w_in;
+        up *= w_in;
+        bf16_t* g_row = g_scratch.data() + (size_t)r * I;
+        if (clamped) {
+          if (gate > lim) gate = lim;
+          if (up > lim) up = lim;
+          else if (up < -lim) up = -lim;
+          const float glu = gate / (1.0f + std::exp(-gate * alpha));
+          g_row[i] = f32_to_bf16(glu * (up + up_bias));
+        } else {
+          g_row[i] = f32_to_bf16(act_apply(act, gate) * up);
+        }
+      }
+    }
+  }
+
+  void do_pass2_gguf(const MoeTask* t, int64_t p) {
+    const int64_t hb = p % n_hblk;
+    const int u = static_cast<int>(p / n_hblk);
+    const int e = gg_uniq[u];
+    const int h0 = static_cast<int>(hb) * HBLK;
+    const int h1 = std::min(H, h0 + HBLK);
+    const GgufRows& L = gguf[t->layer_id];
+    const uint8_t* dn_e = reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id)) +
+                          (size_t)e * H * (size_t)L.dn_row;
+    const int r0 = gg_rstart[u], r1 = gg_rstart[u + 1];
+    for (int h = h0; h < h1; ++h) {
+      const uint8_t* row = dn_e + (size_t)h * L.dn_row;
+      for (int j = r0; j < r1; ++j) {
+        const int r = gg_routes[j];
+        const float w_out = apply_on_input ? 1.0f : t->w[r];
+        float v;
+        L.dn_dot(I, &v, 0, row, 0, gg_gq.data() + (size_t)r * gg_gq_stride, 0, 1);
+        gg_part[(size_t)r * H + h] = v * w_out;
+      }
+    }
+  }
+
+  void do_pass3_gguf(const MoeTask* t, int64_t p) {
+    const int64_t hb = p % n_hblk;
+    const int tok = static_cast<int>(p / n_hblk);
+    const int h0 = static_cast<int>(hb) * HBLK;
+    const int h1 = std::min(H, h0 + HBLK);
+    bf16_t* y_row = t->y + (size_t)tok * H;
+    for (int h = h0; h < h1; ++h) {
+      float acc = 0.0f;
+      for (int k = 0; k < top_k; ++k) {
+        const int r = tok * top_k + k;
+        const int e = t->ids[r];
+        if (e < 0 || e >= num_experts) continue;
+        acc += gg_part[(size_t)r * H + h];
+      }
+      y_row[h] = f32_to_bf16(acc);
+    }
+  }
+
+  // One row per layer: {gu_dot, gu_quant, gu_row, gu_qrow, dn_dot, dn_quant, dn_row,
+  // dn_qrow} (addresses from freetoken/kernel/ggml_cpu.py, byte sizes). Idle-only.
+  void set_gguf_layers(const std::vector<std::vector<int64_t>>& rows) {
+    if (fmt != WF_GGUF) throw std::runtime_error("set_gguf_layers: executor is not gguf");
+    if (static_cast<int>(rows.size()) != num_layers)
+      throw std::runtime_error("set_gguf_layers: one row per layer");
+    gguf.assign(num_layers, GgufRows{});
+    for (int l = 0; l < num_layers; ++l) {
+      const auto& r = rows[l];
+      if (r.size() != 8) throw std::runtime_error("set_gguf_layers: 8 fields per layer");
+      GgufRows& g = gguf[l];
+      g.gu_dot = reinterpret_cast<gg_dot_fn>(static_cast<uintptr_t>(r[0]));
+      g.gu_quant = reinterpret_cast<gg_quant_fn>(static_cast<uintptr_t>(r[1]));
+      g.gu_row = r[2];
+      g.gu_qrow = r[3];
+      g.dn_dot = reinterpret_cast<gg_dot_fn>(static_cast<uintptr_t>(r[4]));
+      g.dn_quant = reinterpret_cast<gg_quant_fn>(static_cast<uintptr_t>(r[5]));
+      g.dn_row = r[6];
+      g.dn_qrow = r[7];
+      gg_xq_stride = std::max(gg_xq_stride, (g.gu_qrow + 63) / 64 * 64);
+      gg_gq_stride = std::max(gg_gq_stride, (g.dn_qrow + 63) / 64 * 64);
     }
   }
 
@@ -1873,8 +2019,16 @@ struct CpuMoeExecutor {
   // Prepare one intermediate row (token,route) for the down GEMV: ds_fp4 first FP8
   // round-trips it (DSV4 act_quant), then both formats deinterleave to fp32 even/odd
   // (reused across every down output row).
-  void prep_g_row(int64_t r) {
+  void prep_g_row(const MoeTask* t, int64_t r) {
     bf16_t* g = g_scratch.data() + (size_t)r * I;
+    if (fmt == WF_GGUF) {  // quantize the intermediate row to the down type's activations
+      if (t->ids[r] < 0 || t->ids[r] >= num_experts) return;
+      thread_local std::vector<float> gf;
+      gf.resize(I);
+      for (int j = 0; j < I; ++j) gf[j] = bf16_to_f32(g[j]);
+      gguf[t->layer_id].dn_quant(gf.data(), gg_gq.data() + (size_t)r * gg_gq_stride, I);
+      return;
+    }
     if (use_q4a8) {  // q4_0 W4A8: Q8_0-quantize the intermediate row for the down GEMV.
       quant_q8_0(g, I, gi8_scratch.data() + (size_t)r * I,
                  gas_scratch.data() + (size_t)r * (I / 32));
@@ -1928,11 +2082,11 @@ struct CpuMoeExecutor {
     // Row-major fp4: prepare the intermediate rows (per token,route) before the down
     // GEMV -- ds_fp4 FP8 round-trips (DSV4 act_quant), both deinterleave to fp32; q4_0
     // W4A8 Q8_0-quantizes. Needs all of pass1 done (a full row spans every iblk).
-    if (needs_di || use_q4a8) {
+    if (needs_di || use_q4a8 || fmt == WF_GGUF) {
       for (;;) {
         int64_t r = prt_next.fetch_add(1, std::memory_order_relaxed);
         if (r >= prt_total) break;
-        prep_g_row(r);
+        prep_g_row(t, r);
       }
       barrier(local_sense);
     }
@@ -1941,13 +2095,39 @@ struct CpuMoeExecutor {
       if (p >= p2_total) break;
       do_pass2(t, p);
     }
+    if (fmt == WF_GGUF) {  // sum each token's routes (pass 2 wrote them per route)
+      barrier(local_sense);
+      for (;;) {
+        int64_t p = p3_next.fetch_add(1, std::memory_order_relaxed);
+        if (p >= p3_total) break;
+        do_pass3_gguf(t, p);
+      }
+    }
   }
 
   void worker_loop(int tid) {
     pin_self(tid);
     uint64_t my_gen = 0;
+    // Hot wait: while tasks keep coming (one per MoE layer, ~0.5-1 ms apart in decode),
+    // spin on the generation instead of sleeping on the condition variable. Waking a pool
+    // of sleeping workers costs a futex round trip per thread -- measured as ~0.2 ms of a
+    // 0.29 ms task on the Ryzen 7 5700G, more than the expert rows themselves. Past
+    // kHotWindow without a task the worker sleeps as before.
+    using hot_clock = std::chrono::steady_clock;
+    constexpr auto kHotWindow = std::chrono::milliseconds(5);
+    auto last_task = hot_clock::now() - kHotWindow;
     for (;;) {
       MoeTask* t;
+      if (spin_wait && hot_clock::now() - last_task < kHotWindow) {
+        unsigned polls = 0;
+        while (submitted.load(std::memory_order_acquire) == my_gen &&
+               !__atomic_load_n(&stop, __ATOMIC_RELAXED)) {
+#if CPU_MOE_X86
+          _mm_pause();
+#endif
+          if ((++polls & 1023u) == 0 && hot_clock::now() - last_task >= kHotWindow) break;
+        }
+      }
       {
         std::unique_lock<std::mutex> lk(task_mtx);
         task_cv.wait(lk, [&] { return stop || cur_gen != my_gen; });
@@ -1956,6 +2136,7 @@ struct CpuMoeExecutor {
         t = cur_task;
       }
       run_task_body(t);
+      last_task = hot_clock::now();
       if (done_count.fetch_add(1) + 1 == num_threads) {
         if (task_routes > 0) {  // counted before completion, so a sync sees this task
           const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1990,10 +2171,39 @@ struct CpuMoeExecutor {
     if (need > g_scratch.size()) g_scratch.resize(need);
     p1_total = static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
     p2_total = static_cast<int64_t>(t->num_tokens) * n_hblk;
-    prt_total = (needs_di || use_q4a8) ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
+    prt_total = (needs_di || use_q4a8 || fmt == WF_GGUF) ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
+    p3_total = 0;
+    if (fmt == WF_GGUF) {
+      const int nr = t->num_tokens * top_k;
+      gg_uniq.clear();
+      gg_rstart.assign(1, 0);
+      gg_routes.clear();
+      // distinct experts in first-seen order; routes grouped under each (nr <= a few dozen)
+      std::vector<int> seen;
+      for (int r = 0; r < nr; ++r) {
+        const int e = t->ids[r];
+        if (e < 0 || e >= num_experts) continue;
+        bool dup = false;
+        for (int u : seen) dup |= (u == e);
+        if (!dup) seen.push_back(e);
+      }
+      for (int e : seen) {
+        gg_uniq.push_back(e);
+        for (int r = 0; r < nr; ++r)
+          if (t->ids[r] == e) gg_routes.push_back(r);
+        gg_rstart.push_back(static_cast<int>(gg_routes.size()));
+      }
+      const int64_t U = static_cast<int64_t>(gg_uniq.size());
+      p1_total = U * n_iblk;
+      p2_total = U * n_hblk;
+      p3_total = static_cast<int64_t>(t->num_tokens) * n_hblk;
+      const size_t pn = static_cast<size_t>(nr) * H;
+      if (pn > gg_part.size()) gg_part.resize(pn);
+    }
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
     prt_next.store(0, std::memory_order_relaxed);
+    p3_next.store(0, std::memory_order_relaxed);
     done_count.store(0, std::memory_order_relaxed);
     bar_count.store(0, std::memory_order_relaxed);
     bar_sense.store(0, std::memory_order_relaxed);
@@ -2028,6 +2238,20 @@ struct CpuMoeExecutor {
         if (use_vnni)
           quant_i8_pg16(xe, xo, H, xi8_scratch.data() + (size_t)tok * H,
                         xas_scratch.data() + (size_t)tok * (H / 16));
+      }
+    }
+    // gguf: quantize the per-token input to the layer's activation type, once.
+    if (fmt == WF_GGUF) {
+      const GgufRows& L = gguf.at(t->layer_id);
+      const size_t xn = static_cast<size_t>(t->num_tokens) * gg_xq_stride;
+      if (xn > gg_xq.size()) gg_xq.resize(xn);
+      const size_t gn = static_cast<size_t>(t->num_tokens) * top_k * gg_gq_stride;
+      if (gn > gg_gq.size()) gg_gq.resize(gn);
+      std::vector<float> xf(H);
+      for (int tok = 0; tok < t->num_tokens; ++tok) {
+        const bf16_t* src = t->x + (size_t)tok * H;
+        for (int j = 0; j < H; ++j) xf[j] = bf16_to_f32(src[j]);
+        L.gu_quant(xf.data(), gg_xq.data() + (size_t)tok * gg_xq_stride, H);
       }
     }
     // q4_0 W4A8: Q8_0-quantize the per-token input once (single-threaded, tiny for decode).
@@ -2232,6 +2456,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("start_flag_coordinator", &CpuMoeExecutor::start_flag_coordinator,
            py::arg("ready_ptr"), py::arg("done_ptr"), py::arg("num_slots"),
            py::arg("pin_core"))
+      .def("set_gguf_layers", &CpuMoeExecutor::set_gguf_layers, py::arg("rows"))
+      .def("set_spin_wait", [](CpuMoeExecutor& e, bool v) { e.spin_wait = v; }, py::arg("value"))
       .def("set_input_prequant",
            [](CpuMoeExecutor& e, bool v) { e.input_prequant = v; },
            py::arg("value"))

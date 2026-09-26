@@ -230,11 +230,12 @@ def convert_responses_to_genspec(
     else:
         template_tools, parser_tools = split_tool_lists(raw_tools, selected)
 
-    from .model_meta import effort_toggle_kwargs
+    from .model_meta import default_template_kwargs, effort_toggle_kwargs
 
     ctk = dict(getattr(req, "chat_template_kwargs", None) or {})
     if req.reasoning:
         ctk = effort_toggle_kwargs(req.reasoning.get("effort"), ctk)
+    ctk = default_template_kwargs(ctk)
 
     return GenSpec(
         messages=render_messages(messages),

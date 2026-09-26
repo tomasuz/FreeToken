@@ -31,6 +31,7 @@ from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
 from .mtp import MTPDecodeMixin
+from .mtp4 import Qwen4MTPMixin
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
 from .table import TableManager
@@ -59,7 +60,7 @@ class ForwardInput(NamedTuple):
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
-class Scheduler(SchedulerIOMixin, MTPDecodeMixin):
+class Scheduler(SchedulerIOMixin, Qwen4MTPMixin, MTPDecodeMixin):
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
 

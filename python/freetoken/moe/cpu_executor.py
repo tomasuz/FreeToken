@@ -114,7 +114,7 @@ _ACT_IDS = {
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
 from freetoken.gguf_quant import GGUF_EXPERT_FORMATS
 
-_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
+_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4, "gguf": 5}
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -240,6 +240,9 @@ class CpuMoeExecutor:
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
+        # "gguf" (a ggml type per layer and projection): the types the rows are read in
+        self._gguf_layer_types = getattr(cache, "gguf_layer_types", None)
+        self._gguf_rows: list[list[int]] | None = None
         ptrs, (self.H, self.I) = self._resolve_banks(
             {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()}, fmt
         )
@@ -304,6 +307,13 @@ class CpuMoeExecutor:
             core_ids=core_ids,
             **ptrs,
         )
+        if self._gguf_rows is not None:
+            self._ext.set_gguf_layers(self._gguf_rows)
+        # the pool's cores are pinned to it anyway: spin between a step's layers (on by
+        # default where it was measured, gguf; FREETOKEN_CPU_MOE_SPIN=0/1 decides elsewhere)
+        spin = os.environ.get("FREETOKEN_CPU_MOE_SPIN")
+        if (spin == "1" or (spin is None and fmt == "gguf")) and hasattr(self._ext, "set_spin_wait"):
+            self._ext.set_spin_wait(True)
         self.num_threads = nthreads
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()
@@ -414,6 +424,45 @@ class CpuMoeExecutor:
         self._banks.extend(layers)
         return table
 
+    def _resolve_gguf_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
+        """GGUF experts at a ggml type per layer: ``gate_up`` ``[E, 2I, row_bytes(H)]`` (gate
+        rows, then up rows) and ``down`` ``[E, H, row_bytes(I)]`` per layer, computed with
+        llama.cpp's CPU dot products (``kernel/ggml_cpu.py``)."""
+        from freetoken.kernel import ggml_cpu
+
+        gate_up, down = banks["gate_up"], banks["down"]
+        types = self._gguf_layer_types
+        if types is None or len(types) != len(gate_up):
+            raise NotImplementedError("gguf CPU MoE needs the cache's per-layer ggml types")
+        if not ggml_cpu.available():
+            raise NotImplementedError("gguf CPU MoE needs an x86-64 host with a C compiler")
+        I = int(gate_up[0].shape[1] // 2)
+        H = int(down[0].shape[1])
+        rows = []
+        for layer, (gu_type, dn_type) in enumerate(types):
+            gu, dn = ggml_cpu.row_dot(gu_type), ggml_cpu.row_dot(dn_type)
+            if gu is None or dn is None:
+                raise NotImplementedError(
+                    f"gguf CPU MoE: no CPU dot product for layer {layer}'s types ({gu_type}, {dn_type})"
+                )
+            assert gate_up[layer].shape[1] == 2 * I and down[layer].shape[1] == H
+            rows.append([
+                gu.vec_dot, gu.quantize, int(gate_up[layer].shape[2]), gu.act_row_bytes(H),
+                dn.vec_dot, dn.quantize, int(down[layer].shape[2]), dn.act_row_bytes(I),
+            ])
+        self._gguf_rows = rows
+        ptrs = dict(
+            gate_up_ptr=self._make_table(gate_up).data_ptr(),
+            down_ptr=self._make_table(down).data_ptr(),
+            gate_up_scale_ptr=0,
+            gate_up_global_ptr=0,
+            down_scale_ptr=0,
+            down_global_ptr=0,
+            gate_up_bias_ptr=0,
+            down_bias_ptr=0,
+        )
+        return ptrs, (H, I)
+
     def _resolve_banks(self, banks: dict, fmt: str) -> tuple[dict, tuple[int, int]]:
         """Return (pointer kwargs for the C++ ctor, (H, I)) for the given format.
 
@@ -448,6 +497,9 @@ class CpuMoeExecutor:
 
         if fmt == "q4_0":
             return self._resolve_q4_0_banks(banks)
+
+        if fmt == "gguf":
+            return self._resolve_gguf_banks(banks)
 
         if fmt in GGUF_EXPERT_FORMATS:
             # The compiled CPU path has hand-written AVX2/VNNI dot kernels for Q4_0

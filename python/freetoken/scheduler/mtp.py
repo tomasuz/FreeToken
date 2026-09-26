@@ -268,12 +268,13 @@ class MTPDecodeMixin:
         req.device_len = req.input_ids.numel()
         self.token_pool[req.table_idx, req.device_len - 1] = int(tok)
 
-    def _mtp_emit(self, req: Req, tokens: list, kept_processed: int) -> None:
+    def _mtp_emit(self, req: Req, tokens: list, kept_processed: int, n_pending: int = 1) -> None:
         """Commit real tokens in order, mirroring the normal drain's finish rules
         (length / eos / stop-strings) and emitting one DetokenizeMsg per token.
         ``kept_processed`` = this step's kept processed count = the new cached_len
-        (index of the newest committed real token) once the request survives.
-        A finished request is removed from the decode manager and its resources freed.
+        (index of the newest committed real token) once the request survives;
+        ``n_pending`` committed tokens are left unprocessed (more than one after a Qwen3.8
+        reject, see mtp4.py). A finished request is removed from the decode manager and its resources freed.
         Returns the number of tokens actually committed (emitted) this step.
         """
         msgs: list = []
@@ -326,7 +327,7 @@ class MTPDecodeMixin:
 
         if not finished:
             req.cached_len = kept_processed
-            assert req.device_len == req.input_ids.numel() == kept_processed + 1, (
+            assert req.device_len == req.input_ids.numel() == kept_processed + n_pending, (
                 f"[mtp] bad commit state cached={req.cached_len} device={req.device_len} "
                 f"ids={req.input_ids.numel()}"
             )

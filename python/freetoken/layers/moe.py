@@ -144,6 +144,13 @@ class MoELayer(BaseOP):
         return self._maybe_all_reduce(self._resident_gemm(hidden_states, topk_weights, topk_ids))
 
 
+
+# CPU assist: the CPU's misses admitted to the slot cache per layer and step (0: all), and
+# the most misses the CPU takes per layer (0: all; past it the GPU fetches the rest itself)
+_ASSIST_ADMIT_CAP = int(os.environ.get("FREETOKEN_ASSIST_ADMIT_CAP", "1"))
+_ASSIST_CPU_MAX = int(os.environ.get("FREETOKEN_ASSIST_CPU_MAX", "12"))
+
+
 def _submit(executor, layer_id: int, hidden_states, topk_weights, ids):
     """Start work on an executor without waiting, whatever kind of executor it is.
 
@@ -351,12 +358,15 @@ class OffloadMoELayer(MoELayer):
             return self._decode_split(
                 cache, helpers, hidden_states, topk_weights, topk_ids
             )
+        if cache.cpu_assist is not None:
+            return self._decode_cpu_assist(cache, hidden_states, topk_weights, topk_ids)
         with phase("moe.ensure"):
             cache.ensure_experts(self.layer_id, topk_ids)
             if cache.collect_miss_hist:
                 cache.record_miss_hist(self.layer_id)
         with phase("moe.fetch"):
             cache.copy_missing()
+            cache.prefetch_join(self.layer_id)
         with phase("moe.gemm"):
             return self._expert_gemm(
                 cache,
@@ -368,6 +378,42 @@ class OffloadMoELayer(MoELayer):
                 alphas=cache.alphas_for_slots(self.layer_id),
                 is_prefill=False,
             )
+
+    def _decode_cpu_assist(self, cache, hidden_states, topk_weights, topk_ids):
+        """Resident experts on the GPU, the rest on the CPU at the same time; nothing waits
+        on PCIe. The CPU computes a missing expert from host RAM sooner than the link brings
+        it over (Ryzen 7 5700G, Qwen3.8 UD-Q3_K_XL: ~100 us a route in the pool vs ~160 us
+        to copy a 2 MiB expert), beside the GPU's GEMM instead of before it. The misses are
+        still admitted to the slot cache, copied in the background for later steps.
+
+        FREETOKEN_GGUF_CPU_ASSIST=1. On tm, decode 52.3 -> 44.7 ms/token; not for MTP
+        verifies, whose extra misses make the CPU the longer side (T=3: 93 -> ~100 ms)."""
+        executor = cache.cpu_assist
+        with phase("moe.plan"):
+            on_gpu = cache.assist_split(self.layer_id, topk_ids, _ASSIST_CPU_MAX)
+            cpu_ids = torch.where(on_gpu, topk_ids.new_full((), -1), topk_ids).contiguous()
+            cpu_w = torch.where(on_gpu, topk_weights.new_zeros(()), topk_weights).contiguous()
+        with phase("moe.submit.cpu"):
+            pending = _submit(executor, self.layer_id, hidden_states, cpu_w, cpu_ids)
+        with phase("moe.admit"):
+            slots = cache.assist_plan(self.layer_id, topk_ids, on_gpu, _ASSIST_ADMIT_CAP, _ASSIST_CPU_MAX > 0)
+            cache.prefetch_join(self.layer_id)  # experts a prefetch made resident must have landed
+        with phase("moe.gemm"):
+            gpu_slots = torch.where(on_gpu, slots, slots.new_zeros(())).to(topk_ids.dtype)
+            gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
+            out = self._expert_gemm(
+                cache,
+                hidden_states,
+                gpu_w,
+                gpu_slots,
+                views=cache.bank_views(),
+                n=None,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=False,
+            )
+        with phase("moe.join.cpu"):
+            part = _sync(executor, pending)
+        return out + part
 
     def _decode_split(
         self,
@@ -546,6 +592,8 @@ class OffloadMoELayer(MoELayer):
             )
             cache.release_prefill_layer(self.layer_id)
             return out
+        if cache.quant_format == "gguf":
+            return self._prefill_by_ensure(cache, hidden_states, topk_weights, topk_ids)
         cache.materialize_layer(self.layer_id)
         cache.copy_missing()
         return self._expert_gemm(
@@ -556,6 +604,40 @@ class OffloadMoELayer(MoELayer):
             views=cache.bank_views(self.num_experts),
             n=self.num_experts,
             alphas=cache.alphas_for_layer(self.layer_id),
+            is_prefill=True,
+        )
+
+    def _prefill_by_ensure(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Prefill through the slot cache: only the experts this chunk routes to, and of
+        those only the ones not already cached, cross PCIe.
+
+        Materializing the layer instead copies every expert of it, cached or not: on
+        Qwen3.8 GGUF that is 26 GiB per prefill however short the prompt (~2 s at PCIe 3.0
+        x16), where a short prompt needs a fraction of the layer and much of that is still
+        in the cache from decode. Not graph-captured (the id set is data-dependent), which
+        prefill never is.
+        """
+        uniq = torch.unique(topk_ids)  # <= num_experts distinct ids, so the region holds them
+        slots = uniq.to(torch.int32, copy=True)  # a copy: ensure_experts rewrites it in place
+        cache.ensure_experts(self.layer_id, slots)
+        cache.copy_missing()
+        lut = torch.empty((self.num_experts,), dtype=slots.dtype, device=slots.device)
+        lut[uniq.long()] = slots
+        slot_ids = lut[topk_ids.long()].to(topk_ids.dtype)
+        return self._expert_gemm(
+            cache,
+            hidden_states,
+            topk_weights,
+            slot_ids,
+            views=cache.bank_views(),
+            n=None,
+            alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=True,
         )
 
@@ -633,12 +715,12 @@ class OffloadMoELayer(MoELayer):
             from freetoken.moe.fused_q4_0 import fused_experts_gguf
 
             gate_up, down = views
-            if gate_up.dim() == 2:
+            if gate_up.dim() != 3:  # slot regions, not a resident layer's own banks
                 gate_up, down = cache.layer_bank_views(self.layer_id, n)
             gate_up_type, down_type = cache.gguf_layer_types[self.layer_id]
             return fused_experts_gguf(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation,
-                gate_up_type, down_type=down_type,
+                gate_up_type, down_type=down_type, num_experts=self.num_experts,
             )
         if fmt in GGUF_EXPERT_FORMATS:
             # Native GGUF experts (any ggml quant the borrowed kernels dispatch):
