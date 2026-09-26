@@ -60,12 +60,13 @@ def chat_request_to_genspec(
     model_sampling: dict[str, Any],
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
-    from .model_meta import effort_toggle_kwargs
+    from .model_meta import default_template_kwargs, effort_toggle_kwargs
 
     ctk = req.chat_template_kwargs
     thinking_type = _thinking_type(req)
     if req.reasoning_effort or thinking_type:
         ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    ctk = default_template_kwargs(ctk)
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
         sampling_params=resolve_sampling(
