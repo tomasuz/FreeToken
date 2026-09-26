@@ -64,3 +64,13 @@ def test_default_stays_within_noise(monkeypatch):
     monkeypatch.setattr(kernel_select, "_time", lambda fn: (next(t), fn()))
     kernel_select.select(("t", 4), {"a": lambda: 1, "b": lambda: 2}, default="a")
     assert kernel_select.decisions()[("t", 4)] == "a"
+
+
+def test_default_mode_takes_the_callers_rule(monkeypatch):
+    from freetoken.kernel import kernel_select
+
+    monkeypatch.setattr(kernel_select, "_MODE", "default")
+    monkeypatch.setattr(kernel_select, "_decisions", {})
+    calls = []
+    kernel_select.select(("t", 5), _paths(calls), default="slow")
+    assert calls == ["slow"] and ("t", 5) not in kernel_select.decisions()
