@@ -53,3 +53,14 @@ def test_forced_mode_and_capture_default(monkeypatch):
     calls.clear()
     kernel_select.select(("t", 3), _paths(calls), default="slow")
     assert calls == ["slow"] and ("t", 3) not in kernel_select.decisions()
+
+
+def test_default_stays_within_noise(monkeypatch):
+    from freetoken.kernel import kernel_select
+
+    monkeypatch.setattr(kernel_select, "_MODE", "auto")
+    monkeypatch.setattr(kernel_select, "_decisions", {})
+    t = iter([1.0, 0.98])  # "b" 2 % faster than the default "a": noise, keep "a"
+    monkeypatch.setattr(kernel_select, "_time", lambda fn: (next(t), fn()))
+    kernel_select.select(("t", 4), {"a": lambda: 1, "b": lambda: 2}, default="a")
+    assert kernel_select.decisions()[("t", 4)] == "a"

@@ -245,7 +245,10 @@ class Qwen4MTPMixin:
         C = req.cached_len
         pending = req.input_ids[C:].tolist()
         n_p = len(pending)
-        drafts = drafts[: max(0, MAX_T - n_p)]
+        # at most MAX_T rows, and no draft past the request's end: m accepted drafts and the
+        # bonus token append m+1 ids, which must fit in max_device_len
+        room = req.max_device_len - req.input_ids.numel() - 1
+        drafts = drafts[: max(0, min(MAX_T - n_p, room))]
         tokens = pending + drafts
         T = len(tokens)
         live = self._mtp4_live_slot(req)
