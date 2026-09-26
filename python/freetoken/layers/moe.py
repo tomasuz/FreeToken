@@ -151,6 +151,10 @@ _ASSIST_ADMIT_CAP = int(os.environ.get("FREETOKEN_ASSIST_ADMIT_CAP", "1"))
 _ASSIST_CPU_MAX = int(os.environ.get("FREETOKEN_ASSIST_CPU_MAX", "12"))
 
 
+# prefill: tokens per routed-expert GEMM within a chunk (0: the whole chunk at once)
+_PREFILL_MOE_SUB = int(os.environ.get("FREETOKEN_PREFILL_MOE_SUB", "512"))
+
+
 def _submit(executor, layer_id: int, hidden_states, topk_weights, ids):
     """Start work on an executor without waiting, whatever kind of executor it is.
 
@@ -630,16 +634,26 @@ class OffloadMoELayer(MoELayer):
         lut = torch.empty((self.num_experts,), dtype=slots.dtype, device=slots.device)
         lut[uniq.long()] = slots
         slot_ids = lut[topk_ids.long()].to(topk_ids.dtype)
-        return self._expert_gemm(
-            cache,
-            hidden_states,
-            topk_weights,
-            slot_ids,
-            views=cache.bank_views(),
-            n=None,
-            alphas=cache.alphas_for_slots(self.layer_id),
-            is_prefill=True,
-        )
+        # The experts are in place for the whole chunk; the GEMM's activations (f32 gate/up
+        # and down rows per route) are what peaks, ~0.35 MiB a token on Qwen3.8. Running it
+        # in sub-batches keeps a long prefill chunk -- the chunk is what the PCIe fetch is
+        # paid per -- from taking that VRAM from the expert slots.
+        sub = _PREFILL_MOE_SUB
+        T = hidden_states.shape[0]
+        if sub <= 0 or T <= sub:
+            return self._expert_gemm(
+                cache, hidden_states, topk_weights, slot_ids, views=cache.bank_views(), n=None,
+                alphas=cache.alphas_for_slots(self.layer_id), is_prefill=True,
+            )
+        outs = [
+            self._expert_gemm(
+                cache, hidden_states[i : i + sub], topk_weights[i : i + sub], slot_ids[i : i + sub],
+                views=cache.bank_views(), n=None, alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=True,
+            )
+            for i in range(0, T, sub)
+        ]
+        return torch.cat(outs)
 
     def _resident_expert_gemm(
         self,
