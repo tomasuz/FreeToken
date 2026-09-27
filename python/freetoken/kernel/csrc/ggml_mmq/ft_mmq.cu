@@ -53,7 +53,7 @@ extern "C" void ggml_log_internal(enum ggml_log_level level, const char * format
 // ------------------------------------------------------------------------------------------
 
 // ggml_cuda_parse_id, verbatim: gcnArchName -> the cc the MMQ configs are keyed by.
-static int ft_parse_arch(const char * devName) {
+[[maybe_unused]] static int ft_parse_arch(const char * devName) {  // HIP only
     int archMajor = 0x0;
     int archMinor = 0x0;
     int archNum = GGML_CUDA_CC_OFFSET_AMD;
@@ -110,7 +110,11 @@ static ggml_cuda_device_info ft_cuda_init() {
         d.smpbo = prop.sharedMemPerBlock;
         d.warp_size = prop.warpSize;
         d.supports_cooperative_launch = false;
+#if defined(GGML_USE_HIP)
         d.cc = ft_parse_arch(prop.gcnArchName);
+#else
+        d.cc = 100 * prop.major + 10 * prop.minor;  // as ggml_cuda_init() on CUDA
+#endif
     }
     return info;
 }
