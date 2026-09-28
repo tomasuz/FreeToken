@@ -1,4 +1,4 @@
-"""Optional inbound-request logging.
+"""Optional inbound-request and generated-response logging.
 
 When the ``FREETOKEN_API_LOG_DIR`` environment variable is set, every request that is
 dispatched to one of the API handlers (``/v1/chat/completions``,
@@ -6,6 +6,17 @@ dispatched to one of the API handlers (``/v1/chat/completions``,
 appended as one JSON record per line to a per-process
 ``requests-<start>-<pid>.jsonl`` file under that directory. (Requests rejected
 by FastAPI's body validation never reach a handler, so they are not recorded.)
+
+The same file also gets one record per finished generation (streamed or not),
+written by ``log_response`` from ``generation.py``'s ``generate_events`` /
+``generate_full`` -- the one place every wire protocol (OpenAI, Anthropic,
+Responses) converges, so this covers all of them without each adapter logging
+its own wire shape. A response record's ``reasoning`` field is the model's
+thinking/reasoning-channel text (empty when the model or request has none);
+``content`` is the final answer text. Match a request to its response by
+``uid`` (the response's ``uid``, also the numeric suffix of wire ids like
+``chatcmpl-<uid>``) and by adjacency -- requests carry no uid of their own,
+since one is not assigned until after the request is logged.
 
 Records are handed to a dedicated background writer thread through a bounded
 in-memory queue, so a slow / full / network-backed log filesystem can never
@@ -152,26 +163,76 @@ def _to_payload(req: Any) -> Any:
     return req
 
 
-def log_request(endpoint: str, req: Any, request: Request | None = None) -> None:
-    """Enqueue one record for an inbound API request. No-op unless
-    ``FREETOKEN_API_LOG_DIR`` is set. Non-blocking and swallows all errors (warns at
-    most once)."""
-    if not _LOG_DIR:
-        return
+def _enqueue(record: dict[str, Any]) -> None:
+    """Shared tail of log_request/log_response: serialize and hand off to the writer
+    thread. Never raises -- a logging failure must not break request handling."""
     try:
         _ensure_worker()
         if _init_failed:
             return
-        record = {
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
-            "endpoint": endpoint,
-            "client": request.client.host if request and request.client else None,
-            "request": _to_payload(req),
-        }
         line = json.dumps(record, ensure_ascii=False) + "\n"
         try:
             _queue.put_nowait(line)
         except queue.Full:
             _warn_once("request log queue full; dropping records (slow log disk?)")
     except Exception as exc:  # noqa: BLE001 — logging must never break serving
-        _warn_once(f"failed to enqueue request log: {exc}")
+        _warn_once(f"failed to enqueue request/response log: {exc}")
+
+
+def log_request(endpoint: str, req: Any, request: Request | None = None) -> None:
+    """Enqueue one record for an inbound API request. No-op unless
+    ``FREETOKEN_API_LOG_DIR`` is set. Non-blocking and swallows all errors (warns at
+    most once)."""
+    if not _LOG_DIR:
+        return
+    _enqueue({
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+        "kind": "request",
+        "endpoint": endpoint,
+        "client": request.client.host if request and request.client else None,
+        "request": _to_payload(req),
+    })
+
+
+def _tool_calls_payload(tool_calls: Any) -> list[dict[str, Any]] | None:
+    if not tool_calls:
+        return None
+    out = []
+    for c in tool_calls:
+        out.append(c.model_dump(mode="json") if isinstance(c, BaseModel) else c)
+    return out
+
+
+def log_response(
+    endpoint: str,
+    uid: int,
+    *,
+    reasoning: str = "",
+    content: str = "",
+    tool_calls: Any = None,
+    finish_reason: str = "",
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    error: str | None = None,
+) -> None:
+    """Enqueue one record for a finished generation: its thinking/reasoning text, final
+    content, any tool calls, and how it ended. No-op unless ``FREETOKEN_API_LOG_DIR`` is
+    set. Non-blocking and swallows all errors (warns at most once). Called once per
+    request whether it streamed or not -- ``generate_events``/``generate_full`` accumulate
+    the pieces from their events/result before calling this, so callers never format a
+    wire response just to log it."""
+    if not _LOG_DIR:
+        return
+    _enqueue({
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+        "kind": "response",
+        "endpoint": endpoint,
+        "uid": uid,
+        "finish_reason": finish_reason,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "reasoning": reasoning,
+        "content": content,
+        "tool_calls": _tool_calls_payload(tool_calls),
+        "error": error,
+    })
