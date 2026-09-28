@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import request_ring
+from .request_logger import log_response
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
 from freetoken.tokenizer.tokenize import resolve_thinking_mode
@@ -481,11 +482,19 @@ def _record_generation(
     completion_tokens: int,
     error: str | None,
     first_token_at: float | None = None,
+    uid: int = 0,
+    reasoning: str = "",
+    content: str = "",
+    tool_calls: tuple[ToolCallItem, ...] = (),
+    finish_reason: str = "",
 ) -> None:
-    """Log one generation request into the request ring. Every protocol adapter converges here,
-    so token totals are captured whatever endpoint served the request — unlike the HTTP
-    middleware, which for a stream records before the totals are known. `source is None` opts
-    out (those paths stay logged by the middleware)."""
+    """Log one generation request into the request ring, and (FREETOKEN_API_LOG_DIR) its
+    reasoning/content/tool-calls to the on-disk response log. Every protocol adapter
+    converges here, so both are captured whatever endpoint served the request — unlike the
+    HTTP middleware, which for a stream records before the totals are known, and unlike
+    each adapter's own wire formatting, which would otherwise have to be duplicated just to
+    log it. `source is None` opts out of both (those paths stay logged by the middleware,
+    if at all)."""
     if source is None:
         return
     from .api_server import _served_model_name  # lazy: api_server imports this module
@@ -505,6 +514,11 @@ def _record_generation(
             error=error,
         )
     )
+    log_response(
+        source, uid, reasoning=reasoning, content=content, tool_calls=tool_calls,
+        finish_reason=finish_reason, prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens, error=error,
+    )
 
 
 async def generate_events(
@@ -512,19 +526,33 @@ async def generate_events(
 ) -> AsyncIterator[GenEvent]:
     """Wraps `_generate_events_impl` to log the request with its totals, read off the terminal
     `GenDone`. The `finally` still records the row on a mid-stream disconnect — but with 0 tokens
-    if the drop lands before `GenDone`, the only event carrying the totals."""
+    if the drop lands before `GenDone`, the only event carrying the totals. Also accumulates the
+    reasoning/content text and tool calls as they stream by, purely for the on-disk response log
+    (FREETOKEN_API_LOG_DIR) -- no adapter has to re-serialize its wire stream just to log it."""
     start = time.monotonic()
     prompt_tokens = 0
     completion_tokens = 0
     first_token_at: float | None = None
     error: str | None = None
+    finish_reason = ""
+    reasoning_parts: list[str] = []
+    content_parts: list[str] = []
+    tool_calls: list[ToolCallItem] = []
     try:
         async for ev in _generate_events_impl(uid, spec, state):
             if isinstance(ev, GenDone):
                 prompt_tokens = ev.prompt_tokens
                 completion_tokens = ev.completion_tokens
-            elif first_token_at is None:
-                first_token_at = time.monotonic()
+                finish_reason = ev.finish_reason
+            else:
+                if first_token_at is None:
+                    first_token_at = time.monotonic()
+                if isinstance(ev, ReasoningDelta):
+                    reasoning_parts.append(ev.text)
+                elif isinstance(ev, ContentDelta):
+                    content_parts.append(ev.text)
+                elif isinstance(ev, ToolCallsDelta):
+                    tool_calls.extend(ev.calls)
             yield ev
     except GenerationError as exc:
         error = str(exc)
@@ -533,7 +561,9 @@ async def generate_events(
         _record_generation(
             source=source, stream=True, start=start,
             prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, error=error,
-            first_token_at=first_token_at,
+            first_token_at=first_token_at, uid=uid, reasoning="".join(reasoning_parts),
+            content="".join(content_parts), tool_calls=tuple(tool_calls),
+            finish_reason=finish_reason,
         )
 
 
@@ -556,7 +586,11 @@ async def generate_full(
             source=source, stream=False, start=start,
             prompt_tokens=result.prompt_tokens if result else 0,
             completion_tokens=result.completion_tokens if result else 0,
-            error=error,
+            error=error, uid=uid,
+            reasoning=result.reasoning if result else "",
+            content=result.content if result else "",
+            tool_calls=tuple(result.tool_calls) if result else (),
+            finish_reason=result.finish_reason if result else "",
         )
 
 
