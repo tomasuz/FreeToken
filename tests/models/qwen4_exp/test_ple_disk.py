@@ -157,6 +157,32 @@ def test_store_stages_bitwise_rows(tmp_path):
     assert int(flag[0]) == 1, "empty flush must still signal"
 
 
+def test_store_submit_then_wait_matches_flush(tmp_path):
+    """submit_pending()/wait_pending() (the split flush() uses for eager prefill's overlap,
+    see DiskRowTable.fill_submit) must read the same bytes as one flush() call, whatever runs
+    on this thread between the two halves."""
+    store, table, args = _make_store(tmp_path)
+    emb = _embedding()
+
+    gen = torch.Generator().manual_seed(41)
+    seq = torch.randint(0, EOS, (150,), generator=gen, dtype=torch.int64).tolist()
+    ctx = torch.tensor([EOS, EOS, *seq], dtype=torch.int64)
+    staging = torch.empty(len(seq) * args.num_ngram_heads * args.ngram_head_dim, dtype=torch.uint8)
+    store.stage(ctx.data_ptr(), len(seq), staging.data_ptr())
+    store.submit_pending()
+    _ = [x * x for x in range(1000)]  # something else runs while the reads are in flight
+    store.wait_pending()
+    ids = emb.row_ids(_meta([seq], [[EOS, EOS]]))
+    assert torch.equal(staging, table[ids.reshape(-1)].reshape(-1)), "submit+wait vs oracle"
+
+    # wait_pending() alone, nothing submitted: a no-op, not a hang or a crash
+    store.wait_pending()
+
+    # a submit with nothing staged behaves like flush(0) on an empty batch: inert
+    store.submit_pending()
+    store.wait_pending()
+
+
 def test_layouts_readers_and_errors(tmp_path):
     # 4 extents in 2 files, out of order, unaligned junk between; the last extent ends at EOF
     sizes, offsets = [500, 400, 300, 800], [0, 500, 900, 1200]
@@ -285,6 +311,36 @@ def test_disk_table_matches_oracle(tmp_path):
     disk.host_fill_batch(SimpleNamespace(is_decode=False, padded_reqs=[fresh, cont]), use_graph=False)
     ids = emb.row_ids(_meta([prompt[:4], prompt[4:]], [[EOS, EOS], [prompt[2], prompt[3]]])).cuda()
     assert _bitwise_equal(disk.lookup(ids), oracle.lookup(ids)), "hook prefill"
+
+
+def test_disk_table_fill_submit_overlaps_with_the_caller(tmp_path):
+    """fill_submit() only queues the reads; lookup() must still see the right bytes whatever
+    the caller does in between (the model's earlier layers, in production) -- and a second
+    lookup() in the same forward (a second PLE layer) must not re-wait or re-read."""
+    disk, oracle, args = _make_table(tmp_path)
+    emb = _embedding()
+
+    seqs = [[3, 4, EOS, 5, 6, 8], [2, EOS, 11, 12, 13, 14]]
+    runs = [torch.tensor([EOS, EOS, *seqs[0]]), torch.tensor([21, 22, *seqs[1]])]
+    disk.fill_submit(runs)
+    assert disk._fill_pending, "submit must leave the wait for lookup()"
+    _ = [x * x for x in range(1000)]  # stands in for the model's earlier-layer kernel launches
+    row_ids = emb.row_ids(_meta(seqs, [[EOS, EOS], [21, 22]])).cuda()
+    assert _bitwise_equal(disk.lookup(row_ids), oracle.lookup(row_ids)), "first lookup after fill_submit"
+    assert not disk._fill_pending, "lookup() must clear the pending flag once waited"
+
+    # a second PLE layer's lookup in the same forward: nothing new pending, so no re-wait,
+    # and it reads the same already-landed bytes
+    assert _bitwise_equal(disk.lookup(row_ids), oracle.lookup(row_ids)), "second lookup, same batch"
+
+    # the engine hook: host_fill_batch's prefill branch goes through fill_submit too
+    prompt = [3, 4, EOS, 5, 6, 8]
+    fresh = SimpleNamespace(input_ids=torch.tensor(prompt[:4], dtype=torch.int32), device_len=4, cached_len=0)
+    cont = SimpleNamespace(input_ids=torch.tensor(prompt, dtype=torch.int32), device_len=6, cached_len=4)
+    disk.host_fill_batch(SimpleNamespace(is_decode=False, padded_reqs=[fresh, cont]), use_graph=False)
+    assert disk._fill_pending
+    ids = emb.row_ids(_meta([prompt[:4], prompt[4:]], [[EOS, EOS], [prompt[2], prompt[3]]])).cuda()
+    assert _bitwise_equal(disk.lookup(ids), oracle.lookup(ids)), "hook prefill via fill_submit"
 
 
 @requires_cuda

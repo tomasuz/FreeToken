@@ -510,6 +510,50 @@ class PleStore {
     if (signal_addr) signal_flag(signal_addr);
   }
 
+  // Split of flush_pending(): queue every staged row (fills the reader's in-flight
+  // capacity, a fast syscall that does not wait for any of it to land) and return. Lets a
+  // caller keep issuing GPU kernel launches -- which do not block on the host either --
+  // while the reads run in the kernel, instead of the host sitting idle until every byte
+  // is back. wait_pending() drains them; a no-op if nothing was staged.
+  void submit_pending() {
+    pf_active_ = !pending_.empty();
+    if (!pf_active_) return;
+    pf_total_ = pending_.size();
+    pf_cap_ = reader_->capacity();
+    pf_tag_pending_.assign(pf_cap_, 0);
+    pf_next_ = 0;
+    pf_completed_ = 0;
+    for (unsigned tag = 0; tag < std::min((size_t)pf_cap_, pf_total_); tag++) submit_next_into(tag);
+  }
+
+  // Drain every read submit_pending() queued (resubmitting as reader slots free, same as
+  // flush_pending()) and fan out the copies. No-op if submit_pending() had nothing pending
+  // or already drained it.
+  void wait_pending() {
+    if (!pf_active_) return;
+    struct Cleanup {
+      PleStore *s;
+      ~Cleanup() {
+        s->pending_.clear();
+        s->pending_index_.clear();
+        s->pf_active_ = false;
+      }
+    } cleanup{this};
+    try {
+      for (; pf_completed_ < pf_total_; pf_completed_++) {
+        const unsigned tag = reader_->wait_one();
+        const Pending &p = pending_[pf_tag_pending_[tag]];
+        const uint8_t *row = bounce_ + (size_t)tag * kSpanMax + p.row_off;
+        for (uint8_t *dst : p.dsts) std::memcpy(dst, row, row_bytes_);
+        p.file->discard_cache(p.read_off, p.read_len);
+        if (pf_next_ < pf_total_) submit_next_into(tag);
+      }
+    } catch (...) {
+      reader_->drain();
+      throw;
+    }
+  }
+
   std::string io_backend() const {
     size_t direct = 0;
     for (const auto &f : files_) direct += f->direct_io() ? 1 : 0;
@@ -548,41 +592,21 @@ class PleStore {
     pending_.push_back(std::move(p));
   }
 
-  // Read every pending row in reader-capacity batches and fan out the copies.
-  void flush_pending() {
-    if (pending_.empty()) return;
-    struct Cleanup {
-      PleStore *s;
-      ~Cleanup() {
-        s->pending_.clear();
-        s->pending_index_.clear();
-      }
-    } cleanup{this};
+  // Submit the pending entry at pf_next_ into reader slot tag, advancing pf_next_. Shared
+  // by submit_pending()'s initial fill and wait_pending()'s resubmit-on-completion.
+  void submit_next_into(unsigned tag) {
+    const Pending &p = pending_[pf_next_];
+    pf_tag_pending_[tag] = pf_next_++;
+    reader_->submit(tag, p.file->native_fd(), bounce_ + (size_t)tag * kSpanMax, p.read_len,
+                    p.row_off + row_bytes_, p.read_off);
+  }
 
-    const unsigned cap = reader_->capacity();
-    const size_t total = pending_.size();
-    std::vector<size_t> tag_pending(cap);
-    size_t next = 0;
-    auto submit_slot = [&](unsigned tag) {
-      const Pending &p = pending_[next];
-      tag_pending[tag] = next++;
-      reader_->submit(tag, p.file->native_fd(), bounce_ + (size_t)tag * kSpanMax, p.read_len,
-                      p.row_off + row_bytes_, p.read_off);
-    };
-    try {
-      for (unsigned tag = 0; tag < std::min((size_t)cap, total); tag++) submit_slot(tag);
-      for (size_t completed = 0; completed < total; completed++) {
-        const unsigned tag = reader_->wait_one();
-        const Pending &p = pending_[tag_pending[tag]];
-        const uint8_t *row = bounce_ + (size_t)tag * kSpanMax + p.row_off;
-        for (uint8_t *dst : p.dsts) std::memcpy(dst, row, row_bytes_);
-        p.file->discard_cache(p.read_off, p.read_len);
-        if (next < total) submit_slot(tag);
-      }
-    } catch (...) {
-      reader_->drain();
-      throw;
-    }
+  // Read every pending row in reader-capacity batches and fan out the copies. Kept for
+  // flush()'s callers (the decode path): identical to submit_pending() immediately
+  // followed by wait_pending().
+  void flush_pending() {
+    submit_pending();
+    wait_pending();
   }
 
   int64_t row_bytes_, row_stride_, rows_per_extent_;
@@ -595,6 +619,13 @@ class PleStore {
 
   std::vector<Pending> pending_;
   std::unordered_map<int64_t, size_t> pending_index_;
+
+  // submit_pending() / wait_pending() split state (see above); pf_active_ is false
+  // whenever there is nothing outstanding to wait for.
+  std::vector<size_t> pf_tag_pending_;
+  size_t pf_next_ = 0, pf_total_ = 0, pf_completed_ = 0;
+  unsigned pf_cap_ = 0;
+  bool pf_active_ = false;
 };
 
 }  // namespace
@@ -613,6 +644,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("staging_addr"), py::call_guard<py::gil_scoped_release>())
       .def("flush", &PleStore::flush, py::arg("signal_addr") = 0,
            py::call_guard<py::gil_scoped_release>())
+      .def("submit_pending", &PleStore::submit_pending, py::call_guard<py::gil_scoped_release>())
+      .def("wait_pending", &PleStore::wait_pending, py::call_guard<py::gil_scoped_release>())
       .def("io_backend", &PleStore::io_backend);
   m.def("memop_write", &memop_write, py::arg("stream"), py::arg("addr"), py::arg("value"));
   m.def("memop_wait_geq", &memop_wait_geq, py::arg("stream"), py::arg("addr"), py::arg("value"));

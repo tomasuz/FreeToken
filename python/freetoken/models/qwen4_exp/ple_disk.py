@@ -187,6 +187,7 @@ class DiskRowTable:
         self._flag.zero_()
         self._token_readback = alloc_pinned_tensor(max_graph_rows, dtype=torch.int32)
         self._readback_event = torch.cuda.Event()
+        self._fill_pending = False  # set by fill_submit(), cleared by wait_fill()
         sync = "wait-sync" if self._wait_sync else "launch-gating"
         logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}")
 
@@ -219,6 +220,28 @@ class DiskRowTable:
             self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
             offset += run.numel() - 2
         self._store.flush(self._flag.data_ptr() if graph and self._wait_sync else 0)
+
+    def fill_submit(self, runs: Sequence[torch.Tensor]) -> None:
+        """Eager-only: stage and submit the disk reads, but do not wait for them. The model's
+        forward -- kernel launches, themselves non-blocking on the host -- runs concurrently
+        with the reads instead of after them; :meth:`lookup` waits right before it needs the
+        bytes, so whatever ran between this call and that one is free overlap. A prefill chunk
+        stages far more rows than one decode step, so this is where the wait was worth moving;
+        decode keeps its own flag-sync path (:meth:`fill`) unchanged."""
+        offset = 0
+        for run in runs:
+            self._store.stage(run.data_ptr(), run.numel() - 2,
+                              self._eager_pinned.data_ptr() + offset * self._token_bytes)
+            offset += run.numel() - 2
+        self._store.submit_pending()
+        self._fill_pending = True
+
+    def wait_fill(self) -> None:
+        """Drain a pending :meth:`fill_submit`. A no-op once already waited (or if nothing was
+        submitted), so every :meth:`lookup` in a forward can call it unconditionally."""
+        if self._fill_pending:
+            self._store.wait_pending()
+            self._fill_pending = False
 
     def host_fill_batch(self, batch: Batch, use_graph: bool):
         """Stage this batch's rows; returns the post-dispatch fill callable under flag-sync, else None."""
@@ -258,7 +281,7 @@ class DiskRowTable:
             ))
             for req in batch.padded_reqs
         ]
-        self.fill(runs, graph=False)
+        self.fill_submit(runs)
         return None
 
     @contextmanager
@@ -281,6 +304,13 @@ class DiskRowTable:
             _ple_store.memop_wait_reset(
                 torch.cuda.current_stream(self._device).cuda_stream, self._flag.data_ptr()
             )
+        elif not capturing:
+            # eager (prefill): fill_submit() only queued the reads; whatever ran between that
+            # call and this one (the model's earlier layers) is where they overlapped, and the
+            # wait here is however much of them is still outstanding. A no-op once already
+            # waited (a second PLE layer in the same forward) or for the decode path, which
+            # still blocks inside fill() itself and never sets the pending flag.
+            self.wait_fill()
         pinned, dev = (
             (self._graph_pinned, self._graph_dev) if capturing else (self._eager_pinned, self._eager_dev)
         )
