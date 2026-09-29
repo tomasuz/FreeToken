@@ -1483,8 +1483,19 @@ def _ensure_expandable_segments() -> None:
     """
     if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
         return
+    # torch.cuda.memory._set_allocator_settings is the pre-2.12 name; 2.12 renamed it to the
+    # accelerator-generic torch._C._accelerator_setAllocatorSettings (same string config) as
+    # part of unifying the CUDA/ROCm/XPU allocator surface, and warns on the old one. Try the
+    # new name first so a 2.12+ ROCm build actually reaches its allocator (this setting was a
+    # CUDA-only no-op on ROCm before 2.12); fall back for older torch.
+    setter = getattr(torch._C, "_accelerator_setAllocatorSettings", None) or getattr(
+        torch.cuda.memory, "_set_allocator_settings", None
+    )
+    if setter is None:
+        logger.info_rank0("Could not enable expandable_segments (no allocator-settings API on this torch); continuing")
+        return
     try:
-        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        setter("expandable_segments:True")
     except Exception as exc:  # pragma: no cover - depends on torch build
         logger.info_rank0(f"Could not enable expandable_segments ({exc}); continuing")
         return

@@ -29,10 +29,11 @@ _CSRC = pathlib.Path(__file__).parent / "csrc" / "nvfp4_moe"
 def _module():
     from torch.utils.cpp_extension import load
 
-    from .gguf import _apply_arch_selection, _build_directory, _c_compiler_for, _host_compiler
+    from .gguf import _apply_arch_selection, _build_directory, _c_compiler_for, _hip_extra_cflags, _host_compiler
 
     is_hip = bool(getattr(torch.version, "hip", None))
     extra_cuda_cflags = ["-O3"] if is_hip else ["-O3", "--expt-relaxed-constexpr"]
+    extra_cuda_cflags += _hip_extra_cflags(is_hip)
     archs = _apply_arch_selection(is_hip)
     if archs:
         logger.info(f"building NVFP4 MoE kernel for the devices present: {', '.join(archs)}")

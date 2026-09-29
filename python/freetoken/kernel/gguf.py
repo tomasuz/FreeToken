@@ -85,6 +85,32 @@ def visible_device_archs() -> list[str]:
     return seen
 
 
+def _hip_extra_cflags(is_hip: bool) -> list[str]:
+    """Extra ``extra_cuda_cflags`` a HIP JIT build needs beyond its own sources; empty on
+    CUDA.
+
+    A host that also has an nvidia-cuda-toolkit install (a one-off, unrelated need: a
+    compile-only check of this project's CUDA-target MMQ kernels, see UPSTREAM.md) puts a
+    real ``/usr/include/vector_types.h`` on the system include path. Some of torch's
+    c10/hip headers (hit via c10/hip/HIPGuard.h -> InlineDeviceGuard.h) carry a bare
+    ``#include <vector_types.h>`` left over from code shared with the CUDA build; HIP
+    itself never takes that branch (hip/hip_vector_types.h's own #if on
+    __HIP_PLATFORM_AMD__ vs __HIP_PLATFORM_NVIDIA__ skips it, defining the same types from
+    amd_detail/amd_hip_vector_types.h instead), and without a real CUDA install the include
+    normally just fails to resolve and this dead branch is silently never reached. With one
+    installed, the real header's struct-based char1/uchar1/... conflicts with the type
+    aliases HIP already defined: "definition of type 'char1' conflicts with type alias of
+    the same name".
+
+    A shadow header in extra_include_paths does not survive this: torch's hipify pass
+    renames any file it walks that looks like a CUDA header (even an unchanged one,
+    "[skipped, already hipified]"), so a same-named file placed there is gone by compile
+    time. Predefining the real header's own include guard instead makes its ``#if
+    !defined(__VECTOR_TYPES_H__)`` false wherever it is reached, skipping its whole body --
+    no file involved, so hipify has nothing to rename away."""
+    return ["-D__VECTOR_TYPES_H__"] if is_hip else []
+
+
 def _apply_arch_selection(is_hip: bool) -> list[str]:
     """Restrict the JIT build to the architectures of the devices actually present.
 
@@ -126,6 +152,7 @@ def _module():
     _is_hip = bool(getattr(_t.version, "hip", None))
     # --expt-relaxed-constexpr and -ccbin are nvcc-only; hipcc/clang rejects both.
     extra_cuda_cflags = ["-O3"] if _is_hip else ["-O3", "--expt-relaxed-constexpr"]
+    extra_cuda_cflags += _hip_extra_cflags(_is_hip)
     archs = _apply_arch_selection(_is_hip)
     if archs:
         logger.info(f"building GGUF kernels for the devices present: {', '.join(archs)}")
